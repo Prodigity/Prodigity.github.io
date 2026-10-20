@@ -30,5 +30,7 @@ The saved game (SPEL BEWAREN) stays in your browser's storage.
 
 ## Licence
 
-The engine and the port are GPL-3.0 (see the `source` branch). BatteryCheck's own levels, graphics,
-sounds and music belong to their original authors.
+The engine and the port are GPL-3.0: see [LICENSE](LICENSE) and the `source` branch. The libraries in the
+build and their licences are listed in [THIRD-PARTY.md](THIRD-PARTY.md). BatteryCheck's own levels, graphics,
+sounds and music are © 1998 Taxus Interactive and Orangegames BV, published here for preservation; see
+[THIRD-PARTY.md](THIRD-PARTY.md#batterychecks-own-content).
