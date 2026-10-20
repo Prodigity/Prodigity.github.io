@@ -74,8 +74,12 @@
       if (started && gameKeys[e.code]) { e.preventDefault(); }
     }, { capture: true });
 
+    // The build these files are; asked for by it, so a new build is never mixed with cached files of the last one
+    var build = 'c97e8cb';
+
     window.Module = {
       canvas: canvas,
+      locateFile: function (path, prefix) { return prefix + path + '?' + build; },
       print: function (t) { log(t); },
       printErr: function (t) { log(t); console.warn(t); },
       setStatus: function (t) {
@@ -93,7 +97,7 @@
       status.textContent = 'Loading...';
       // Loaded on the click, so the game's audio starts inside a user gesture
       var s = document.createElement('script');
-      s.src = 'jazz2.js';
+      s.src = 'jazz2.js?' + build;
       s.async = true;
       s.onerror = function () { status.textContent = 'Could not load the game files.'; };
       document.body.appendChild(s);
