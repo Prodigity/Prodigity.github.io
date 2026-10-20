@@ -1,9 +1,100 @@
-<html>
-  <head>
-    <meta http-equiv="Refresh" content="0; url='https://prodigity.github.io/primi'" />
-  </head>
-  <body>
-    <p>This landingpage is kinda barebones at the moment</p>
-    <p>Check <a href="https://prodigity.github.io/primi">primi</a> if you want to see my prioritization tool</p>
-  </body>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BatteryCheck</title>
+<meta name="description" content="BatteryCheck (1998), the Batteryman game, playable in the browser - a faithful port on the Jazz² Resurrection engine.">
+<style>
+  :root { --bg: #0b0d12; --fg: #e8e6df; --muted: #9aa0ab; --accent: #f5c518; --panel: #161a22; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
+  /* The game draws its own 640x480 view; the canvas is kept 4:3 so it fills it without bars */
+  canvas { display: block; width: min(100vw, calc(100vh * 4 / 3)); height: min(100vh, calc(100vw * 3 / 4)); background: #000; outline: none; image-rendering: pixelated; }
+  #overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(11, 13, 18, 0.94); padding: 16px; }
+  #card { max-width: 560px; width: 100%; background: var(--panel); border: 1px solid #262c38; border-radius: 12px; padding: 28px; }
+  h1 { margin: 0 0 4px; font-size: 28px; letter-spacing: 0.5px; }
+  h1 span { color: var(--accent); }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  table { border-collapse: collapse; width: 100%; margin: 0 0 20px; }
+  td { padding: 4px 0; vertical-align: top; }
+  td:first-child { width: 42%; color: var(--accent); font-family: ui-monospace, Consolas, monospace; font-size: 13px; padding-right: 12px; }
+  button { width: 100%; padding: 12px; font: inherit; font-weight: 600; font-size: 16px; color: #111; background: var(--accent); border: 0; border-radius: 8px; cursor: pointer; }
+  button:disabled { opacity: 0.6; cursor: progress; }
+  #status { margin-top: 12px; min-height: 1.5em; color: var(--muted); font-size: 13px; text-align: center; }
+  .fine { margin-top: 18px; color: var(--muted); font-size: 12px; }
+  .fine a { color: var(--muted); }
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas></div>
+<div id="overlay">
+  <div id="card">
+    <h1>Battery<span>Check</span></h1>
+    <p class="sub">The 1998 Batteryman game, in your browser.</p>
+    <table>
+      <tr><td>← →</td><td>walk</td></tr>
+      <tr><td>↑ ↓</td><td>look up, crouch</td></tr>
+      <tr><td>Ctrl</td><td>jump</td></tr>
+      <tr><td>Space</td><td>put a battery in, Freddy, menus</td></tr>
+      <tr><td>Esc</td><td>menu (save, load, quit)</td></tr>
+      <tr><td>Pause/Break</td><td>pause</td></tr>
+    </table>
+    <button id="play" type="button">Play</button>
+    <div id="status"></div>
+    <p class="fine">A port of the original game code, played on the
+      <a href="https://github.com/deathkiller/jazz2-native">Jazz² Resurrection</a> engine (GPL-3.0).
+      Source: <a href="https://github.com/Prodigity/Prodigity.github.io/tree/source">the <code>source</code> branch</a>.
+      Your saved game stays in this browser.</p>
+  </div>
+</div>
+<script>
+  (function () {
+    var canvas = document.getElementById('canvas');
+    var overlay = document.getElementById('overlay');
+    var status = document.getElementById('status');
+    var play = document.getElementById('play');
+    var started = false;
+    // The last lines of the game's log, for a bug report (window.batteryLog)
+    var lines = window.batteryLog = [];
+    function log(t) { lines.push(t); if (lines.length > 2000) { lines.shift(); } }
+
+    // Keys the game uses must not scroll the page or trigger browser shortcuts while it runs
+    var gameKeys = { ArrowLeft: 1, ArrowRight: 1, ArrowUp: 1, ArrowDown: 1, Space: 1, Tab: 1, Pause: 1 };
+    window.addEventListener('keydown', function (e) {
+      if (started && gameKeys[e.code]) { e.preventDefault(); }
+    }, { capture: true });
+
+    window.Module = {
+      canvas: canvas,
+      print: function (t) { log(t); },
+      printErr: function (t) { log(t); console.warn(t); },
+      setStatus: function (t) {
+        var m = /\((\d+(?:\.\d+)?)\/(\d+)\)/.exec(t || '');
+        status.textContent = m ? 'Loading ' + Math.round(100 * m[1] / m[2]) + ' %' : (t || '');
+        if (!t && started) { overlay.style.display = 'none'; canvas.focus(); }
+      },
+      onAbort: function (what) { status.textContent = 'The game stopped: ' + what; overlay.style.display = 'flex'; }
+    };
+
+    play.addEventListener('click', function () {
+      if (started) { return; }
+      started = true;
+      play.disabled = true;
+      status.textContent = 'Loading...';
+      // Loaded on the click, so the game's audio starts inside a user gesture
+      var s = document.createElement('script');
+      s.src = 'jazz2.js';
+      s.async = true;
+      s.onerror = function () { status.textContent = 'Could not load the game files.'; };
+      document.body.appendChild(s);
+    });
+    canvas.addEventListener('mousedown', function () { canvas.focus(); });
+    // The engine names the window after itself; the page keeps the game's name
+    new MutationObserver(function () { if (document.title !== 'BatteryCheck') { document.title = 'BatteryCheck'; } })
+      .observe(document.querySelector('title'), { childList: true, characterData: true, subtree: true });
+  })();
+</script>
+</body>
 </html>
