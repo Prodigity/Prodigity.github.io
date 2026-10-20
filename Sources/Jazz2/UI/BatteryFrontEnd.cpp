@@ -38,6 +38,13 @@ namespace Jazz2::UI
 		/** @brief `FUN_0041fcd0` runs on milliseconds, the fades on the 70 Hz clock; frames come at 60 Hz units */
 		constexpr float MsPerFrameUnit = 1000.0f / 60.0f;
 
+		/** @brief The last frame's real duration in 60 Hz units - the original's clocks are real time, while the engine's
+			timeMult is capped at 2.5 (slow motion below 24 fps); at most half a second, as after a load */
+		float RealTimeMult()
+		{
+			return std::min(theApplication().GetFrameTimer().GetLastFrameDuration() * 60.0f, 30.0f);
+		}
+
 		void FitView(Rendering::UpscaleRenderPass& pass, std::int32_t width, std::int32_t height)
 		{
 			// The original's 640×480 screen, the largest 4:3 rectangle that fits, centred - as the level's view
@@ -398,7 +405,7 @@ namespace Jazz2::UI
 
 	void BatteryFrontEnd::OnBeginFrame()
 	{
-		float timeMult = theApplication().GetTimeMult();
+		float timeMult = RealTimeMult();
 		_clockAccumulator += timeMult * MsPerFrameUnit;
 		std::uint32_t whole = (std::uint32_t)_clockAccumulator;
 		_clockAccumulator -= (float)whole;
@@ -569,6 +576,7 @@ namespace Jazz2::UI
 
 	BatteryMenu::Action BatteryInGameMenu::Update(float timeMult)
 	{
+		timeMult = RealTimeMult();
 		_clockAccumulator += timeMult * MsPerFrameUnit;
 		std::uint32_t whole = (std::uint32_t)_clockAccumulator;
 		_clockAccumulator -= (float)whole;

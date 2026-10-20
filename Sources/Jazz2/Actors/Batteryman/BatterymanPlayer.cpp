@@ -5,6 +5,7 @@
 #include "../../Tiles/TileMap.h"
 #include "../../PreferencesCache.h"
 
+#include "../../../nCine/Application.h"
 #include "../../../nCine/Base/Random.h"
 
 #include <algorithm>
@@ -368,10 +369,13 @@ namespace Jazz2::Actors::Batteryman
 
 	void BatterymanPlayer::OnUpdate(float timeMult)
 	{
-		// The original runs its logic at a fixed 70 Hz (FUN_00401860); a backlog of more than 35 ticks
-		// collapses to one, as there. timeMult is relative to 60 Hz.
-		_tickAccumulator += timeMult * (TicksPerSecond / 60.0f);
-		_clockMs += timeMult * (1000.0f / 60.0f);
+		// The original runs its logic at a fixed 70 Hz on the real-time clock (FUN_00401860, FUN_0041fd20); a backlog
+		// of more than 35 ticks collapses to one, as there. The time is the frame's real duration: timeMult is capped
+		// at 2.5 frames, which would run the game in slow motion below 24 fps (a slow browser), unlike the original
+		static_cast<void>(timeMult);
+		float seconds = theApplication().GetFrameTimer().GetLastFrameDuration();
+		_tickAccumulator += seconds * (float)TicksPerSecond;
+		_clockMs += seconds * 1000.0f;
 		std::int32_t ticks = (std::int32_t)_tickAccumulator;
 		_tickAccumulator -= (float)ticks;
 		if (ticks > 35) {
