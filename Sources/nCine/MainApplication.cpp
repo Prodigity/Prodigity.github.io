@@ -738,8 +738,13 @@ namespace nCine
 #endif
 
 #if defined(DEATH_TARGET_EMSCRIPTEN)
-		emscripten_set_main_loop(MainApplication::EmscriptenStep, 0, 1);
+		// Not simulating an infinite loop: that leaves main() by throwing "unwind", and main() is resumed by
+		// Asyncify from an IndexedDB callback here (FileSystem::MountAsPersistent), where nothing catches it -
+		// an "Uncaught unwind" in the console. The application is static and the runtime stays alive, so main()
+		// can simply return.
+		emscripten_set_main_loop(MainApplication::EmscriptenStep, 0, 0);
 		emscripten_set_main_loop_timing(EM_TIMING_RAF, 1);
+		return EXIT_SUCCESS;
 #else
 #	if defined(DEATH_TARGET_PSP)
 		std::uint32_t pspSeenResumes = Backends::PspPower::GetResumeCount();
