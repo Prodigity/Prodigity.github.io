@@ -10,6 +10,21 @@ namespace Jazz2::Actors::Batteryman
 	class BatteryWorld;
 
 	/**
+		@brief Where a converted animation's common origin lies in its frame cell
+
+		The converter places a frame at (origin + its hotspot) and stores the origin, the largest negative hotspot
+		plus the 2 px border, as @ref GenericGraphicResource::Hotspot - except when no frame's hotspot is negative,
+		where it stores nothing (read as 0, 0) and only the border remains (teardown/90 §2.1).
+	*/
+	inline Vector2i FrameOrigin(const GenericGraphicResource& base)
+	{
+		if (base.Hotspot.X == 0 && base.Hotspot.Y == 0) {
+			return Vector2i(GenericGraphicResource::FrameBorder, GenericGraphicResource::FrameBorder);
+		}
+		return base.Hotspot;
+	}
+
+	/**
 		@brief One slot of BatteryCheck's object pool (`DAT_004b11dc`, 512 × 0x80 bytes)
 
 		The original's objects are a 128-byte record and a behaviour function (`+0x00`) called once per 70 Hz tick.

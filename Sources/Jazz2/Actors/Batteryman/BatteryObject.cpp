@@ -223,25 +223,30 @@ namespace Jazz2::Actors::Batteryman
 			float texBiasY = (float(frameRect.Y) / float(texSize.Y));
 
 			// The original puts the frame's top-left at (x + hotX, y + hotY), mirrored about x when the direction is
-			// negative; the converted frame cell carries that hotspot as Base->Hotspot (teardown/90 §2.2)
+			// negative. The converter puts the frame at (origin + hot) in the animation's cell, origin being the
+			// common hotspot plus the 2 px border; a tightly packed frame keeps only its own area and records where
+			// that begins in the cell, so the quad moves by that offset, and a mirrored frame mirrors within that
+			// area (teardown/90 §2.1)
+			Vector2i origin = FrameOrigin(*base);
+			Vector2i offset = base->GetFrameOffset(res->FrameOffset + (std::int32_t)frame);
 			std::int32_t px = (r.X + ((r.X >> 31) & 0xffff)) >> 16;
 			std::int32_t py = (r.Y + ((r.Y >> 31) & 0xffff)) >> 16;
 			float left;
 			if (r.Direction < 0) {
 				texBiasX += texScaleX;
 				texScaleX = -texScaleX;
-				left = (float)(px + base->Hotspot.X - frameRect.W);
+				left = (float)(px + origin.X - offset.X - frameRect.W);
 			} else {
-				left = (float)(px - base->Hotspot.X);
+				left = (float)(px - origin.X + offset.X);
 			}
-			float top = (float)(py - base->Hotspot.Y);
+			float top = (float)(py - origin.Y + offset.Y);
 			std::int32_t height = frameRect.H;
 
 			if ((r.P5 & 0x1f) == 8) {
 				// Mode 8, clip-top: only the rows below the frame's top + param are drawn
 				const FrameInfo* info = BatteryAnims::Get().GetFrame(r.Frame);
 				if (info != nullptr) {
-					std::int32_t cut = (py + info->HotspotY + (std::uint8_t)r.P6) - (py - base->Hotspot.Y);
+					std::int32_t cut = (py + info->HotspotY + (std::uint8_t)r.P6) - (std::int32_t)top;
 					cut = std::clamp(cut, 0, height);
 					top += (float)cut;
 					texBiasY += (float)cut / float(texSize.Y);

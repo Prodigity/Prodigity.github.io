@@ -780,8 +780,10 @@ namespace Jazz2::Actors::Batteryman
 			float(frameRect.X) / float(texSize.X), float(frameRect.H) / float(texSize.Y), float(frameRect.Y) / float(texSize.Y));
 		instanceBlock->GetUniform(Material::SpriteSizeUniformName)->SetFloatValue((float)frameRect.W, (float)frameRect.H);
 		instanceBlock->GetUniform(Material::ColorUniformName)->SetFloatVector(Colorf::White.Data());
-		// The frame's top-left at (x + hotX, y + hotY), as for the objects' sprites
-		command->SetTransformation(Matrix4x4f::Translation((float)(x - base->Hotspot.X), (float)(y - base->Hotspot.Y), 0.0f));
+		// The frame's top-left at (x + hotX, y + hotY), as for the objects' sprites (BatteryObject::OnDraw)
+		Vector2i origin = FrameOrigin(*base);
+		Vector2i offset = base->GetFrameOffset(res->FrameOffset + (std::int32_t)frame);
+		command->SetTransformation(Matrix4x4f::Translation((float)(x - origin.X + offset.X), (float)(y - origin.Y + offset.Y), 0.0f));
 		command->SetLayer(BatteryWorld::GetParticleRenderLayer());
 		command->SetVisitOrder(order);
 		resolver.BindSpritePalette(*command, *base->TextureDiffuse.get(), indexed, res->PaletteOffset);
