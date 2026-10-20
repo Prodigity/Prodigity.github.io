@@ -60,6 +60,14 @@
     var lines = window.batteryLog = [];
     function log(t) { lines.push(t); if (lines.length > 2000) { lines.shift(); } }
 
+    // The engine sizes its drawing buffer by the device pixel ratio but draws as if it were 1, which leaves only a
+    // corner of the view on a HiDPI screen; the game draws a 640x480 view, so it is given a ratio of 1
+    try { Object.defineProperty(window, 'devicePixelRatio', { get: function () { return 1; }, configurable: true }); } catch (e) { }
+    // Emscripten leaves main() by throwing 'unwind' once the main loop runs; it is not an error
+    window.addEventListener('error', function (e) {
+      if (e.error === 'unwind' || /\bunwind\b/.test(e.message || '')) { e.preventDefault(); }
+    });
+
     // Keys the game uses must not scroll the page or trigger browser shortcuts while it runs
     var gameKeys = { ArrowLeft: 1, ArrowRight: 1, ArrowUp: 1, ArrowDown: 1, Space: 1, Tab: 1, Pause: 1 };
     window.addEventListener('keydown', function (e) {
