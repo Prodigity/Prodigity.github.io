@@ -1,0 +1,308 @@
+﻿#include "Bridge.h"
+#include "../../ContentResolver.h"
+#include "../../ILevelHandler.h"
+#include "../../Tiles/TileMap.h"
+#include "../Player.h"
+
+#include "../../../nCine/Graphics/RenderQueue.h"
+
+#include <IO/MemoryStream.h>
+
+using namespace Death::IO;
+
+namespace Jazz2::Actors::Solid
+{
+	Bridge::Bridge()
+		: _widths(nullptr), _widthsCount(0), _widthOffset(0), _leftX(0.0f), _leftHeight(0.0f), _rightX(0.0f), _rightHeight(0.0f),
+			_syncLeftX(0.0f), _syncLeftHeight(0.0f), _syncRightX(0.0f), _syncRightHeight(0.0f), _sagSyncTimer(0.0f), _sagWasActive(false)
+	{
+	}
+
+	Bridge::~Bridge()
+	{
+		auto players = _levelHandler->GetPlayers();
+		for (auto* player : players) {
+			player->CancelCarryingObject(this);
+		}
+	}
+
+	void Bridge::Preload(const ActorActivationDetails& details)
+	{
+		BridgeType bridgeType = (BridgeType)details.Params[2];
+		switch (bridgeType) {
+			default:
+			case BridgeType::Rope: PreloadMetadataAsync("Bridge/Rope"_s); break;
+			case BridgeType::Stone: PreloadMetadataAsync("Bridge/Stone"_s); break;
+			case BridgeType::Vine: PreloadMetadataAsync("Bridge/Vine"_s); break;
+			case BridgeType::StoneRed: PreloadMetadataAsync("Bridge/StoneRed"_s); break;
+			case BridgeType::Log: PreloadMetadataAsync("Bridge/Log"_s); break;
+			case BridgeType::Gem: PreloadMetadataAsync("Bridge/Gem"_s); break;
+			case BridgeType::Lab: PreloadMetadataAsync("Bridge/Lab"_s); break;
+		}
+	}
+
+	void Bridge::GetPieceWidths(BridgeType type, const std::int32_t*& widths, std::int32_t& count, std::int32_t& offset)
+	{
+		offset = 0;
+		switch (type) {
+			default:
+			case BridgeType::Rope: widths = PieceWidthsRope; count = std::int32_t(arraySize(PieceWidthsRope)); break;
+			case BridgeType::Stone: widths = PieceWidthsStone; count = std::int32_t(arraySize(PieceWidthsStone)); break;
+			case BridgeType::Vine: widths = PieceWidthsVine; count = std::int32_t(arraySize(PieceWidthsVine)); offset = 8; break;
+			case BridgeType::StoneRed: widths = PieceWidthsStoneRed; count = std::int32_t(arraySize(PieceWidthsStoneRed)); break;
+			case BridgeType::Log: widths = PieceWidthsLog; count = std::int32_t(arraySize(PieceWidthsLog)); break;
+			case BridgeType::Gem: widths = PieceWidthsGem; count = std::int32_t(arraySize(PieceWidthsGem)); break;
+			case BridgeType::Lab: widths = PieceWidthsLab; count = std::int32_t(arraySize(PieceWidthsLab)); offset = 12; break;
+		}
+	}
+
+	void Bridge::GetPieceOffsets(std::uint8_t bridgeType, std::int32_t bridgeWidth, SmallVectorImpl<std::int32_t>& offsets)
+	{
+		const std::int32_t* widths;
+		std::int32_t count, offset;
+		GetPieceWidths(bridgeType <= std::uint8_t(BridgeType::Last) ? BridgeType(bridgeType) : BridgeType::Rope, widths, count, offset);
+		// Each piece is half of its own width and half of the next one's further, the first one sticks out of the left end
+		std::int32_t widthCovered = widths[0] / 2 - offset;
+		for (std::int32_t i = 0; widthCovered <= bridgeWidth + 4; i++) {
+			offsets.push_back(widthCovered - 16);
+			widthCovered += (widths[i % count] + widths[(i + 1) % count]) / 2;
+		}
+	}
+
+	Task<bool> Bridge::OnActivatedAsync(const ActorActivationDetails& details)
+	{
+		EventParamsReader params(details);
+		_bridgeWidth = params.GetUint16(0) * 16;
+		_bridgeType = (BridgeType)params.GetUint8(2);
+		// Limit _heightFactor here, because with higher _heightFactor (for example in "04_haunted1") it starts to be inaccurate.
+		// The divisor is level data and nothing stops it being zero, which is not survivable everywhere: the PSP's
+		// Allegrex traps the IEEE divide-by-zero and the process is gone with no diagnosis (see Thread::DisableFpuTraps()).
+		const std::uint8_t heightDivisor = params.GetUint8(3);
+		_heightFactor = (heightDivisor != 0
+			? std::round(std::min((float)_bridgeWidth / heightDivisor, 38.0f))
+			: 0.0f);
+
+		_pos.Y -= 6.0f;
+
+		SetState(ActorState::SkipPerPixelCollisions, true);
+		SetState(ActorState::CanBeFrozen | ActorState::CollideWithTileset | ActorState::ApplyGravitation, false);
+
+		switch (_bridgeType) {
+			default:
+			case BridgeType::Rope: async_await RequestMetadataAsync("Bridge/Rope"_s); break;
+			case BridgeType::Stone: async_await RequestMetadataAsync("Bridge/Stone"_s); break;
+			case BridgeType::Vine: async_await RequestMetadataAsync("Bridge/Vine"_s); break;
+			case BridgeType::StoneRed: async_await RequestMetadataAsync("Bridge/StoneRed"_s); break;
+			case BridgeType::Log: async_await RequestMetadataAsync("Bridge/Log"_s); break;
+			case BridgeType::Gem: async_await RequestMetadataAsync("Bridge/Gem"_s); break;
+			case BridgeType::Lab: async_await RequestMetadataAsync("Bridge/Lab"_s); break;
+		}
+		GetPieceWidths(_bridgeType, _widths, _widthsCount, _widthOffset);
+
+		SetAnimation(AnimState::Default);
+
+		auto& resolver = ContentResolver::Get();
+		if (!resolver.IsHeadless()) {
+			SmallVector<std::int32_t, 64> offsets;
+			GetPieceOffsets(std::uint8_t(_bridgeType), _bridgeWidth, offsets);
+			for (std::int32_t offset : offsets) {
+				BridgePiece& piece = _pieces.emplace_back();
+				piece.Pos = Vector2f(_pos.X + offset, _pos.Y);
+				piece.Command = std::make_unique<RenderCommand>(RenderCommand::Type::Sprite);
+				piece.Command->GetMaterial().SetShaderProgramType(Material::ShaderProgramType::Sprite);
+				piece.Command->GetMaterial().SetBlendingEnabled(true);
+				piece.Command->GetMaterial().ReserveUniformsDataMemory();
+				piece.Command->GetGeometry().SetDrawParameters(PrimitiveType::TriangleStrip, 0, 4);
+
+				auto* textureUniform = piece.Command->GetMaterial().Uniform(Material::TextureUniformName);
+				if (textureUniform && textureUniform->GetIntValue(0) != 0) {
+					textureUniform->SetIntValue(0); // GL_TEXTURE0
+				}
+			}
+		}
+
+		async_return true;
+	}
+
+	void Bridge::OnUpdate(float timeMult)
+	{
+		std::int32_t n = 0;
+		Player* foundPlayers[8];
+		float foundX[8];
+
+		auto players = _levelHandler->GetPlayers();
+		for (auto* player : players) {
+			auto diff = player->GetPos() - _pos;
+			if (n < arraySize(foundPlayers) && diff.X >= -20.0f && diff.X <= _bridgeWidth + 20.0f &&
+				diff.Y > -27.0f && diff.Y < _heightFactor && player->GetSpeed().Y >= 0.0f) {
+				foundX[n] = diff.X;
+				foundPlayers[n] = player;
+				n++;
+			} else {
+				player->CancelCarryingObject(this);
+			}
+		}
+
+		if (n >= 2) {
+			float left = std::numeric_limits<float>::max();
+			float right = std::numeric_limits<float>::min();
+
+			for (std::int32_t i = 0; i < n; i++) {
+				if (left > foundX[i]) {
+					left = foundX[i];
+				}
+				if (right < foundX[i]) {
+					right = foundX[i];
+				}
+			}
+
+			_leftHeight = (std::abs(_leftX - left) < 64.0f ? lerpByTime(_leftHeight, GetSectionHeight(left), 0.1f, timeMult) : 0.0f);
+			_rightHeight = (std::abs(_rightX - right) < 64.0f ? lerpByTime(_rightHeight, GetSectionHeight(right), 0.1f, timeMult) : 0.0f);
+			_leftX = left;
+			_rightX = right;
+
+			for (std::int32_t i = 0; i < n; i++) {
+				float height;
+				if (foundX[i] <= left) {
+					height = _leftHeight;
+				} else if (right <= foundX[i]) {
+					height = _rightHeight;
+				} else {
+					height = lerp(_leftHeight, _rightHeight, (foundX[i] - left) / (right - left));
+				}
+
+				auto* player = foundPlayers[i];
+				auto playerPos = player->GetPos();
+				player->UpdateCarryingObject(this);
+				player->MoveInstantly(Vector2f(playerPos.X, _pos.Y + playerPos.Y - player->AABBInner.B + BaseY + height),
+					MoveType::Absolute | MoveType::Force);
+			}
+		} else if (n == 1) {
+			_leftHeight = _rightHeight = lerpByTime(std::max(_leftHeight, _rightHeight), GetSectionHeight(foundX[0]), 0.1f, timeMult);
+			_leftX = _rightX = foundX[0];
+
+			for (std::int32_t i = 0; i < n; i++) {
+				auto* player = foundPlayers[i];
+				auto playerPos = player->GetPos();
+				player->UpdateCarryingObject(this);
+				player->MoveInstantly(Vector2f(playerPos.X, _pos.Y + playerPos.Y - player->AABBInner.B + BaseY + _leftHeight),
+					MoveType::Absolute | MoveType::Force);
+			}
+		} else {
+			_leftHeight = lerpByTime(_leftHeight, 0.0f, 0.1f, timeMult);
+			_rightHeight = lerpByTime(_rightHeight, 0.0f, 0.1f, timeMult);
+		}
+
+		// The server sees all players and computes the authoritative sag; broadcast it via the actor RPC so
+		// clients render the bridge bending under remote players too (a client only sees its local player).
+		// Local/single-player sessions take no action here (SendPacket is a no-op) and render from local sag.
+		if (_levelHandler->IsServer() && !_levelHandler->IsLocalSession()) {
+			bool active = (_leftHeight > 0.001f || _rightHeight > 0.001f);
+			if (active || _sagWasActive) {
+				_sagSyncTimer -= timeMult;
+				if (_sagSyncTimer <= 0.0f) {
+					_sagSyncTimer = 3.0f;
+					_sagWasActive = active;
+
+					MemoryStream packet(12);
+					packet.WriteValue<std::int32_t>((std::int32_t)(_leftX * 512.0f));
+					packet.WriteValue<std::int16_t>((std::int16_t)(_leftHeight * 256.0f));
+					packet.WriteValue<std::int32_t>((std::int32_t)(_rightX * 512.0f));
+					packet.WriteValue<std::int16_t>((std::int16_t)(_rightHeight * 256.0f));
+					SendPacket(arrayView(packet.GetBuffer(), packet.GetSize()));
+				}
+			}
+		}
+
+		auto& resolver = ContentResolver::Get();
+		if (!resolver.IsHeadless()) {
+			// Render each piece at the deeper of the locally-computed sag and the server-synced sag (the latter
+			// is zero except on multiplayer clients), so the bridge reflects the weight of all players
+			std::int32_t widthCovered = _widths[0] / 2 - _widthOffset;
+			for (std::int32_t i = 0; widthCovered <= _bridgeWidth + 4; i++) {
+				float drop = std::max(GetDropAt((float)widthCovered, _leftX, _leftHeight, _rightX, _rightHeight),
+					GetDropAt((float)widthCovered, _syncLeftX, _syncLeftHeight, _syncRightX, _syncRightHeight));
+
+				BridgePiece& piece = _pieces[i];
+				piece.Pos = Vector2f(_pos.X + widthCovered - 16, _pos.Y + drop);
+
+				widthCovered += (_widths[i % _widthsCount] + _widths[(i + 1) % _widthsCount]) / 2;
+			}
+		}
+	}
+
+	float Bridge::GetDropAt(float widthCovered, float leftX, float leftHeight, float rightX, float rightHeight) const
+	{
+		if (leftHeight <= 0.001f && rightHeight <= 0.001f) {
+			return 0.0f;
+		}
+		if (widthCovered < leftX) {
+			return (leftX > 0.0f ? leftHeight * sinApprox(fPiOver2 * widthCovered / leftX) : leftHeight);
+		} else if (rightX < widthCovered) {
+			return (_bridgeWidth > rightX ? rightHeight * sinApprox(fPiOver2 * (_bridgeWidth - widthCovered) / (_bridgeWidth - rightX)) : rightHeight);
+		} else {
+			return (rightX > leftX ? lerp(leftHeight, rightHeight, (widthCovered - leftX) / (rightX - leftX)) : leftHeight);
+		}
+	}
+
+	void Bridge::OnPacketReceived(MemoryStream& packet)
+	{
+		// Authoritative sag from the server (clients only); used together with the locally-computed sag when rendering
+		_syncLeftX = packet.ReadValue<std::int32_t>() / 512.0f;
+		_syncLeftHeight = packet.ReadValue<std::int16_t>() / 256.0f;
+		_syncRightX = packet.ReadValue<std::int32_t>() / 512.0f;
+		_syncRightHeight = packet.ReadValue<std::int16_t>() / 256.0f;
+	}
+
+	void Bridge::OnUpdateHitbox()
+	{
+		AABBInner = AABBf(_pos.X - 16.0f, _pos.Y + BaseY, _pos.X + _bridgeWidth + 16.0f, _pos.Y - BaseY);
+	}
+
+	bool Bridge::OnDraw(RenderQueue& renderQueue)
+	{
+		if (_currentAnimation != nullptr) {
+			Vector2i texSize = _currentAnimation->Base->TextureDiffuse->GetSize();
+			auto& resolver = ContentResolver::Get();
+			bool indexed = ((_currentAnimation->Base->Flags & GenericGraphicResourceFlags::Indexed) == GenericGraphicResourceFlags::Indexed);
+
+			for (std::int32_t i = 0; i < _pieces.size(); i++) {
+				auto* command = _pieces[i].Command.get();
+				resolver.ConfigureSpriteShader(*command, indexed);
+
+				std::int32_t curAnimFrame = _currentAnimation->FrameOffset + (i % _currentAnimation->FrameCount);
+				Recti frameRect = _currentAnimation->Base->GetFrameRect(curAnimFrame);
+				float texScaleX = (float(frameRect.W) / float(texSize.X));
+				float texBiasX = (float(frameRect.X) / float(texSize.X));
+				float texScaleY = (float(frameRect.H) / float(texSize.Y));
+				float texBiasY = (float(frameRect.Y) / float(texSize.Y));
+
+				auto* instanceBlock = command->GetInstanceBlock();
+				instanceBlock->GetUniform(Material::TexRectUniformName)->SetFloatValue(texScaleX, texBiasX, texScaleY, texBiasY);
+				instanceBlock->GetUniform(Material::SpriteSizeUniformName)->SetFloatValue((float)frameRect.W, (float)frameRect.H);
+				instanceBlock->GetUniform(Material::ColorUniformName)->SetFloatVector(Colorf::White.Data());
+
+				auto pos = _pieces[i].Pos;
+				command->SetTransformation(Matrix4x4f::Translation(pos.X - frameRect.W / 2, pos.Y - frameRect.H / 2, 0.0f));
+				command->SetLayer(_renderer.layer());
+				resolver.BindSpritePalette(*command, *_currentAnimation->Base->TextureDiffuse.get(), indexed, _currentAnimation->PaletteOffset);
+
+				renderQueue.AddCommand(command);
+			}
+		}
+
+		return true;
+	}
+
+	float Bridge::GetSectionHeight(float x) const
+	{
+		// A bridge of no width has no sag to compute, and the division would be by zero - fatal on a target
+		// whose FPU traps it rather than yielding infinity
+		if (_bridgeWidth <= 0) {
+			return 0.0f;
+		}
+
+		float fase = fPi * std::clamp(x / _bridgeWidth, 0.0f, 1.0f);
+		return _heightFactor * sinApprox(fase);
+	}
+}

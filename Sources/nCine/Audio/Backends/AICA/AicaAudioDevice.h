@@ -1,0 +1,311 @@
+#pragma once
+
+#if defined(WITH_AICA) || defined(DOXYGEN_GENERATING_OUTPUT)
+
+#include "../../AudioDeviceBase.h"
+
+#include <Containers/SmallVector.h>
+
+using namespace Death::Containers;
+
+namespace nCine
+{
+	/**
+		@brief Dreamcast implementation of @ref IAudioDevice on top of the AICA
+
+		Talks to the sound processor through KallistiOS directly instead of going through an OpenAL
+		port. The AICA is a 64-channel wavetable synthesizer with **2 MB of sound RAM of its own**,
+		which is what makes audio nearly free in main memory here: a fully loaded sound lives in that
+		separate pool and the SH4 only ever touches it again to change a volume.
+
+		The two kinds of player map onto two different parts of the hardware:
+		- A @ref AudioBufferPlayer becomes one AICA channel @m_span{m-text m-dim} (two for a stereo
+		  buffer, since a channel is mono) @m_endspan playing a sample out of sound RAM. When it has
+		  finished is predicted from the sample's length and rate: the only state the hardware offers
+		  is the key-on bit `snd_is_playing()` reads, which is a control bit the console never clears
+		  by itself when a one-shot sample runs out (emulators do), so a source that waited for it
+		  was never given back and the pool ran dry after a few seconds of play.
+		- A @ref AudioStreamPlayer becomes one of KallistiOS's `snd_stream` handles, whose driver on
+		  the ARM keeps a ring buffer in sound RAM topped up from a callback. The callback is served
+		  out of the queue this class keeps, so the streaming players still see the queue interface
+		  they expect. There are only @ref MaxStreams of these.
+		- A sound much longer than a channel can address (over @ref MaxSamplesForHalving, about six
+		  seconds at 22 kHz) is an @ref AudioBufferPlayer to the engine but a stream handle here: it
+		  stays in main memory and is fed to the driver from there while it plays, so it sounds whole
+		  and at its full rate. Such a player cannot change its pitch once started, like any stream.
+		  A sound between the two limits is played on a channel at half its rate.
+
+		As with @ref AsndAudioDevice the hardware has no notion of a listener, so panning and
+		distance attenuation are computed here and folded into the channel volume and pan. The AICA
+		does have a low-pass filter per channel, but the driver leaves it switched off and does not
+		expose it, so @ref setSourceLowPass() does nothing.
+	*/
+	class AicaAudioDevice : public AudioDeviceBase
+	{
+	public:
+		AicaAudioDevice();
+		~AicaAudioDevice() override;
+
+		bool isValid() const override;
+
+		const char* name() const override;
+
+		void setGain(float gain) override;
+
+		void updateListener(const Vector3f& position, const Vector3f& velocity) override;
+
+		std::int32_t nativeFrequency() override;
+
+		std::uint32_t registerPlayer(IAudioPlayer* player) override;
+		void updatePlayers() override;
+
+		std::uint32_t createBuffer(BufferUsage usage) override;
+		void deleteBuffer(std::uint32_t bufferId) override;
+		bool uploadBuffer(std::uint32_t bufferId, BufferFormat format, const void* data, std::int32_t size, std::int32_t frequency) override;
+
+		void setSourceBuffer(std::uint32_t sourceId, std::uint32_t bufferId) override;
+		void setSourceGain(std::uint32_t sourceId, float gain) override;
+		void setSourcePitch(std::uint32_t sourceId, float pitch) override;
+		void setSourceLooping(std::uint32_t sourceId, bool looping) override;
+		void setSourceRelative(std::uint32_t sourceId, bool relative) override;
+		void setSourcePosition(std::uint32_t sourceId, const Vector3f& position) override;
+		void setSourceLowPass(std::uint32_t sourceId, float value) override;
+		std::int32_t sourceSampleOffset(std::uint32_t sourceId) override;
+		void setSourceSampleOffset(std::uint32_t sourceId, std::int32_t offset) override;
+		void playSource(std::uint32_t sourceId) override;
+		void pauseSource(std::uint32_t sourceId) override;
+		void stopSource(std::uint32_t sourceId) override;
+		bool isSourcePlaying(std::uint32_t sourceId) override;
+
+		void queueBuffer(std::uint32_t sourceId, std::uint32_t bufferId) override;
+		std::int32_t numProcessedBuffers(std::uint32_t sourceId) override;
+		void unqueueBuffers(std::uint32_t sourceId, std::int32_t count, std::uint32_t* bufferIds) override;
+
+		void suspendDevice() override;
+		void resumeDevice() override;
+
+	protected:
+		void onBlockingOperationBegan() override;
+		void onBlockingOperationEnded() override;
+
+	private:
+		/** @brief Number of sources, comfortably below the 64 channels the AICA has */
+		static constexpr std::int32_t MaxSources = 24;
+		/** @brief Number of streaming players that can sound at once, the limit of `snd_stream` */
+		static constexpr std::int32_t MaxStreams = 4;
+		/** @brief Upper bound on the streaming queue of a source, @ref AudioStream uses three */
+		static constexpr std::int32_t MaxQueuedBuffers = 4;
+		/** @brief Size of the sound RAM ring buffer of each streaming channel */
+		static constexpr std::int32_t StreamBufferSize = 16 * 1024;
+		/** @brief Rate the module decoder renders at, the AICA resamples every channel anyway */
+		static constexpr std::int32_t PreferredFrequency = 22050;
+		/** @brief Loudest volume an AICA channel accepts */
+		static constexpr std::int32_t MaxVolume = 255;
+		/** @brief Hardware limit on the sample count of a single channel */
+		static constexpr std::int32_t MaxSamplesPerChannel = 65534;
+		/**
+		 * @brief Milliseconds a one-shot sample is considered playing past its computed end
+		 *
+		 * Covers the driver's command latency (it looks at its queue every 10 ms) and the rounding of
+		 * the channel's rate, so a sound is not cut off before its last samples were heard.
+		 */
+		static constexpr std::uint64_t SampleEndMarginMs = 20;
+		/**
+		 * @brief Longest sound that is still played on a channel, at half its sample rate
+		 *
+		 * A sound over @ref MaxSamplesPerChannel that fits after one halving of its rate loses only
+		 * some high end and keeps a channel of its own; one that would have to be halved again is
+		 * streamed from main memory instead (see @ref startLongSample()). The line is drawn here
+		 * rather than at the channel limit because there are only @ref MaxStreams stream handles,
+		 * shared with the music, and the intro alone plays a dozen sounds between the two limits.
+		 */
+		static constexpr std::int32_t MaxSamplesForHalving = MaxSamplesPerChannel * 2;
+
+		/** @brief One audio buffer, in sound RAM or in main memory depending on what it is for */
+		struct Buffer
+		{
+			/** @brief Which of the two representations below is in use */
+			BufferUsage usage;
+			/** @brief Whether this entry is in use */
+			bool used;
+			/**
+			 * @brief Whether this is a static buffer too long for a channel, kept in @ref data instead
+			 *
+			 * A channel addresses at most @ref MaxSamplesPerChannel samples, so a longer sound is kept
+			 * in main memory like a streaming buffer and played through a stream handle that is fed
+			 * from it, see @ref startLongSample(). 8-bit samples are kept as they are (converted to
+			 * signed) and widened to the 16-bit the stream driver plays as they are handed over.
+			 */
+			bool longSample;
+
+			/**
+			 * @brief Sound RAM offsets of a static buffer, one per channel
+			 *
+			 * An AICA channel is mono, so a stereo sample is split into two blocks that two channels
+			 * play in parallel. `0` means nothing is allocated.
+			 */
+			std::uint32_t spuAddress[2];
+			/** @brief Bytes reserved in sound RAM for each of @ref spuAddress */
+			std::int32_t spuCapacity;
+
+			/** @brief Samples of a streaming buffer, in main memory for the stream driver to read */
+			std::uint8_t* data;
+			/** @brief Allocated size of @ref data */
+			std::int32_t capacity;
+			/** @brief Bytes of @ref data that hold samples */
+			std::int32_t size;
+
+			/** @brief Number of sample frames the buffer holds */
+			std::int32_t numSamples;
+			/** @brief Sample rate the samples were recorded at */
+			std::int32_t frequency;
+			/** @brief Number of channels, 1 or 2 */
+			std::int32_t numChannels;
+			/** @brief Bytes per sample of one channel, 1 or 2 */
+			std::int32_t bytesPerSample;
+
+			Buffer()
+				: usage(BufferUsage::Static), used(false), longSample(false), spuAddress {}, spuCapacity(0), data(nullptr),
+					capacity(0), size(0), numSamples(0), frequency(0), numChannels(0), bytesPerSample(0) {}
+		};
+
+		/** @brief State of one source, which becomes either AICA channels or a stream handle */
+		struct Source
+		{
+			/** @brief Buffer attached for non-streamed playback, `0` if none */
+			std::uint32_t attachedBufferId;
+			/** @brief AICA channels the attached buffer is playing on, `-1` when not allocated */
+			std::int32_t channels[2];
+			/** @brief Playback position kept across a pause, in sample frames */
+			std::int32_t pausedOffset;
+			/**
+			 * @brief Sample frame the channels were keyed on at
+			 *
+			 * The driver always starts a channel at position zero of whatever it is pointed at, so a
+			 * resume after a pause points it further into the sample and every position the hardware
+			 * reports afterwards is relative to this.
+			 */
+			std::int32_t sampleStartOffset;
+			/**
+			 * @brief Time a one-shot sample will have played out, in the millisecond clock, `0` if none
+			 *
+			 * Set when the channels are keyed on and moved when the pitch changes, see @ref isSourcePlaying().
+			 */
+			std::uint64_t sampleEndAt;
+
+			/** @brief Stream handle of a streaming source, `-1` when it has none */
+			std::int32_t streamHandle;
+			/** @brief Streaming queue, oldest buffer first */
+			std::uint32_t queuedBufferIds[MaxQueuedBuffers];
+			/** @brief Entries of @ref queuedBufferIds that are in use */
+			std::int32_t numQueued;
+			/** @brief Leading entries of @ref queuedBufferIds the stream driver has consumed */
+			std::int32_t numProcessed;
+			/** @brief Bytes of the oldest queued buffer that have already been handed to the driver */
+			std::int32_t headOffset;
+
+			/** @brief Player gain */
+			float gain;
+			/** @brief Playback rate multiplier */
+			float pitch;
+			/** @brief Position in physical units, as handed over by the player */
+			Vector3f position;
+			/** @brief Whether the position is relative to the listener */
+			bool relative;
+			/** @brief Whether a non-streamed buffer repeats */
+			bool looping;
+
+			/** @brief Whether the source is fed by the streaming queue instead of a single buffer */
+			bool streaming;
+			/** @brief Whether the stream handle is fed from the attached long sample instead of the queue */
+			bool longSample;
+			/** @brief Next sample frame of the attached long sample to hand to the stream driver */
+			std::int32_t longSamplePos;
+			/** @brief Which half of the staging block the next request of an 8-bit long sample is written to */
+			std::int32_t longSampleStagingHalf;
+			/**
+			 * @brief Time the last sample frame of a long sample was handed to the driver, 0 while playing
+			 *
+			 * The driver keeps a ring buffer ahead of what is heard, so the sound is over only once that
+			 * has played out, see @ref isSourcePlaying().
+			 */
+			std::uint64_t longSampleDrainedAt;
+			/** @brief Whether the hardware has been told to start */
+			bool started;
+			/** @brief Whether playback is paused */
+			bool paused;
+			/**
+			 * @brief Whether a stream was stopped for a blocking operation and is to be started again after it
+			 *
+			 * The driver's ring is topped up from @ref updatePlayers(), which a load stops calling for far
+			 * longer than the ring holds, and the channel keeps looping the ring meanwhile - see
+			 * @ref onBlockingOperationBegan(). A source in this state still reports itself as playing.
+			 */
+			bool stoppedForBlocking;
+
+			Source()
+				: attachedBufferId(0), channels { -1, -1 }, pausedOffset(0), sampleStartOffset(0), sampleEndAt(0), streamHandle(-1),
+					queuedBufferIds {}, numQueued(0), numProcessed(0), headOffset(0), gain(1.0f),
+					pitch(1.0f), relative(false), looping(false), streaming(false), longSample(false),
+					longSamplePos(0), longSampleStagingHalf(0), longSampleDrainedAt(0), started(false), paused(false),
+					stoppedForBlocking(false) {}
+		};
+
+		/** @brief Whether the sound processor was brought up successfully */
+		bool _initialized;
+		/** @brief Whether a blocking operation is in progress, so no stream is started until it ends */
+		bool _inBlockingOperation;
+		/** @brief All buffers, the id of a buffer is its index plus one */
+		SmallVector<Buffer, 0> _buffers;
+		/** @brief State of every source, indexed by source id minus one */
+		Source _sources[MaxSources];
+
+		/**
+		 * @brief Staging blocks a long 8-bit sample is expanded to 16-bit into, one pair per stream handle
+		 *
+		 * The stream driver plays 16-bit PCM, so the samples of an 8-bit long sample are widened on the
+		 * way to it, one request at a time. The driver copies a block with DMA after the callback
+		 * returned, so two are alternated and the one the previous request handed over is never
+		 * written while it may still be read. Each entry holds @ref LongSampleStagingSize bytes and
+		 * is allocated the first time its handle plays one.
+		 */
+		std::uint8_t* _longSampleStaging[MaxStreams];
+		/** @brief Size of each of @ref _longSampleStaging, two blocks of the most the driver asks for at once */
+		static constexpr std::int32_t LongSampleStagingSize = StreamBufferSize;
+
+		/** @brief The one instance, so the C callback of the stream driver can find its way back */
+		static AicaAudioDevice* _current;
+
+		/** @brief Returns the buffer of the specified id, or `nullptr` if there is none */
+		Buffer* bufferForId(std::uint32_t bufferId);
+		/** @brief Returns the index of the specified source id, or `-1` if it is not one */
+		static std::int32_t sourceForId(std::uint32_t sourceId);
+
+		/** @brief Turns the gain, position and listener of a source into a volume and a panning */
+		void computeVolume(std::int32_t index, bool isStereo, std::int32_t& volume, std::int32_t& pan);
+		/** @brief Pushes a freshly computed volume and panning into whatever the source is playing on */
+		void applyVolume(std::int32_t index);
+
+		/** @brief Starts the attached buffer of a source on freshly allocated AICA channels */
+		void startSample(std::int32_t index, std::int32_t sampleOffset);
+		/** @brief Stops the AICA channels of a source and returns them to the pool */
+		void stopSample(std::int32_t index);
+		/** @brief Starts the stream of a queue-fed source, once it has something queued */
+		void startStream(std::int32_t index);
+		/** @brief Starts the attached long sample of a source on a freshly allocated stream handle */
+		void startLongSample(std::int32_t index, std::int32_t sampleOffset);
+		/** @brief Stops the stream a long sample is playing through and releases its handle */
+		void stopLongSample(std::int32_t index);
+		/** @brief Releases the stream handle of a source */
+		void releaseStream(std::int32_t index);
+		/** @brief Serves the stream driver from the queue of a source */
+		void* fillStream(std::int32_t index, std::int32_t bytesRequested, std::int32_t& bytesProvided);
+
+		// Spelled with plain `int` because that is what `snd_stream_callback_t` is declared with: on
+		// this target `std::int32_t` is `long int`, so a signature using it would be a different type
+		// and the callback could not be registered at all
+		static void* streamCallback(int handle, int bytesRequested, int* bytesProvided);
+	};
+}
+
+#endif

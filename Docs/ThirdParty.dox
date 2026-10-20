@@ -1,0 +1,47 @@
+namespace Death {
+//###==##====#=====--==~--~=~- --- -- -  -  -   -
+
+/** @page third-party Third-party components
+@brief Third-party dependencies and their corresponding license information
+
+This page lists third-party libraries that are used directly or through the API by **Jazz² Resurrection**.
+The project itself is licensed under the terms of the [GNU General Public License v3.0](https://github.com/deathkiller/jazz2-native/blob/master/LICENSE).
+It has been developed in @m_class{m-icon} ![](https://resources.jetbrains.com/storage/products/company/brand/logos/CLion_icon.svg) CLion using the open-source license.
+
+- - -
+
+-   **Core** and shared parts
+    -   @m_class{m-doc} [jsoncpp](https://github.com/open-source-parsers/jsoncpp) library --- Licensed under [MIT License](https://github.com/open-source-parsers/jsoncpp/blob/master/LICENSE)
+    -   @m_class{m-doc} [The Parallel Hashmap](https://github.com/greg7mdp/parallel-hashmap) implementation --- licensed under [Apache-2.0 License](https://github.com/greg7mdp/parallel-hashmap/blob/master/LICENSE)
+    -   Parts of @m_class{m-doc} [Corrade](https://github.com/mosra/corrade) library --- licensed under [MIT/Expat License](https://github.com/mosra/corrade/blob/master/COPYING)
+    -   Parts of @m_class{m-doc} [nCine](https://github.com/nCine/nCine) game engine --- licensed under [MIT License](https://github.com/nCine/nCine/blob/master/LICENSE)
+    -   Parts of @m_class{m-doc} [Quill](https://github.com/odygrd/quill) library --- licensed under [MIT License](https://github.com/odygrd/quill/blob/master/LICENSE)
+    -   @m_class{m-doc} [Pattern-defeating quicksort](https://github.com/orlp/pdqsort) implementation --- licensed under [zlib License](https://github.com/orlp/pdqsort/blob/master/license.txt)
+    -   @m_class{m-doc} [xxHash](https://xxhash.com/) library --- licensed under [BSD-2-Clause License](https://github.com/Cyan4973/xxHash/blob/dev/LICENSE)
+    -   @m_class{m-doc} [zlib](https://www.zlib.net/) library --- licensed under [zlib License](https://www.zlib.net/zlib_license.html)
+-   **Backends**
+    -   @m_class{m-doc} [GLEW](https://glew.sourceforge.net/) library --- licensed under Modified BSD License, Mesa 3-D License (MIT) and Khronos License (MIT)
+    -   @m_class{m-doc} [GLFW](https://www.glfw.org/) library --- licensed under [MIT/Expat License](https://github.com/glfw/glfw/blob/master/LICENSE.md)
+    -   @m_class{m-doc} [SDL2](https://www.libsdl.org/) library --- licensed under [zlib License](https://github.com/libsdl-org/SDL/blob/main/LICENSE.txt)
+    -   @m_class{m-doc} [OpenAL](https://github.com/kcat/openal-soft) library --- licensed under [LGPL License](https://github.com/kcat/openal-soft/blob/master/COPYING)
+-   **Additional components** and optional features
+    -   @m_class{m-doc} [AngelScript](https://www.angelcode.com/angelscript/) library --- licensed under [zlib License](https://www.angelcode.com/angelscript/sdk/docs/manual/doc_license.html)
+    -   @m_class{m-doc} [ANGLE](https://github.com/google/angle) library --- licensed under [BSD-3-Clause License](https://github.com/google/angle/blob/main/LICENSE)
+    -   @m_class{m-doc} [Backward](https://github.com/bombela/backward-cpp) library --- licensed under [MIT License](https://github.com/bombela/backward-cpp/blob/master/LICENSE.txt)
+    -   @m_class{m-doc} [Dear ImGui](https://github.com/ocornut/imgui) library --- licensed under [MIT License](https://github.com/ocornut/imgui/blob/master/LICENSE.txt)
+    -   @m_class{m-doc} [ENet](https://github.com/lsalzman/enet) library --- licensed under [MIT License](https://github.com/lsalzman/enet/blob/master/LICENSE)
+    -   @m_class{m-doc} [IXWebSocket](https://github.com/machinezone/IXWebSocket) library --- licensed under [BSD-3-Clause license](https://github.com/machinezone/IXWebSocket/blob/master/LICENSE.txt)
+    -   @m_class{m-doc} [libcurl](https://github.com/curl/curl) library --- licensed under [CURL License](https://github.com/curl/curl/blob/master/COPYING)
+    -   @m_class{m-doc} [libopenmpt](https://lib.openmpt.org/libopenmpt/) library --- licensed under [BSD-3-Clause License](https://github.com/OpenMPT/openmpt/blob/master/LICENSE)
+    -   @m_class{m-doc} [libvorbis](https://github.com/xiph/vorbis) library --- licensed under [BSD-3-Clause License](https://github.com/xiph/vorbis/blob/master/COPYING)
+    -   @m_class{m-doc} [libwebp](https://github.com/webmproject/libwebp) library --- licensed under [BSD-3-Clause License](https://github.com/webmproject/libwebp/blob/main/COPYING)
+    -   @m_class{m-doc} [libxmp](https://libxmp.sourceforge.net/) library --- licensed under [MIT License](https://github.com/libxmp/libxmp/blob/master/docs/COPYING)
+    -   @m_class{m-doc} [Mesa](https://mesa3d.org/) library --- licensed under [MIT License](https://docs.mesa3d.org/license.html)
+-   **Nintendo 64** content conversion in AssetPacker, vendored in the form [libdragon](https://github.com/DragonMinded/libdragon) keeps them
+    -   @m_class{m-doc} [libxm](https://github.com/Artefact2/libxm) library --- licensed under [WTFPL](http://www.wtfpl.net/)
+    -   @m_class{m-doc} [ulc-codec](https://github.com/Aikku93/ulc-codec) encoder --- released into the public domain under [The Unlicense](https://unlicense.org/)
+    -   @m_class{m-doc} [VADPCM](https://github.com/depp/vadpcm) codec --- licensed under [Mozilla Public License 2.0](https://www.mozilla.org/en-US/MPL/2.0/)
+
+*/
+
+}

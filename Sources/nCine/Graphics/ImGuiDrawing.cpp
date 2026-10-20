@@ -1,0 +1,1001 @@
+#if defined(WITH_IMGUI)
+
+#include "ImGuiDrawing.h"
+#include "RenderQueue.h"
+#include "RenderCommandPool.h"
+#include "RenderResources.h"
+#include "RHI/Rhi.h"
+#include "../Application.h"
+#include "../Input/IInputManager.h"
+
+#include <IO/FileSystem.h>
+
+// A backend without an ImGui input glue (Qt5, every console) simply has no branch here, and the
+// overlay then draws without receiving input
+#if defined(WITH_GLFW)
+#	include "../Backends/ImGuiGlfwInput.h"
+#elif (defined(WITH_SDL2) || defined(WITH_SDL3))
+#	include "../Backends/ImGuiSdlInput.h"
+#elif defined(DEATH_TARGET_ANDROID)
+#	include "../Backends/Android/ImGuiAndroidInput.h"
+#endif
+
+#include "../../Shaders/Generated/DefaultImGui.h"
+
+using namespace Death::Containers::Literals;
+using namespace Death::IO;
+using namespace nCine::Backends;
+
+#if defined(DEATH_TRACE_VERBOSE_GL)
+#	define GL_CALL(op)													\
+		do {															\
+			op;															\
+			GLenum _glErr = glGetError();								\
+			if (_glErr != 0) {											\
+				LOGE("GL error 0x{:x} returned from {}", _glErr, #op);	\
+			}															\
+		} while (0)
+#else
+#	define GL_CALL(op) op
+#endif
+
+namespace nCine
+{
+	ImGuiDrawing::ImGuiDrawing(bool withSceneGraph)
+		: _withSceneGraph(withSceneGraph), _appInputHandler(nullptr), _lastFrameWidth(0), _lastFrameHeight(0), _lastLayerValue(0)
+	{
+		ImGuiIO& io = ImGui::GetIO();
+		io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
+
+#if defined(IMGUI_HAS_DOCK)
+		io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;		// Enable Docking
+#endif
+#if defined(IMGUI_HAS_VIEWPORT) && (defined(WITH_RHI_GL) || defined(WITH_RHI_D3D11) || \
+		((defined(WITH_RHI_VULKAN) || defined(WITH_RHI_METAL)) && (defined(WITH_SDL2) || defined(WITH_SDL3))))
+		// Multi-viewport platform windows need the renderer to draw into a window of its own: the OpenGL backend
+		// renders with raw GL into per-window GL contexts, Direct3D 11 into a per-window swap chain, Vulkan and Metal
+		// into an off-screen target presented into a per-window swap chain / layer. The remaining backends have no such path, so the
+		// feature is not offered there (a panel dragged out of the main window stays docked instead of opening an
+		// empty one).
+		io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;		// Enable Multi-Viewport / Platform Windows
+#endif
+
+		io.BackendRendererUserData = this;
+#if defined(RHI_GL_PROFILE_ES) || defined(DEATH_TARGET_EMSCRIPTEN)
+		io.BackendRendererName = "nCine_OpenGL_ES";
+#else
+		io.BackendRendererName = "nCine_OpenGL";
+#endif
+
+/*#if defined(DEATH_TARGET_ANDROID)
+		static char iniFilename[512];
+		nctl::strncpy(iniFilename, fs::joinPath(fs::savePath(), "imgui.ini").data(), 512);
+		io.IniFilename = iniFilename;
+#endif*/
+
+#if !(defined(RHI_GL_PROFILE_ES) && !GL_ES_VERSION_3_2) && !defined(DEATH_TARGET_EMSCRIPTEN)
+		io.BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;	// We can honor the ImDrawCmd::VtxOffset field, allowing for large meshes.
+#endif
+		io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;	// We can honor ImGuiPlatformIO::Textures[] requests during render.
+
+		_imguiShaderProgram = std::make_unique<RHI::ShaderProgram>(RHI::ShaderProgram::QueryPhase::Immediate);
+#if defined(WITH_RHI_GL)
+#	if defined(RHI_GL_PROFILE_ES2)
+		// The ES2 profile compiles with "#version 100", so it needs the ESSL 100 (Essl100Emitter) sources
+		_imguiShaderProgram->AttachShaderFromString(ShaderStage::Vertex, ShadersGen::DefaultImGui.Variants[0].VsSource100);
+		_imguiShaderProgram->AttachShaderFromString(ShaderStage::Fragment, ShadersGen::DefaultImGui.Variants[0].FsSource100);
+#	else
+		_imguiShaderProgram->AttachShaderFromString(ShaderStage::Vertex, ShadersGen::DefaultImGui.Variants[0].VsSource);
+		_imguiShaderProgram->AttachShaderFromString(ShaderStage::Fragment, ShadersGen::DefaultImGui.Variants[0].FsSource);
+#	endif
+#else
+		// Non-GL backends consume their own precompiled artifact from the offline reflection (D3D11: HLSL,
+		// Vulkan: SPIR-V, software: transpiled C++) - the same route RenderResources uses for the engine's
+		// precompiled programs. The GL source strings are compiled out (nullptr) on these builds and their
+		// AttachShaderFromString is an inert stub, so the reflection is the only shader input Link() needs.
+		_imguiShaderProgram->SetReflection(&ShadersGen::DefaultImGui.Variants[0]);
+#endif
+		_imguiShaderProgram->Link(RHI::ShaderProgram::Introspection::Enabled);
+		FATAL_ASSERT(_imguiShaderProgram->GetStatus() != RHI::ShaderProgram::Status::LinkingFailed);
+
+		if (!withSceneGraph) {
+			SetupBuffersAndShader();
+		}
+
+#if defined(IMGUI_HAS_VIEWPORT) && (defined(WITH_RHI_GL) || defined(WITH_RHI_D3D11) || \
+		((defined(WITH_RHI_VULKAN) || defined(WITH_RHI_METAL)) && (defined(WITH_SDL2) || defined(WITH_SDL3))))
+		PrepareForViewports();
+#endif
+
+		// Set custom style
+		ImGuiStyle& style = ImGui::GetStyle();
+		style.WindowRounding = 4.0f;
+		style.FrameRounding = 2.0f;
+		style.FrameBorderSize = 1.0f;
+
+		// TODO: Set custom purple colors
+		ImVec4* colors = style.Colors;
+		/*colors[ImGuiCol_FrameBg] = ImVec4(0.24f, 0.13f, 0.33f, 0.54f);
+		colors[ImGuiCol_FrameBgHovered] = ImVec4(0.37f, 0.21f, 0.49f, 0.54f);
+		colors[ImGuiCol_FrameBgActive] = ImVec4(0.44f, 0.24f, 0.59f, 0.54f);
+		colors[ImGuiCol_TitleBg] = ImVec4(0.15f, 0.09f, 0.21f, 0.54f);
+		colors[ImGuiCol_TitleBgActive] = ImVec4(0.24f, 0.13f, 0.33f, 0.85f);
+		colors[ImGuiCol_CheckMark] = ImVec4(0.58f, 0.26f, 0.98f, 1.00f);
+		colors[ImGuiCol_SliderGrab] = ImVec4(0.44f, 0.20f, 0.74f, 1.00f);
+		colors[ImGuiCol_SliderGrabActive] = ImVec4(0.52f, 0.22f, 0.89f, 1.00f);
+		colors[ImGuiCol_Button] = ImVec4(0.59f, 0.26f, 0.98f, 0.40f);
+		colors[ImGuiCol_ButtonHovered] = ImVec4(0.46f, 0.24f, 0.68f, 1.00f);
+		colors[ImGuiCol_ButtonActive] = ImVec4(0.53f, 0.29f, 0.72f, 1.00f);
+		colors[ImGuiCol_Header] = ImVec4(0.61f, 0.26f, 0.98f, 0.31f);
+		colors[ImGuiCol_HeaderHovered] = ImVec4(0.46f, 0.23f, 0.71f, 0.80f);
+		colors[ImGuiCol_HeaderActive] = ImVec4(0.42f, 0.19f, 0.68f, 1.00f);
+		colors[ImGuiCol_SeparatorHovered] = ImVec4(0.37f, 0.10f, 0.75f, 0.78f);
+		colors[ImGuiCol_SeparatorActive] = ImVec4(0.37f, 0.10f, 0.75f, 1.00f);
+		colors[ImGuiCol_ResizeGrip] = ImVec4(0.60f, 0.26f, 0.98f, 0.20f);
+		colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.60f, 0.26f, 0.98f, 0.67f);
+		colors[ImGuiCol_ResizeGripActive] = ImVec4(0.60f, 0.26f, 0.98f, 0.95f);
+		colors[ImGuiCol_Tab] = ImVec4(0.37f, 0.18f, 0.58f, 0.86f);
+		colors[ImGuiCol_TabHovered] = ImVec4(0.48f, 0.26f, 0.73f, 0.80f);
+		colors[ImGuiCol_TabActive] = ImVec4(0.42f, 0.20f, 0.68f, 1.00f);
+		colors[ImGuiCol_TabUnfocused] = ImVec4(0.11f, 0.07f, 0.15f, 0.97f);
+		colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.27f, 0.14f, 0.42f, 1.00f);
+		colors[ImGuiCol_DockingPreview] = ImVec4(0.41f, 0.17f, 0.68f, 0.70f);
+		colors[ImGuiCol_TextSelectedBg] = ImVec4(0.58f, 0.26f, 0.98f, 0.35f);
+		colors[ImGuiCol_NavHighlight] = ImVec4(0.58f, 0.26f, 0.98f, 1.00f);*/
+
+		/*colors[ImGuiCol_FrameBg] = ImVec4(0.13f, 0.22f, 0.33f, 0.54f);
+		colors[ImGuiCol_FrameBgHovered] = ImVec4(0.21f, 0.38f, 0.49f, 0.54f);
+		colors[ImGuiCol_FrameBgActive] = ImVec4(0.24f, 0.45f, 0.59f, 0.54f);
+		colors[ImGuiCol_TitleBg] = ImVec4(0.09f, 0.17f, 0.21f, 0.54f);
+		colors[ImGuiCol_TitleBgActive] = ImVec4(0.09f, 0.17f, 0.21f, 1.00f);
+		colors[ImGuiCol_CheckMark] = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
+		colors[ImGuiCol_SliderGrab] = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
+		colors[ImGuiCol_SliderGrabActive] = ImVec4(0.22f, 0.71f, 0.89f, 1.00f);
+		colors[ImGuiCol_Button] = ImVec4(0.23f, 0.59f, 0.88f, 0.40f);
+		colors[ImGuiCol_ButtonHovered] = ImVec4(0.16f, 0.37f, 0.54f, 1.00f);
+		colors[ImGuiCol_ButtonActive] = ImVec4(0.08f, 0.23f, 0.35f, 1.00f);
+		colors[ImGuiCol_Header] = ImVec4(0.26f, 0.60f, 0.98f, 0.31f);
+		colors[ImGuiCol_HeaderHovered] = ImVec4(0.17f, 0.33f, 0.46f, 1.00f);
+		colors[ImGuiCol_HeaderActive] = ImVec4(0.08f, 0.20f, 0.32f, 1.00f);
+		colors[ImGuiCol_SeparatorHovered] = ImVec4(0.10f, 0.51f, 0.75f, 0.78f);
+		colors[ImGuiCol_SeparatorActive] = ImVec4(0.10f, 0.49f, 0.75f, 1.00f);
+		colors[ImGuiCol_ResizeGrip] = ImVec4(0.26f, 0.68f, 0.98f, 0.20f);
+		colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.26f, 0.66f, 0.98f, 0.67f);
+		colors[ImGuiCol_ResizeGripActive] = ImVec4(0.10f, 0.42f, 0.62f, 0.95f);
+		colors[ImGuiCol_Tab] = ImVec4(0.12f, 0.34f, 0.43f, 0.40f);
+		colors[ImGuiCol_TabHovered] = ImVec4(0.26f, 0.54f, 0.73f, 0.80f);
+		colors[ImGuiCol_TabActive] = ImVec4(0.15f, 0.41f, 0.58f, 1.00f);
+		colors[ImGuiCol_TabUnfocused] = ImVec4(0.07f, 0.12f, 0.15f, 0.28f);
+		colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.14f, 0.34f, 0.42f, 1.00f);
+		colors[ImGuiCol_DockingPreview] = ImVec4(0.17f, 0.46f, 0.68f, 0.70f);
+		colors[ImGuiCol_TextSelectedBg] = ImVec4(0.26f, 0.79f, 0.98f, 0.35f);
+		colors[ImGuiCol_NavHighlight] = ImVec4(0.26f, 0.79f, 0.98f, 1.00f);*/
+
+
+
+		// Try to use system font
+#if defined(DEATH_TARGET_WINDOWS)
+		String systemFont = fs::CombinePath({ fs::GetWindowsDirectory(), "Fonts"_s, "SegoeUI.ttf"_s });
+		if (fs::FileExists(systemFont)) {
+			// Include the most of european latin characters
+			static const ImWchar ranges[] = { 0x0020, 0x017E, 0 };
+			io.Fonts->AddFontFromFileTTF(systemFont.data(), 17.0f, nullptr, ranges);
+		}
+#endif
+
+		// TODO: Add these lines to "ImGui::NavUpdateCancelRequest()"
+		/*
+			if (g.NavWindow && ((g.NavWindow->Flags & ImGuiWindowFlags_Popup) || !(g.NavWindow->Flags & ImGuiWindowFlags_ChildWindow))) {
+				if (g.NavWindow->NavLastIds[0] != 0) {
+					g.NavWindow->NavLastIds[0] = 0;
+				} else {
+					FocusWindow(NULL);
+				}
+			}
+		*/
+	}
+
+	ImGuiDrawing::~ImGuiDrawing()
+	{
+		// Destroy all textures
+		for (ImTextureData* tex : ImGui::GetPlatformIO().Textures) {
+			if (tex->RefCount == 1) {
+				DestroyTexture(tex);
+			}
+		}
+
+#if defined(IMGUI_HAS_VIEWPORT) && defined(WITH_RHI_GL)
+		// The raw-GL buffer handles only exist on the GL backend (matching the member declarations)
+		if (_vboHandle) {
+			glDeleteBuffers(1, &_vboHandle);
+			_vboHandle = 0;
+		}
+		if (_elementsHandle) {
+			glDeleteBuffers(1, &_elementsHandle);
+			_elementsHandle = 0;
+		}
+#endif
+
+		ImGuiIO& io = ImGui::GetIO();
+		io.BackendRendererName = nullptr;
+		io.BackendRendererUserData = nullptr;
+		io.BackendFlags &= ~(ImGuiBackendFlags_RendererHasVtxOffset | ImGuiBackendFlags_RendererHasTextures);
+#if defined(IMGUI_HAS_VIEWPORT)
+		io.BackendFlags &= ~ImGuiBackendFlags_RendererHasViewports;
+#endif
+	}
+
+	void ImGuiDrawing::NewFrame()
+	{
+#if defined(WITH_GLFW)
+		ImGuiGlfwInput::newFrame();
+#elif (defined(WITH_SDL2) || defined(WITH_SDL3))
+		ImGuiSdlInput::newFrame();
+#elif defined(DEATH_TARGET_ANDROID)
+		ImGuiAndroidInput::newFrame();
+#endif
+
+#if !defined(IMGUI_HAS_VIEWPORT)
+		// _projectionMatrix must be recaltulated when the main window moves if viewports are active
+		ImGuiIO& io = ImGui::GetIO();
+		if (_lastFrameWidth != io.DisplaySize.x || _lastFrameHeight != io.DisplaySize.y) {
+			_lastFrameWidth = io.DisplaySize.x;
+			_lastFrameHeight = io.DisplaySize.y;
+			_projectionMatrix = Matrix4x4f::Ortho(0.0f, io.DisplaySize.x, io.DisplaySize.y, 0.0f, -1.0f, 1.0f);
+
+			if (!_withSceneGraph) {
+				_imguiShaderUniforms->GetUniform(Material::GuiProjectionMatrixUniformName)->SetFloatVector(_projectionMatrix.Data());
+				_imguiShaderUniforms->GetUniform(Material::DepthUniformName)->SetFloatValue(0.0f);
+				_imguiShaderUniforms->CommitUniforms();
+			}
+		}
+#endif
+
+		ImGui::NewFrame();
+
+		// Decide who owns the mouse cursor this frame. The application hides it in fullscreen, and
+		// IInputManager::setCursor() then also forbids ImGui from touching it (ImGuiConfigFlags_NoMouseCursorChange)
+		// so the game's choice sticks - but that leaves any ImGui window on screen unusable, with no pointer to aim
+		// with. So ImGui is allowed to drive the cursor whenever it has a window up, and told to want none
+		// (ImGuiMouseCursor_None, which the platform backend turns into a hidden OS cursor) when it does not and the
+		// application asked for a hidden one. A locked cursor is never interfered with: relative mouse mode needs it
+		// hidden and captured. The application's own cursor state is never changed here, only ImGui's permission.
+		// MetricsRenderWindows counts the windows of the last frame, so this follows them appearing and disappearing
+		// on its own; note that a permanently visible overlay panel keeps the cursor visible in fullscreen too.
+		IInputManager& inputManager = theApplication().GetInputManager();
+		const IInputManager::Cursor appCursor = inputManager.cursor();
+		if (appCursor == IInputManager::Cursor::HiddenLocked) {
+			ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+		} else {
+			ImGui::GetIO().ConfigFlags &= ~ImGuiConfigFlags_NoMouseCursorChange;
+			if (appCursor == IInputManager::Cursor::Hidden && ImGui::GetIO().MetricsRenderWindows == 0) {
+				ImGui::SetMouseCursor(ImGuiMouseCursor_None);
+			}
+		}
+	}
+
+	void ImGuiDrawing::EndFrame(RenderQueue& renderQueue)
+	{
+		ImGui::EndFrame();
+		ImGui::Render();
+
+#if defined(WITH_GLFW)
+		ImGuiGlfwInput::endFrame();
+#elif (defined(WITH_SDL2) || defined(WITH_SDL3))
+		ImGuiSdlInput::endFrame();
+#endif
+
+		ImGuiIO& io = ImGui::GetIO();
+		if (io.WantCaptureKeyboard) {
+			if (_appInputHandler == nullptr) {
+				_appInputHandler = IInputManager::handler();
+				IInputManager::setHandler(nullptr);
+			}
+		} else {
+			if (_appInputHandler != nullptr) {
+				IInputManager::setHandler(_appInputHandler);
+				_appInputHandler = nullptr;
+			}
+		}
+
+		Draw(renderQueue);
+	}
+
+	void ImGuiDrawing::EndFrame()
+	{
+		ImGui::EndFrame();
+		ImGui::Render();
+
+		Draw();
+	}
+
+	void ImGuiDrawing::DestroyTexture(ImTextureData* tex)
+	{
+		RHI::Texture* texturePtr = (RHI::Texture*)(intptr_t)tex->TexID;
+		_textures.erase(texturePtr);
+
+		// Clear identifiers and mark as destroyed (in order to allow, e.g., calling InvalidateDeviceObjects while running)
+		tex->SetTexID(ImTextureID_Invalid);
+		tex->SetStatus(ImTextureStatus_Destroyed);
+	}
+
+	void ImGuiDrawing::UpdateTexture(ImTextureData* tex)
+	{
+		// FIXME: Consider backing up and restoring
+		if (tex->Status == ImTextureStatus_WantCreate || tex->Status == ImTextureStatus_WantUpdates) {
+#ifdef GL_UNPACK_ROW_LENGTH // Not on WebGL/ES
+			glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#endif
+#ifdef GL_UNPACK_ALIGNMENT
+			glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+#endif
+		}
+
+		if (tex->Status == ImTextureStatus_WantCreate) {
+			// Create and upload new texture to graphics system
+			//IMGUI_DEBUG_LOG("UpdateTexture #%03d: WantCreate %dx%d\n", tex->UniqueID, tex->Width, tex->Height);
+			IM_ASSERT(tex->TexID == 0 && tex->BackendUserData == nullptr);
+			IM_ASSERT(tex->Format == ImTextureFormat_RGBA32);
+			const void* pixels = tex->GetPixels();
+
+			// Upload texture to graphics system
+			// (Bilinear sampling is required by default. Set 'io.Fonts->Flags |= ImFontAtlasFlags_NoBakedLines' or 'style.AntiAliasedLinesUseTex = false' to allow point/nearest sampling)
+#if defined(WITH_RHI_GL)
+			// Preserve the GL bind-state cache across the upload's internal binds
+			GLint lastTexture = RHI::Texture::GetBoundHandle(GL_TEXTURE_2D);
+#endif
+			std::unique_ptr<RHI::Texture> texture = std::make_unique<RHI::Texture>(TextureTarget::Texture2D);
+			texture->SetMinFiltering(SamplerFilter::Linear);
+			texture->SetMagFiltering(SamplerFilter::Linear);
+			texture->SetWrap(SamplerWrapping::ClampToEdge);
+			texture->TexImage2D(0, PixelFormat::RGBA8, false, tex->Width, tex->Height, pixels);
+
+			RHI::Texture* texturePtr = texture.get();
+			_textures.emplace(texturePtr, std::move(texture));
+			// Store identifiers
+			tex->SetTexID((ImTextureID)(intptr_t)texturePtr);
+			tex->SetStatus(ImTextureStatus_OK);
+
+#if defined(WITH_RHI_GL)
+			// Restore state
+			RHI::Texture::BindHandle(GL_TEXTURE_2D, lastTexture);
+#endif
+		} else if (tex->Status == ImTextureStatus_WantUpdates) {
+			// Update selected blocks. We only ever write to textures regions which have never been used before!
+			// This backend choose to use tex->Updates[] but you can use tex->UpdateRect to upload a single region.
+#if defined(WITH_RHI_GL)
+			GLint lastTexture = RHI::Texture::GetBoundHandle(GL_TEXTURE_2D);
+#endif
+
+			RHI::Texture* texturePtr = (RHI::Texture*)(intptr_t)tex->TexID;
+			texturePtr->Bind();
+
+#ifdef GL_UNPACK_ROW_LENGTH // Not on WebGL/ES
+			glPixelStorei(GL_UNPACK_ROW_LENGTH, tex->Width);
+			for (ImTextureRect& r : tex->Updates) {
+				texturePtr->TexSubImage2D(0, r.x, r.y, r.w, r.h, PixelFormat::RGBA8, false, tex->GetPixelsAt(r.x, r.y));
+			}
+			glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+#else
+			// GL ES doesn't have GL_UNPACK_ROW_LENGTH, so we need to (A) copy to a contiguous buffer or (B) upload line by line.
+			for (ImTextureRect& r : tex->Updates) {
+				const int srcPitch = r.w * tex->BytesPerPixel;
+				if (_tempTexBuffer.size() < r.h * srcPitch)
+					_tempTexBuffer.resize(r.h * srcPitch);
+				char* outP = _tempTexBuffer.data();
+				for (int y = 0; y < r.h; y++, outP += srcPitch)
+					memcpy(outP, tex->GetPixelsAt(r.x, r.y + y), srcPitch);
+				texturePtr->TexSubImage2D(0, r.x, r.y, r.w, r.h, PixelFormat::RGBA8, false, _tempTexBuffer.data());
+			}
+#endif
+			tex->SetStatus(ImTextureStatus_OK);
+#if defined(WITH_RHI_GL)
+			RHI::Texture::BindHandle(GL_TEXTURE_2D, lastTexture); // Restore state
+#endif
+		} else if (tex->Status == ImTextureStatus_WantDestroy && tex->UnusedFrames > 0) {
+			DestroyTexture(tex);
+		}
+	}
+
+	RenderCommand* ImGuiDrawing::RetrieveCommandFromPool()
+	{
+		bool commandAdded = false;
+		RenderCommand* retrievedCommand = RenderResources::GetRenderCommandPool().RetrieveOrAdd(_imguiShaderProgram.get(), commandAdded);
+		if (commandAdded) {
+			SetupRenderCommand(*retrievedCommand);
+		}
+		return retrievedCommand;
+	}
+
+	void ImGuiDrawing::SetupRenderCommand(RenderCommand& cmd)
+	{
+		cmd.SetType(RenderCommand::Type::ImGui);
+
+		Material& material = cmd.GetMaterial();
+		material.SetShaderProgram(_imguiShaderProgram.get());
+		material.ReserveUniformsDataMemory();
+		material.Uniform(Material::TextureUniformName)->SetIntValue(0); // GL_TEXTURE0
+		_imguiShaderProgram->GetAttribute(Material::PositionAttributeName)->SetVboParameters(sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, pos)));
+		_imguiShaderProgram->GetAttribute(Material::TexCoordsAttributeName)->SetVboParameters(sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, uv)));
+		_imguiShaderProgram->GetAttribute(Material::ColorAttributeName)->SetVboParameters(sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, col)));
+		_imguiShaderProgram->GetAttribute(Material::ColorAttributeName)->SetType(std::uint32_t(VertexAttribType::UnsignedByte));
+		_imguiShaderProgram->GetAttribute(Material::ColorAttributeName)->SetNormalized(true);
+		material.SetBlendingEnabled(true);
+		material.SetBlendingFactors(BlendingFactor::SrcAlpha, BlendingFactor::OneMinusSrcAlpha);
+
+		cmd.GetGeometry().SetElementsPerVertex(sizeof(ImDrawVert) / sizeof(float));
+		cmd.GetGeometry().SetDrawParameters(PrimitiveType::Triangles, 0, 0);
+	}
+
+	void ImGuiDrawing::Draw(RenderQueue& renderQueue)
+	{
+		ImDrawData* drawData = ImGui::GetDrawData();
+
+		const std::uint32_t numElements = sizeof(ImDrawVert) / sizeof(float);
+
+		ImGuiIO& io = ImGui::GetIO();
+		const std::int32_t fbWidth = std::int32_t(drawData->DisplaySize.x * drawData->FramebufferScale.x);
+		const std::int32_t fbHeight = std::int32_t(drawData->DisplaySize.y * drawData->FramebufferScale.y);
+		if (fbWidth <= 0 || fbHeight <= 0) {
+			return;
+		}
+		const ImVec2 clipOff = drawData->DisplayPos;
+		const ImVec2 clipScale = drawData->FramebufferScale;
+
+		if (drawData->Textures != nullptr) {
+			for (ImTextureData* tex : *drawData->Textures) {
+				if (tex->Status != ImTextureStatus_OK) {
+					UpdateTexture(tex);
+				}
+			}
+		}
+
+#if defined(IMGUI_HAS_VIEWPORT)
+		// _projectionMatrix must be recaltulated when the main window moves if viewports are active
+		_projectionMatrix = Matrix4x4f::Ortho(0.0f, io.DisplaySize.x, io.DisplaySize.y, 0.0f, -1.0f, 1.0f);
+		_projectionMatrix.Translate(-clipOff.x, -clipOff.y, 0.0f);
+#endif
+
+		std::uint32_t numCmd = 0;
+		for (std::int32_t n = 0; n < drawData->CmdListsCount; n++) {
+			const ImDrawList* imCmdList = drawData->CmdLists[n];
+
+			RenderCommand& firstCmd = *RetrieveCommandFromPool();
+
+			firstCmd.GetMaterial().Uniform(Material::GuiProjectionMatrixUniformName)->SetFloatVector(_projectionMatrix.Data());
+
+			firstCmd.GetGeometry().ShareVbo(nullptr);
+			float* vertices = firstCmd.GetGeometry().AcquireVertexPointer(imCmdList->VtxBuffer.Size * numElements, numElements);
+			memcpy(vertices, imCmdList->VtxBuffer.Data, imCmdList->VtxBuffer.Size * numElements * sizeof(float));
+			firstCmd.GetGeometry().ReleaseVertexPointer();
+
+			firstCmd.GetGeometry().ShareIbo(nullptr);
+			std::uint16_t* indices = firstCmd.GetGeometry().AcquireIndexPointer(imCmdList->IdxBuffer.Size);
+			memcpy(indices, imCmdList->IdxBuffer.Data, imCmdList->IdxBuffer.Size * sizeof(std::uint16_t));
+			firstCmd.GetGeometry().ReleaseIndexPointer();
+
+			if (_lastLayerValue != theApplication().GetGuiSettings().imguiLayer) {
+				// It is enough to set the uniform value once as every ImGui command share the same shader
+				const float depth = RenderCommand::CalculateDepth(theApplication().GetGuiSettings().imguiLayer, -1.0f, 1.0f);
+				firstCmd.GetMaterial().Uniform(Material::DepthUniformName)->SetFloatValue(depth);
+				_lastLayerValue = theApplication().GetGuiSettings().imguiLayer;
+			}
+
+			for (std::int32_t cmdIdx = 0; cmdIdx < imCmdList->CmdBuffer.Size; cmdIdx++) {
+				const ImDrawCmd* imCmd = &imCmdList->CmdBuffer[cmdIdx];
+				RenderCommand& currCmd = (cmdIdx == 0) ? firstCmd : *RetrieveCommandFromPool();
+
+				// Project scissor/clipping rectangles into framebuffer space
+				ImVec2 clipMin((imCmd->ClipRect.x - clipOff.x) * clipScale.x, (imCmd->ClipRect.y - clipOff.y) * clipScale.y);
+				ImVec2 clipMax((imCmd->ClipRect.z - clipOff.x) * clipScale.x, (imCmd->ClipRect.w - clipOff.y) * clipScale.y);
+				if (clipMax.x <= clipMin.x || clipMax.y <= clipMin.y)
+					continue;
+
+				// Apply scissor/clipping rectangle (top-left origin, like ImGui's own - see RhiFwd.h)
+				currCmd.SetScissor(static_cast<std::int32_t>(clipMin.x), static_cast<std::int32_t>(clipMin.y),
+								   static_cast<std::int32_t>(clipMax.x - clipMin.x), static_cast<std::int32_t>(clipMax.y - clipMin.y));
+
+				if (cmdIdx > 0) {
+					currCmd.GetGeometry().ShareVbo(&firstCmd.GetGeometry());
+					currCmd.GetGeometry().ShareIbo(&firstCmd.GetGeometry());
+				}
+
+				currCmd.GetGeometry().SetIndexCount(imCmd->ElemCount);
+				currCmd.GetGeometry().SetFirstIndex(imCmd->IdxOffset);
+				currCmd.GetGeometry().SetFirstVertex(imCmd->VtxOffset);
+				currCmd.SetLayer(theApplication().GetGuiSettings().imguiLayer);
+				currCmd.SetVisitOrder(numCmd);
+				currCmd.GetMaterial().SetTexture(reinterpret_cast<RHI::Texture*>(imCmd->GetTexID()));
+
+				renderQueue.AddCommand(&currCmd);
+				numCmd++;
+			}
+		}
+	}
+
+	void ImGuiDrawing::SetupBuffersAndShader()
+	{
+		_vbo = std::make_unique<RHI::Buffer>(BufferTarget::Vertex);
+		_ibo = std::make_unique<RHI::Buffer>(BufferTarget::Index);
+
+		_imguiShaderUniforms = std::make_unique<RHI::ShaderUniforms>(_imguiShaderProgram.get());
+		_imguiShaderUniforms->SetUniformsDataPointer(_uniformsBuffer);
+		_imguiShaderUniforms->GetUniform(Material::TextureUniformName)->SetIntValue(0); // GL_TEXTURE0
+
+		_imguiShaderProgram->GetAttribute(Material::PositionAttributeName)->SetVboParameters(sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, pos)));
+		_imguiShaderProgram->GetAttribute(Material::TexCoordsAttributeName)->SetVboParameters(sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, uv)));
+		_imguiShaderProgram->GetAttribute(Material::ColorAttributeName)->SetVboParameters(sizeof(ImDrawVert), reinterpret_cast<void*>(offsetof(ImDrawVert, col)));
+		_imguiShaderProgram->GetAttribute(Material::ColorAttributeName)->SetType(std::uint32_t(VertexAttribType::UnsignedByte));
+		_imguiShaderProgram->GetAttribute(Material::ColorAttributeName)->SetNormalized(true);
+	}
+
+	void ImGuiDrawing::Draw()
+	{
+		DrawData(ImGui::GetDrawData(), _vbo.get(), _ibo.get());
+	}
+
+	void ImGuiDrawing::DrawData(ImDrawData* drawData, RHI::Buffer* vbo, RHI::Buffer* ibo)
+	{
+		const std::int32_t fbWidth = std::int32_t(drawData->DisplaySize.x * drawData->FramebufferScale.x);
+		const std::int32_t fbHeight = std::int32_t(drawData->DisplaySize.y * drawData->FramebufferScale.y);
+		if (fbWidth <= 0 || fbHeight <= 0) {
+			return;
+		}
+
+		const ImVec2 clipOff = drawData->DisplayPos;
+		const ImVec2 clipScale = drawData->FramebufferScale;
+
+		if (drawData->Textures != nullptr) {
+			for (ImTextureData* tex : *drawData->Textures) {
+				if (tex->Status != ImTextureStatus_OK) {
+					UpdateTexture(tex);
+				}
+			}
+		}
+
+		// The projection is derived from this draw data, not from the display size: a multi-viewport platform
+		// window has its own origin (DisplayPos), and its geometry is expressed in the same virtual desktop space
+		_imguiShaderProgram->Use();
+		Matrix4x4f projection = Matrix4x4f::Ortho(drawData->DisplayPos.x, drawData->DisplayPos.x + drawData->DisplaySize.x,
+			drawData->DisplayPos.y + drawData->DisplaySize.y, drawData->DisplayPos.y, -1.0f, 1.0f);
+		_imguiShaderUniforms->GetUniform(Material::GuiProjectionMatrixUniformName)->SetFloatVector(projection.Data());
+		_imguiShaderUniforms->GetUniform(Material::DepthUniformName)->SetFloatValue(0.0f);
+		_imguiShaderUniforms->CommitUniforms();
+
+		RHI::Device::BlendingState blendingState = RHI::Device::GetBlendingState();
+		RHI::Device::SetBlendingEnabled(true);
+		RHI::Device::SetBlendingFactors(BlendingFactor::SrcAlpha, BlendingFactor::OneMinusSrcAlpha, BlendingFactor::SrcAlpha, BlendingFactor::OneMinusSrcAlpha);
+		RHI::Device::CullFaceState cullFaceState = RHI::Device::GetCullFaceState();
+		RHI::Device::SetCullFaceEnabled(false);
+		RHI::Device::DepthTestState depthTestState = RHI::Device::GetDepthTestState();
+		RHI::Device::SetDepthTestEnabled(false);
+
+		const IndexFormat indexFormat = (sizeof(ImDrawIdx) == 2 ? IndexFormat::UInt16 : IndexFormat::UInt32);
+
+		// Every command list's geometry is uploaded first, contiguously, and only then drawn from with per-list
+		// base offsets. Uploading and drawing one list at a time would corrupt the output on a backend that defers
+		// execution (Vulkan records the draws and runs them at submit time, when only the last upload into the
+		// reused buffer is still there) - and multi-list draw data is exactly what a busy window produces.
+		std::size_t totalVertices = 0, totalIndices = 0;
+		for (std::int32_t n = 0; n < drawData->CmdListsCount; n++) {
+			totalVertices += std::size_t(drawData->CmdLists[n]->VtxBuffer.Size);
+			totalIndices += std::size_t(drawData->CmdLists[n]->IdxBuffer.Size);
+		}
+		if (totalVertices > 0 && totalIndices > 0) {
+			// Always define vertex format (and bind VAO) before uploading data to buffers
+			_imguiShaderProgram->DefineVertexFormat(vbo, ibo);
+			vbo->BufferData(totalVertices * sizeof(ImDrawVert), nullptr, BufferUsage::StreamDraw);
+			ibo->BufferData(totalIndices * sizeof(ImDrawIdx), nullptr, BufferUsage::StreamDraw);
+
+			std::size_t vertexOffset = 0, indexOffset = 0;
+			for (std::int32_t n = 0; n < drawData->CmdListsCount; n++) {
+				const ImDrawList* imCmdList = drawData->CmdLists[n];
+				vbo->BufferSubData(vertexOffset * sizeof(ImDrawVert), std::size_t(imCmdList->VtxBuffer.Size) * sizeof(ImDrawVert), imCmdList->VtxBuffer.Data);
+				ibo->BufferSubData(indexOffset * sizeof(ImDrawIdx), std::size_t(imCmdList->IdxBuffer.Size) * sizeof(ImDrawIdx), imCmdList->IdxBuffer.Data);
+				vertexOffset += std::size_t(imCmdList->VtxBuffer.Size);
+				indexOffset += std::size_t(imCmdList->IdxBuffer.Size);
+			}
+			_imguiShaderProgram->Use();
+		}
+
+		std::size_t vertexBase = 0, indexBase = 0;
+		for (std::int32_t n = 0; n < drawData->CmdListsCount; n++) {
+			const ImDrawList* imCmdList = drawData->CmdLists[n];
+
+			for (std::int32_t cmdIdx = 0; cmdIdx < imCmdList->CmdBuffer.Size; cmdIdx++) {
+				const ImDrawCmd* imCmd = &imCmdList->CmdBuffer[cmdIdx];
+
+				// Project scissor/clipping rectangles into framebuffer space
+				ImVec2 clipMin((imCmd->ClipRect.x - clipOff.x) * clipScale.x, (imCmd->ClipRect.y - clipOff.y) * clipScale.y);
+				ImVec2 clipMax((imCmd->ClipRect.z - clipOff.x) * clipScale.x, (imCmd->ClipRect.w - clipOff.y) * clipScale.y);
+				if (clipMax.x <= clipMin.x || clipMax.y <= clipMin.y) {
+					continue;
+				}
+
+				// Apply scissor/clipping rectangle (top-left origin, like ImGui's own - see RhiFwd.h)
+				RHI::Device::SetScissor(Recti(std::int32_t(clipMin.x), std::int32_t(clipMin.y),
+					std::int32_t(clipMax.x - clipMin.x), std::int32_t(clipMax.y - clipMin.y)));
+
+				// Bind texture, Draw
+				reinterpret_cast<RHI::Texture*>(imCmd->GetTexID())->Bind();
+				// Both offsets come from the command itself (plus this list's base in the shared upload), so
+				// commands skipped by an empty clip rectangle cannot desynchronize the ones that follow
+				RHI::Device::DrawElements(PrimitiveType::Triangles, imCmd->ElemCount, indexFormat,
+					(indexBase + std::uintptr_t(imCmd->IdxOffset)) * sizeof(ImDrawIdx),
+					std::int32_t(vertexBase + std::size_t(imCmd->VtxOffset)));
+			}
+
+			vertexBase += std::size_t(imCmdList->VtxBuffer.Size);
+			indexBase += std::size_t(imCmdList->IdxBuffer.Size);
+		}
+
+		RHI::Device::SetScissorTestEnabled(false);
+		RHI::Device::SetDepthTestState(depthTestState);
+		RHI::Device::SetCullFaceState(cullFaceState);
+		RHI::Device::SetBlendingState(blendingState);
+	}
+
+#if defined(IMGUI_HAS_VIEWPORT) && defined(WITH_RHI_GL)
+	// The multi-viewport path below intentionally uses raw OpenGL instead of the RHI: it renders into
+	// the GL contexts of additional platform windows, where the RHI backend's single-context state and
+	// bind caches would hold stale values and must not be consulted
+	void ImGuiDrawing::PrepareForViewports()
+	{
+		ImGuiIO& io = ImGui::GetIO();
+		io.BackendFlags |= ImGuiBackendFlags_RendererHasViewports;
+
+		ImGuiPlatformIO& platformIo = ImGui::GetPlatformIO();
+		platformIo.Renderer_RenderWindow = OnRenderPlatformWindow;
+
+		// Backup GL state
+		GLint lastTexture, lastArrayBuffer;
+		glGetIntegerv(GL_TEXTURE_BINDING_2D, &lastTexture);
+		glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &lastArrayBuffer);
+		GLint lastPixelUnpackBuffer = 0;
+
+		GLint lastVertexArray;
+		glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &lastVertexArray);
+
+		// TODO: Use nCine shaders directly instead
+		auto shaderHandle = _imguiShaderProgram.get()->GetGLHandle();
+
+		_attribLocationTex = glGetUniformLocation(shaderHandle, "uTexture");
+		_attribLocationProjMtx = glGetUniformLocation(shaderHandle, "uGuiProjection");
+		_attribLocationVtxPos = (GLuint)glGetAttribLocation(shaderHandle, "aPosition");
+		_attribLocationVtxUV = (GLuint)glGetAttribLocation(shaderHandle, "aTexCoords");
+		_attribLocationVtxColor = (GLuint)glGetAttribLocation(shaderHandle, "aColor");
+
+		// Create buffers
+		// TODO: Use nCine RHI::Buffer directly
+		glGenBuffers(1, &_vboHandle);
+		glGenBuffers(1, &_elementsHandle);
+
+		// Restore modified GL state
+		glBindTexture(GL_TEXTURE_2D, lastTexture);
+		glBindBuffer(GL_ARRAY_BUFFER, lastArrayBuffer);
+
+		glBindVertexArray(lastVertexArray);
+	}
+
+	void ImGuiDrawing::OnRenderPlatformWindow(ImGuiViewport* viewport, void*)
+	{
+		ImGuiDrawing* _this = static_cast<ImGuiDrawing*>(ImGui::GetIO().BackendRendererUserData);
+		_this->DrawPlatformWindow(viewport);
+	}
+
+	void ImGuiDrawing::DrawPlatformWindow(ImGuiViewport* viewport)
+	{
+		if (!(viewport->Flags & ImGuiViewportFlags_NoRendererClear)) {
+			glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+			glClear(GL_COLOR_BUFFER_BIT);
+		}
+		
+		ImDrawData* drawData = viewport->DrawData;
+
+		// Avoid rendering when minimized, scale coordinates for retina displays (screen coordinates != framebuffer coordinates)
+		std::int32_t fbWidth = std::int32_t(drawData->DisplaySize.x * drawData->FramebufferScale.x);
+		std::int32_t fbHeight = std::int32_t(drawData->DisplaySize.y * drawData->FramebufferScale.y);
+		if (fbWidth <= 0 || fbHeight <= 0) {
+			return;
+		}
+
+		// Setup desired GL state
+		// Recreate the VAO every time (this is to easily allow multiple GL contexts to be rendered to. VAO are not shared among GL contexts)
+		// The renderer would actually work without any VAO bound, but then our VertexAttrib calls would overwrite the default one currently bound.
+		GLuint vertexArrayObject = 0;
+		GL_CALL(glGenVertexArrays(1, &vertexArrayObject));
+		SetupRenderStateForPlatformWindow(drawData, fbWidth, fbHeight, vertexArrayObject);
+
+		// Will project scissor/clipping rectangles into framebuffer space
+		ImVec2 clipOff = drawData->DisplayPos;         // (0,0) unless using multi-viewports
+		ImVec2 clipScale = drawData->FramebufferScale; // (1,1) unless using retina display which are often (2,2)
+
+		for (std::int32_t n = 0; n < drawData->CmdListsCount; n++) {
+			const ImDrawList* imCmdList = drawData->CmdLists[n];
+
+			const GLsizeiptr vtxBufferSize = GLsizeiptr(imCmdList->VtxBuffer.Size) * std::int32_t(sizeof(ImDrawVert));
+			const GLsizeiptr idxBufferSize = GLsizeiptr(imCmdList->IdxBuffer.Size) * std::int32_t(sizeof(ImDrawIdx));
+			GL_CALL(glBufferData(GL_ARRAY_BUFFER, vtxBufferSize, (const GLvoid*)imCmdList->VtxBuffer.Data, GL_STREAM_DRAW));
+			GL_CALL(glBufferData(GL_ELEMENT_ARRAY_BUFFER, idxBufferSize, (const GLvoid*)imCmdList->IdxBuffer.Data, GL_STREAM_DRAW));
+
+			for (std::int32_t cmd_i = 0; cmd_i < imCmdList->CmdBuffer.Size; cmd_i++) {
+				const ImDrawCmd* imCmd = &imCmdList->CmdBuffer[cmd_i];
+				if (imCmd->UserCallback != nullptr) {
+					// User callback, registered via ImDrawList::AddCallback()
+					// (ImDrawCallback_ResetRenderState is a special callback value used by the user to request the renderer to reset render state.)
+					if (imCmd->UserCallback == ImGui::GetPlatformIO().DrawCallback_ResetRenderState) {
+						SetupRenderStateForPlatformWindow(drawData, fbWidth, fbHeight, vertexArrayObject);
+					} else {
+						imCmd->UserCallback(imCmdList, imCmd);
+					}
+				} else {
+					// Project scissor/clipping rectangles into framebuffer space
+					ImVec2 clipMin((imCmd->ClipRect.x - clipOff.x) * clipScale.x, (imCmd->ClipRect.y - clipOff.y) * clipScale.y);
+					ImVec2 clipMax((imCmd->ClipRect.z - clipOff.x) * clipScale.x, (imCmd->ClipRect.w - clipOff.y) * clipScale.y);
+					if (clipMax.x <= clipMin.x || clipMax.y <= clipMin.y) {
+						continue;
+					}
+
+					// Apply scissor/clipping rectangle (Y is inverted in OpenGL)
+					GL_CALL(glScissor(static_cast<GLint>(clipMin.x), static_cast<GLint>(static_cast<float>(fbHeight) - clipMax.y),
+						static_cast<GLint>(clipMax.x - clipMin.x), static_cast<GLint>(clipMax.y - clipMin.y)));
+
+					auto* texture = reinterpret_cast<nCine::RHI::Texture*>(imCmd->GetTexID());
+					GL_CALL(glBindTexture(GL_TEXTURE_2D, texture->GetGLHandle()));
+					GL_CALL(glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(imCmd->ElemCount), sizeof(ImDrawIdx) == 2 ? GL_UNSIGNED_SHORT : GL_UNSIGNED_INT,
+						reinterpret_cast<void*>(static_cast<intptr_t>(imCmd->IdxOffset * sizeof(ImDrawIdx)))));
+				}
+			}
+		}
+
+		// Destroy the temporary VAO
+		GL_CALL(glDeleteVertexArrays(1, &vertexArrayObject));
+	}
+
+	void ImGuiDrawing::SetupRenderStateForPlatformWindow(ImDrawData* drawData, std::int32_t fbWidth, std::int32_t fbHeight, unsigned int vertexArrayObject)
+	{
+		glEnable(GL_BLEND);
+		glBlendEquation(GL_FUNC_ADD);
+		glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+		glDisable(GL_CULL_FACE);
+		glDisable(GL_DEPTH_TEST);
+		glDisable(GL_STENCIL_TEST);
+		glEnable(GL_SCISSOR_TEST);
+
+		// Setup viewport, orthographic projection matrix
+		// Our visible imgui space lies from draw_data->DisplayPos (top left) to draw_data->DisplayPos+data_data->DisplaySize (bottom right). DisplayPos is (0,0) for single viewport apps.
+		GL_CALL(glViewport(0, 0, (GLsizei)fbWidth, (GLsizei)fbHeight));
+		float L = drawData->DisplayPos.x;
+		float R = drawData->DisplayPos.x + drawData->DisplaySize.x;
+		float T = drawData->DisplayPos.y;
+		float B = drawData->DisplayPos.y + drawData->DisplaySize.y;
+
+		const float ortho_projection[4][4] = {
+			{ 2.0f / (R - L),		0.0f,				0.0f,		0.0f },
+			{ 0.0f,					2.0f / (T - B),		0.0f,		0.0f },
+			{ 0.0f,					0.0f,				-1.0f,		0.0f },
+			{ (R + L) / (L - R),	(T + B) / (B - T),  0.0f,		1.0f },
+		};
+
+		// TODO: Use nCine shaders directly instead
+		auto shaderHandle = _imguiShaderProgram.get()->GetGLHandle();
+
+		glUseProgram(shaderHandle);
+		glUniform1i(_attribLocationTex, 0);
+		glUniformMatrix4fv(_attribLocationProjMtx, 1, GL_FALSE, &ortho_projection[0][0]);
+
+		glBindVertexArray(vertexArrayObject);
+
+		// Bind vertex/index buffers and setup attributes for ImDrawVert
+		GL_CALL(glBindBuffer(GL_ARRAY_BUFFER, _vboHandle));
+		GL_CALL(glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, _elementsHandle));
+
+		GL_CALL(glEnableVertexAttribArray(_attribLocationVtxPos));
+		GL_CALL(glEnableVertexAttribArray(_attribLocationVtxUV));
+		GL_CALL(glEnableVertexAttribArray(_attribLocationVtxColor));
+		GL_CALL(glVertexAttribPointer(_attribLocationVtxPos, 2, GL_FLOAT, GL_FALSE, sizeof(ImDrawVert), (GLvoid*)offsetof(ImDrawVert, pos)));
+		GL_CALL(glVertexAttribPointer(_attribLocationVtxUV, 2, GL_FLOAT, GL_FALSE, sizeof(ImDrawVert), (GLvoid*)offsetof(ImDrawVert, uv)));
+		GL_CALL(glVertexAttribPointer(_attribLocationVtxColor, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(ImDrawVert), (GLvoid*)offsetof(ImDrawVert, col)));
+	}
+#elif defined(IMGUI_HAS_VIEWPORT) && defined(WITH_RHI_D3D11)
+	// The Direct3D 11 multi-viewport path renders through the ordinary RHI pipeline: one device serves every
+	// window, so a platform window only needs a swap chain of its own that the device can be redirected into
+	// (D3D11Device::BeginSecondaryFrame). No second context, and no backend calls behind the RHI's back.
+	void ImGuiDrawing::PrepareForViewports()
+	{
+		ImGuiIO& io = ImGui::GetIO();
+		io.BackendFlags |= ImGuiBackendFlags_RendererHasViewports;
+
+		ImGuiPlatformIO& platformIo = ImGui::GetPlatformIO();
+		platformIo.Renderer_CreateWindow = OnCreatePlatformWindow;
+		platformIo.Renderer_DestroyWindow = OnDestroyPlatformWindow;
+		platformIo.Renderer_SetWindowSize = OnResizePlatformWindow;
+		platformIo.Renderer_RenderWindow = OnRenderPlatformWindow;
+		platformIo.Renderer_SwapBuffers = OnSwapPlatformWindowBuffers;
+
+		// Platform windows are drawn outside the scene graph, so they need the vertex/index buffers and uniform
+		// storage of the direct path even when the main window renders through the render-command path
+		if (_vbo == nullptr) {
+			SetupBuffersAndShader();
+		}
+	}
+
+	void ImGuiDrawing::OnCreatePlatformWindow(ImGuiViewport* viewport)
+	{
+		// PlatformHandleRaw is the native handle of the window the platform backend created for this viewport
+		viewport->RendererUserData = RHI::Device::CreateSecondarySwapchain(viewport->PlatformHandleRaw,
+			std::int32_t(viewport->Size.x), std::int32_t(viewport->Size.y));
+	}
+
+	void ImGuiDrawing::OnDestroyPlatformWindow(ImGuiViewport* viewport)
+	{
+		RHI::Device::DestroySecondarySwapchain(viewport->RendererUserData);
+		viewport->RendererUserData = nullptr;
+	}
+
+	void ImGuiDrawing::OnResizePlatformWindow(ImGuiViewport* viewport, ImVec2 size)
+	{
+		RHI::Device::ResizeSecondarySwapchain(viewport->RendererUserData, std::int32_t(size.x), std::int32_t(size.y));
+	}
+
+	void ImGuiDrawing::OnRenderPlatformWindow(ImGuiViewport* viewport, void*)
+	{
+		ImGuiDrawing* _this = static_cast<ImGuiDrawing*>(ImGui::GetIO().BackendRendererUserData);
+		_this->DrawPlatformWindow(viewport);
+	}
+
+	void ImGuiDrawing::OnSwapPlatformWindowBuffers(ImGuiViewport* viewport, void*)
+	{
+		RHI::Device::PresentSecondaryFrame(viewport->RendererUserData);
+	}
+
+	void ImGuiDrawing::DrawPlatformWindow(ImGuiViewport* viewport)
+	{
+		if (viewport->RendererUserData == nullptr) {
+			return;
+		}
+
+		ImDrawData* drawData = viewport->DrawData;
+		const std::int32_t fbWidth = std::int32_t(drawData->DisplaySize.x * drawData->FramebufferScale.x);
+		const std::int32_t fbHeight = std::int32_t(drawData->DisplaySize.y * drawData->FramebufferScale.y);
+		if (fbWidth <= 0 || fbHeight <= 0) {
+			return;
+		}
+
+		// Point the device at this window's back-buffer, draw into it with the shared direct path, then hand the
+		// device back to the main window. The swap chain is presented afterwards, from Renderer_SwapBuffers -
+		// ImGui renders every platform window first and only then swaps them all.
+		const Recti previousViewport = RHI::Device::GetViewport();
+		RHI::Device::BeginSecondaryFrame(viewport->RendererUserData, (viewport->Flags & ImGuiViewportFlags_NoRendererClear) == 0);
+		RHI::Device::SetViewport(Recti(0, 0, fbWidth, fbHeight));
+
+		// The shared buffers are enough here: this backend executes each draw as it is issued, so the next window
+		// overwriting them cannot affect the draws already made
+		DrawData(drawData, _vbo.get(), _ibo.get());
+
+		RHI::Device::EndSecondaryFrame();
+		RHI::Device::SetViewport(previousViewport);
+	}
+#elif defined(IMGUI_HAS_VIEWPORT) && (defined(WITH_RHI_VULKAN) || defined(WITH_RHI_METAL)) && (defined(WITH_SDL2) || defined(WITH_SDL3))
+	// The Vulkan and Metal multi-viewport path keeps everything it can inside the ordinary RHI: a platform window's contents
+	// are rendered into an off-screen render target like any other pass (so the usual top-down rows, scissor
+	// mapping and pipeline caches apply), and only the presentation is backend business - the device blits that
+	// texture into the window's own swap chain and joins it into the frame's single submit and present.
+	namespace
+	{
+		struct PlatformWindowData
+		{
+			std::unique_ptr<RHI::Texture> Target;
+			std::unique_ptr<RHI::RenderTarget> Framebuffer;
+			// Geometry buffers of this window alone. Sharing one pair across windows would corrupt them: the draws
+			// are recorded now and executed at submit time, by which point a shared buffer would only hold the
+			// geometry of whichever window was rendered last.
+			std::unique_ptr<RHI::Buffer> Vbo;
+			std::unique_ptr<RHI::Buffer> Ibo;
+			void* Swapchain = nullptr;
+			std::int32_t Width = 0;
+			std::int32_t Height = 0;
+		};
+	}
+
+	void ImGuiDrawing::PrepareForViewports()
+	{
+		ImGuiIO& io = ImGui::GetIO();
+		io.BackendFlags |= ImGuiBackendFlags_RendererHasViewports;
+
+		ImGuiPlatformIO& platformIo = ImGui::GetPlatformIO();
+		platformIo.Renderer_CreateWindow = OnCreatePlatformWindow;
+		platformIo.Renderer_DestroyWindow = OnDestroyPlatformWindow;
+		platformIo.Renderer_SetWindowSize = OnResizePlatformWindow;
+		platformIo.Renderer_RenderWindow = OnRenderPlatformWindow;
+		// Renderer_SwapBuffers is deliberately left unset: every window is presented from PresentFrame(), together
+		// with the main one, because they all share the frame's single command buffer and submit
+
+		// Platform windows are drawn outside the scene graph, so they need the vertex/index buffers and uniform
+		// storage of the direct path even when the main window renders through the render-command path
+		if (_vbo == nullptr) {
+			SetupBuffersAndShader();
+		}
+	}
+
+	void ImGuiDrawing::OnCreatePlatformWindow(ImGuiViewport* viewport)
+	{
+		PlatformWindowData* data = new PlatformWindowData();
+		data->Vbo = std::make_unique<RHI::Buffer>(BufferTarget::Vertex);
+		data->Ibo = std::make_unique<RHI::Buffer>(BufferTarget::Index);
+		// The surface / layer is created from the SDL window itself (SDL only allows that on a Vulkan resp. Metal
+		// window, which the platform backend creates because the RHI is Vulkan resp. Metal)
+		data->Swapchain = RHI::Device::CreateSecondarySwapchain(ImGuiSdlInput::getPlatformWindowHandle(viewport),
+			std::int32_t(viewport->Size.x), std::int32_t(viewport->Size.y));
+		viewport->RendererUserData = data;
+	}
+
+	void ImGuiDrawing::OnDestroyPlatformWindow(ImGuiViewport* viewport)
+	{
+		if (PlatformWindowData* data = static_cast<PlatformWindowData*>(viewport->RendererUserData)) {
+			RHI::Device::DestroySecondarySwapchain(data->Swapchain);
+			delete data;	// releases the render target and the texture behind it
+		}
+		viewport->RendererUserData = nullptr;
+	}
+
+	void ImGuiDrawing::OnResizePlatformWindow(ImGuiViewport* viewport, ImVec2 size)
+	{
+		if (PlatformWindowData* data = static_cast<PlatformWindowData*>(viewport->RendererUserData)) {
+			RHI::Device::ResizeSecondarySwapchain(data->Swapchain, std::int32_t(size.x), std::int32_t(size.y));
+		}
+	}
+
+	void ImGuiDrawing::OnRenderPlatformWindow(ImGuiViewport* viewport, void*)
+	{
+		ImGuiDrawing* _this = static_cast<ImGuiDrawing*>(ImGui::GetIO().BackendRendererUserData);
+		_this->DrawPlatformWindow(viewport);
+	}
+
+	void ImGuiDrawing::DrawPlatformWindow(ImGuiViewport* viewport)
+	{
+		PlatformWindowData* data = static_cast<PlatformWindowData*>(viewport->RendererUserData);
+		if (data == nullptr || data->Swapchain == nullptr) {
+			return;
+		}
+
+		ImDrawData* drawData = viewport->DrawData;
+		const std::int32_t fbWidth = std::int32_t(drawData->DisplaySize.x * drawData->FramebufferScale.x);
+		const std::int32_t fbHeight = std::int32_t(drawData->DisplaySize.y * drawData->FramebufferScale.y);
+		if (fbWidth <= 0 || fbHeight <= 0) {
+			return;
+		}
+
+		if (data->Target == nullptr || data->Width != fbWidth || data->Height != fbHeight) {
+			// Drop the framebuffer before the texture it was built from goes away
+			data->Framebuffer = nullptr;
+			data->Target = std::make_unique<RHI::Texture>(TextureTarget::Texture2D);
+			data->Target->TexStorage2D(1, PixelFormat::RGBA8, fbWidth, fbHeight);
+			data->Framebuffer = std::make_unique<RHI::RenderTarget>();
+			data->Framebuffer->AttachColorTexture(*data->Target, 0);
+			data->Width = fbWidth;
+			data->Height = fbHeight;
+		}
+
+		const Recti previousViewport = RHI::Device::GetViewport();
+		data->Framebuffer->BindDraw();
+		RHI::Device::SetViewport(Recti(0, 0, fbWidth, fbHeight));
+		if ((viewport->Flags & ImGuiViewportFlags_NoRendererClear) == 0) {
+			const Colorf previousClearColor = RHI::Device::GetClearColor();
+			RHI::Device::SetClearColor(Colorf(0.0f, 0.0f, 0.0f, 1.0f));
+			RHI::Device::Clear(ClearFlags::Color);
+			RHI::Device::SetClearColor(previousClearColor);
+		}
+
+		DrawData(drawData, data->Vbo.get(), data->Ibo.get());
+
+		RHI::RenderTarget::UnbindDraw();
+		RHI::Device::SetViewport(previousViewport);
+
+		// Hand the rendered texture over for this frame; the device presents it with the main window
+		RHI::Device::QueueSecondaryPresent(data->Swapchain, data->Target.get());
+	}
+#endif
+}
+
+#endif

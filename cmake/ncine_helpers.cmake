@@ -1,0 +1,901 @@
+include_guard(DIRECTORY)
+
+function(ncine_internal_get_enabled_languages out_var)
+	# Limit flag modification to c-like code, we don't want to accidentally add incompatible flags to MSVC's RC or Swift
+	set(languages_to_process ASM C CXX OBJC OBJCXX)
+	get_property(globally_enabled_languages GLOBAL PROPERTY ENABLED_LANGUAGES)
+	set(enabled_languages "")
+	foreach(lang ${languages_to_process})
+		if(lang IN_LIST globally_enabled_languages)
+			list(APPEND enabled_languages "${lang}")
+		endif()
+	endforeach()
+	set(${out_var} "${enabled_languages}" PARENT_SCOPE)
+endfunction()
+
+function(ncine_internal_get_configs out_var)
+	set(configs RELEASE RELWITHDEBINFO MINSIZEREL DEBUG)
+	set(${out_var} "${configs}" PARENT_SCOPE)
+endfunction()
+
+function(ncine_internal_get_target_link_types out_var)
+	set(target_link_types EXE SHARED MODULE STATIC)
+	set(${out_var} "${target_link_types}" PARENT_SCOPE)
+endfunction()
+
+function(ncine_internal_add_flags_inner flag_var_name flags IN_CACHE)
+	set(${flag_var_name} "${${flag_var_name}} ${flags}")
+	string(STRIP "${${flag_var_name}}" ${flag_var_name})
+	set(${flag_var_name} "${${flag_var_name}}" PARENT_SCOPE)
+
+	if(IN_CACHE)
+		set(mod_flags "$CACHE{${flag_var_name}} ${flags}")
+		string(STRIP "${mod_flags}" mod_flags)
+		get_property(help_text CACHE ${flag_var_name} PROPERTY HELPSTRING)
+		set(${flag_var_name} "${mod_flags}" CACHE STRING "${help_text}" FORCE)
+	endif()
+endfunction()
+
+function(ncine_internal_add_compiler_flags)
+	cmake_parse_arguments(PARSE_ARGV 0 ARGS "IN_CACHE" "FLAGS" "CONFIGS;LANGUAGES")
+
+	if(NOT ARGS_CONFIGS)
+		message(FATAL_ERROR "You must specify at least one configuration for which to add the flags")
+	endif()
+	if(NOT ARGS_FLAGS)
+		message(FATAL_ERROR "You must specify at least one flag to add")
+	endif()
+
+	if(ARGS_LANGUAGES)
+		set(enabled_languages "${ARGS_LANGUAGES}")
+	else()
+		ncine_internal_get_enabled_languages(enabled_languages)
+	endif()
+
+	foreach(lang ${enabled_languages})
+		foreach(config ${ARGS_CONFIGS})
+			set(flag_var_name "CMAKE_${lang}_FLAGS_${config}")
+			ncine_internal_add_flags_inner(${flag_var_name} "${ARGS_FLAGS}" "${ARGS_IN_CACHE}")
+			set(${flag_var_name} "${${flag_var_name}}" PARENT_SCOPE)
+		endforeach()
+	endforeach()
+endfunction()
+
+function(ncine_internal_add_linker_flags)
+	cmake_parse_arguments(PARSE_ARGV 0 ARGS "IN_CACHE" "FLAGS" "CONFIGS;TYPES")
+
+	if(NOT ARGS_TYPES)
+		message(FATAL_ERROR "You must specify at least one linker target type for which to add the flags")
+	endif()
+	if(NOT ARGS_CONFIGS)
+		message(FATAL_ERROR "You must specify at least one configuration for which to add the flags")
+	endif()
+	if(NOT ARGS_FLAGS)
+		message(FATAL_ERROR "You must specify at least one flag to add.")
+	endif()
+
+	foreach(config ${ARGS_CONFIGS})
+		foreach(t ${ARGS_TYPES})
+			set(flag_var_name "CMAKE_${t}_LINKER_FLAGS_${config}")
+			ncine_internal_add_flags_inner(${flag_var_name} "${ARGS_FLAGS}" "${ARGS_IN_CACHE}")
+			set(${flag_var_name} "${${flag_var_name}}" PARENT_SCOPE)
+		endforeach()
+	endforeach()
+endfunction()
+
+function(ncine_internal_remove_flags_inner flag_var_name flag_values IN_CACHE)
+	cmake_parse_arguments(ARGS "REGEX" "" "" ${ARGN})
+	set(replace_type REPLACE)
+	if(ARGS_REGEX)
+		list(PREPEND replace_type REGEX)
+	endif()
+
+	foreach(flag_value IN LISTS flag_values)
+		string(${replace_type} "${flag_value}" " " ${flag_var_name} "${${flag_var_name}}")
+	endforeach()
+	string(STRIP "${${flag_var_name}}" ${flag_var_name})
+	set(${flag_var_name} "${${flag_var_name}}" PARENT_SCOPE)
+
+	if(IN_CACHE)
+		set(mod_flags $CACHE{${flag_var_name}})
+		foreach(flag_value IN LISTS flag_values)
+			string(${replace_type} "${flag_value}" " " mod_flags "${mod_flags}")
+		endforeach()
+		string(STRIP "${mod_flags}" mod_flags)
+		get_property(help_text CACHE ${flag_var_name} PROPERTY HELPSTRING)
+		set(${flag_var_name} "${mod_flags}" CACHE STRING "${help_text}" FORCE)
+	endif()
+endfunction()
+
+function(ncine_internal_remove_compiler_flags flags)
+	cmake_parse_arguments(PARSE_ARGV 1 ARGS "IN_CACHE;REGEX" "" "CONFIGS;LANGUAGES")
+
+	if("${flags}" STREQUAL "")
+		message(WARNING "You must specify at least one flag to remove")
+		return()
+	endif()
+
+	if(ARGS_LANGUAGES)
+		set(languages "${ARGS_LANGUAGES}")
+	else()
+		ncine_internal_get_enabled_languages(languages)
+	endif()
+
+	if(ARGS_CONFIGS)
+		set(configs "${ARGS_CONFIGS}")
+	else()
+		ncine_internal_get_configs(configs)
+	endif()
+
+	if(ARGS_REGEX)
+		list(APPEND extra_options "REGEX")
+	endif()
+
+	foreach(lang ${languages})
+		set(flag_var_name "CMAKE_${lang}_FLAGS")
+		ncine_internal_remove_flags_inner(${flag_var_name} "${flags}" "${ARGS_IN_CACHE}" ${extra_options})
+		set(${flag_var_name} "${${flag_var_name}}" PARENT_SCOPE)
+		foreach(config ${configs})
+			set(flag_var_name "CMAKE_${lang}_FLAGS_${config}")
+			ncine_internal_remove_flags_inner(${flag_var_name} "${flags}" "${ARGS_IN_CACHE}" ${extra_options})
+			set(${flag_var_name} "${${flag_var_name}}" PARENT_SCOPE)
+		endforeach()
+	endforeach()
+endfunction()
+
+function(ncine_internal_replace_flags_inner flag_var_name match_string replace_string IN_CACHE)
+	if(match_string STREQUAL "" AND "${${flag_var_name}}" STREQUAL "")
+		set(${flag_var_name} "${replace_string}" PARENT_SCOPE)
+	else()
+		string(REPLACE "${match_string}" "${replace_string}" ${flag_var_name} "${${flag_var_name}}")
+		string(STRIP "${${flag_var_name}}" ${flag_var_name})
+		set(${flag_var_name} "${${flag_var_name}}" PARENT_SCOPE)
+	endif()
+
+	if(IN_CACHE)
+		get_property(help_text CACHE "${flag_var_name}" PROPERTY HELPSTRING)
+
+		if(match_string STREQUAL "" AND "$CACHE{${flag_var_name}}" STREQUAL "")
+			set(${flag_var_name} "${replace_string}" CACHE STRING "${help_text}" FORCE)
+		else()
+			set(mod_flags "$CACHE{${flag_var_name}}")
+			string(REPLACE "${match_string}" "${replace_string}" mod_flags "${mod_flags}")
+			string(STRIP "${mod_flags}" mod_flags)
+			set(${flag_var_name} "${mod_flags}" CACHE STRING "${help_text}" FORCE)
+		endif()
+	endif()
+endfunction()
+
+function(ncine_internal_replace_compiler_flags match_string replace_string)
+	cmake_parse_arguments(PARSE_ARGV 2 ARGS "IN_CACHE" "" "CONFIGS;LANGUAGES")
+
+	if(NOT ARGS_CONFIGS)
+		message(FATAL_ERROR "You must specify at least one configuration for which to replace the flags")
+	endif()
+
+	if(ARGS_LANGUAGES)
+		set(enabled_languages "${ARGS_LANGUAGES}")
+	else()
+		qt_internal_get_enabled_languages_for_flag_manipulation(enabled_languages)
+	endif()
+
+	foreach(lang ${enabled_languages})
+		foreach(config ${ARGS_CONFIGS})
+			set(flag_var_name "CMAKE_${lang}_FLAGS_${config}")
+			ncine_internal_replace_flags_inner(${flag_var_name} "${match_string}" "${replace_string}" "${ARGS_IN_CACHE}")
+			set(${flag_var_name} "${${flag_var_name}}" PARENT_SCOPE)
+		endforeach()
+	endforeach()
+endfunction()
+
+function(ncine_internal_replace_linker_flags match_string replace_string)
+	cmake_parse_arguments(PARSE_ARGV 2 ARGS "IN_CACHE" "" "CONFIGS;TYPES")
+
+	if(NOT ARGS_TYPES)
+		message(FATAL_ERROR "You must specify at least one linker target type for which to replace the flags")
+	endif()
+	if(NOT ARGS_CONFIGS)
+		message(FATAL_ERROR "You must specify at least one configuration for which to replace the flags")
+	endif()
+
+	foreach(config ${ARGS_CONFIGS})
+		foreach(t ${ARGS_TYPES})
+			set(flag_var_name "CMAKE_${t}_LINKER_FLAGS_${config}")
+			ncine_internal_replace_flags_inner(${flag_var_name} "${match_string}" "${replace_string}" "${ARGS_IN_CACHE}")
+			set(${flag_var_name} "${${flag_var_name}}" PARENT_SCOPE)
+		endforeach()
+	endforeach()
+endfunction()
+
+function(ncine_normalize_optimizations)
+	ncine_internal_get_enabled_languages(enabled_languages)
+	ncine_internal_get_configs(configs)
+	ncine_internal_get_target_link_types(target_link_types)
+
+	if(MSVC)
+		# Handle /INCREMENTAL flag which should not be enabled for Release configurations
+		set(flag_values "/INCREMENTAL:YES" "/INCREMENTAL:NO" "/INCREMENTAL")
+		foreach(flag_value ${flag_values})
+			ncine_internal_replace_linker_flags(
+					"${flag_value}" ""
+					CONFIGS ${configs}
+					TYPES ${target_link_types}
+					IN_CACHE)
+		endforeach()
+
+		set(flag_value "/INCREMENTAL:NO")
+		ncine_internal_add_linker_flags(
+				FLAGS "${flag_value}"
+				CONFIGS RELEASE RELWITHDEBINFO MINSIZEREL
+				TYPES EXE SHARED MODULE # When linking static libraries, link.exe can't recognize this parameter, clang-cl will error out.
+				IN_CACHE)
+
+		ncine_internal_remove_compiler_flags("(^| )/EH[scra-]*( |$)" LANGUAGES CXX CONFIGS ${configs} IN_CACHE REGEX)
+	endif()
+
+	# Legacy Android toolchain file adds the `-g` flag to CMAKE_<LANG>_FLAGS, as result, our release build ends up containing debug symbols
+	if(ANDROID AND ANDROID_COMPILER_FLAGS MATCHES "(^| )-g")
+		ncine_internal_remove_compiler_flags("-g")
+		ncine_internal_add_compiler_flags(FLAGS "-g" CONFIGS DEBUG RELWITHDEBINFO)
+	endif()
+
+	# Update all relevant flags in the calling scope
+	foreach(lang ${enabled_languages})
+		set(flag_var_name "CMAKE_${lang}_FLAGS")
+		set(${flag_var_name} "${${flag_var_name}}" PARENT_SCOPE)
+
+		foreach(config ${configs})
+			set(flag_var_name "CMAKE_${lang}_FLAGS_${config}")
+			set(${flag_var_name} "${${flag_var_name}}" PARENT_SCOPE)
+		endforeach()
+	endforeach()
+
+	foreach(t ${target_link_types})
+		set(flag_var_name "CMAKE_${t}_LINKER_FLAGS")
+		set(${flag_var_name} "${${flag_var_name}}" PARENT_SCOPE)
+
+		foreach(config ${configs})
+			set(flag_var_name "CMAKE_${t}_LINKER_FLAGS_${config}")
+			set(${flag_var_name} "${${flag_var_name}}" PARENT_SCOPE)
+		endforeach()
+	endforeach()
+endfunction()
+
+function(ncine_apply_compiler_options target)
+	cmake_parse_arguments(PARSE_ARGV 1 ARGS "ALLOW_EXCEPTIONS;DISABLE_RTTI" "" "")
+
+	# Without DEATH_USE_RUNTIME_CAST the cast falls back to `dynamic_cast<T>()`, which needs the tables, so it wins over the request.
+	if(ARGS_DISABLE_RTTI AND NOT DEATH_USE_RUNTIME_CAST)
+		set(ARGS_DISABLE_RTTI FALSE)
+	endif()
+
+	get_target_property(target_type ${target} TYPE)
+	set(target_is_executable FALSE)
+	if(target_type STREQUAL "INTERFACE_LIBRARY")
+		return()
+	elseif(target_type STREQUAL "EXECUTABLE")
+		set(target_is_executable TRUE)
+	endif()
+
+	target_compile_features(${target} PUBLIC cxx_std_17)
+	if(PLATFORM_DREAMCAST OR PLATFORM_N64 OR PLATFORM_PS3 OR PLATFORM_AMIGA OR PLATFORM_AMIGAOS4 OR PLATFORM_MORPHOS)
+		# KOS newlib hides C99 stdio (snprintf, strtoll) behind !__STRICT_ANSI__, so GNU extensions are
+		# required; the powerpc64-ps3-elf newlib behind PSL1GHT does exactly the same, and libstdc++'s
+		# <cstdio> then fails to compile at all ("'::snprintf' has not been declared") under -std=c++17.
+		# libdragon's newlib is the same family, and its n64.mk builds everything as gnu17/gnu++17 anyway.
+		# m68k-amigaos-gcc's libnix/newlib headers are the same newlib family again.
+		set_target_properties(${target} PROPERTIES CXX_EXTENSIONS ON)
+	else()
+		set_target_properties(${target} PROPERTIES CXX_EXTENSIONS OFF)
+	endif()
+	target_compile_definitions(${target} PRIVATE "CMAKE_BUILD")
+	if(NCINE_BUILD_LIBRETRO)
+		# Static helper libs are linked into the shared core
+		set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+	endif()
+
+	# Enable interprocedural optimization (LTO on GCC/Clang, /GL + /LTCG on MSVC) in Release, but skip it for
+	# static libraries: an LTO static archive's slim objects don't resolve reliably when linked into the
+	# also-LTO executable (undefined references to its symbols), whereas plain objects link cleanly.
+	if(NCINE_LINKTIME_OPTIMIZATION AND NOT (target_type STREQUAL "STATIC_LIBRARY"))
+		set_property(TARGET ${target} PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+	endif()
+
+	if(DEFINED DEATH_DEBUG)
+		if(DEATH_DEBUG)
+			target_compile_definitions(${target} PRIVATE "DEATH_DEBUG")
+		endif()
+	else()
+		target_compile_definitions(${target} PRIVATE $<$<CONFIG:Debug>:DEATH_DEBUG>)
+	endif()
+	if(DEATH_TRACE)
+		if(target_is_executable)
+			message(STATUS "Runtime event tracing is enabled")
+		endif()
+		target_compile_definitions(${target} PRIVATE "DEATH_TRACE")
+		# Log also all IO operations
+		if(DEATH_TRACE_VERBOSE_IO)
+			target_compile_definitions(${target} PRIVATE "DEATH_TRACE_VERBOSE_IO")
+		elseif(target_is_executable)
+			message(STATUS "Verbose I/O tracing is explicitly disabled")
+		endif()
+		if(DEATH_TRACE_ASYNC)
+			target_compile_definitions(${target} PRIVATE "DEATH_TRACE_ASYNC")
+		elseif(NCINE_WITH_THREADS AND target_is_executable)
+			message(STATUS "Asynchronous processing of event tracing is explicitly disabled")
+		endif()
+		if(DEATH_TRACE_LOG_PATH)
+			if(target_is_executable)
+				message(STATUS "Using overriden trace log path: ${DEATH_TRACE_LOG_PATH}")
+			endif()
+			target_compile_definitions(${target} PUBLIC "DEATH_TRACE_LOG_PATH=\"${DEATH_TRACE_LOG_PATH}\"")
+		endif()
+	endif()
+
+	if(DEATH_CPU_USE_RUNTIME_DISPATCH)
+		target_compile_definitions(${target} PRIVATE "DEATH_CPU_USE_RUNTIME_DISPATCH")
+		if(DEATH_CPU_USE_IFUNC)
+			target_compile_definitions(${target} PRIVATE "DEATH_CPU_USE_IFUNC")
+			if(target_is_executable)
+				message(STATUS "Using GNU IFUNC for CPU-dependent functionality")
+			endif()
+		elseif(target_is_executable)
+			message(STATUS "Using runtime dispatch for CPU-dependent functionality")
+		endif()
+	endif()
+
+	if(NOT DEATH_USE_RUNTIME_CAST)
+		target_compile_definitions(${target} PRIVATE "DEATH_SUPPRESS_RUNTIME_CAST")
+		if(target_is_executable)
+			message(STATUS "runtime_cast<T>() optimization is disabled")
+		endif()
+	endif()
+
+	if(NINTENDO_SWITCH)
+		target_compile_definitions(${target} PUBLIC "DEATH_TARGET_SWITCH")
+	elseif(PLATFORM_N64)
+		# libdragon (the project's own cmake/toolchains/n64.cmake toolchain file sets PLATFORM_N64, and N64 with it)
+		target_compile_definitions(${target} PUBLIC "DEATH_TARGET_N64")
+	elseif(PLATFORM_AMIGA)
+		# AmigaOS 3.x, m68k (the project's own cmake/toolchains/amiga.cmake toolchain file sets PLATFORM_AMIGA)
+		target_compile_definitions(${target} PUBLIC "DEATH_TARGET_AMIGAOS")
+	elseif(PLATFORM_MORPHOS)
+		# MorphOS (the project's own cmake/toolchains/morphos.cmake toolchain file sets PLATFORM_MORPHOS).
+		# Like AmigaOS 4 it is PowerPC with SDL2 and threads, but a different system again - its own
+		# kernel, its own C library, and TinyGL where the other has Warp3D Nova
+		target_compile_definitions(${target} PUBLIC "DEATH_TARGET_MORPHOS")
+		# The SDK's GCC 10.4.0 runtime directory, put in front of the compiler's own: it is where this
+		# port takes its C++ runtime from, and dropping it changes what the link resolves. Two things
+		# come out of it - libatomic, for the 64-bit atomics a 32-bit PowerPC cannot do inline, and the
+		# libstdc++ that MorphOSLibcCompat.cpp is written against (its `__throw_bad_array_new_length`
+		# fills the one symbol GCC 11 emits calls to and that older libstdc++ does not carry; linking
+		# the SDK's 11.3.0 runtime instead makes the two definitions collide). Moving the port onto the
+		# matching runtime means removing that stub as well, so it is a deliberate change rather than a
+		# path cleanup - hence the check, which turns a future SDK without this directory into a clear
+		# error instead of a silent switch. (TinyGL, which SDL2 needs, is attached to the SDL2 imported
+		# target instead, so it lands after it on the link line.)
+		set(_morphosRuntimeDir "${MORPHOS_SDK}/lib/gcc-lib/ppc-morphos/10.4.0")
+		if(NOT EXISTS "${_morphosRuntimeDir}/libatomic.a")
+			message(FATAL_ERROR "The MorphOS SDK at \"${MORPHOS_SDK}\" has no GCC 10.4.0 runtime directory (see the note above this check in cmake/ncine_helpers.cmake)")
+		endif()
+		target_link_libraries(${target} PRIVATE "-L${_morphosRuntimeDir}" atomic)
+	elseif(PLATFORM_AMIGAOS4)
+		# adtools/AmigaOS 4.1 (the project's own cmake/toolchains/os4.cmake toolchain file sets PLATFORM_AMIGAOS4).
+		# A separate target from DEATH_TARGET_AMIGAOS above and not a superset of it: the two share a system
+		# API in name only - this one is PowerPC with a newlib that has threads and most of POSIX, and it
+		# reaches the display through SDL2 rather than through a backend of its own.
+		target_compile_definitions(${target} PUBLIC "DEATH_TARGET_AMIGAOS4")
+		# The threading layer calls the pthread API directly, which on this target lives in the SDK's
+		# libpthread - the compiler's own -athread flavours provide only the gthreads hooks std::thread needs.
+		# libatomic supplies the 64-bit atomics: this is a 32-bit PowerPC, so an atomic 64-bit load is a
+		# library call rather than an instruction, and the web-request layer counts bytes in one.
+		target_link_libraries(${target} PRIVATE pthread atomic)
+	elseif(NINTENDO_WII)
+		# devkitPPC/libogc (the devkitPro Wii.cmake toolchain file sets NINTENDO_WII)
+		target_compile_definitions(${target} PUBLIC "DEATH_TARGET_WII")
+	elseif(NINTENDO_GAMECUBE)
+		# devkitPPC/libogc (the devkitPro GameCube.cmake toolchain file sets NINTENDO_GAMECUBE)
+		target_compile_definitions(${target} PUBLIC "DEATH_TARGET_GAMECUBE")
+	elseif(NINTENDO_3DS)
+		# devkitARM/libctru (the devkitPro 3DS.cmake toolchain file sets NINTENDO_3DS, and __3DS__ with it)
+		target_compile_definitions(${target} PUBLIC "DEATH_TARGET_3DS")
+	elseif(PLATFORM_DREAMCAST)
+		# KallistiOS (the platform module of the KOS kallistios.toolchain.cmake file sets PLATFORM_DREAMCAST)
+		target_compile_definitions(${target} PUBLIC "DEATH_TARGET_DREAMCAST")
+	elseif(PLATFORM_PS2)
+		# PS2SDK (the ps2dev.cmake toolchain file sets PLATFORM_PS2, and PS2/__PS2__/_EE with it)
+		target_compile_definitions(${target} PUBLIC "DEATH_TARGET_PS2")
+	elseif(PLATFORM_PSP)
+		# PSPSDK (the pspdev.cmake toolchain file sets PLATFORM_PSP)
+		target_compile_definitions(${target} PUBLIC "DEATH_TARGET_PSP")
+	elseif(PLATFORM_PS3)
+		# PSL1GHT (the project's own cmake/toolchains/ps3dev.cmake toolchain file sets PLATFORM_PS3, and __PS3__ with it)
+		target_compile_definitions(${target} PUBLIC "DEATH_TARGET_PS3")
+	elseif(VITA)
+		target_compile_definitions(${target} PUBLIC "DEATH_TARGET_VITA")
+
+		# `vita-elf-create` appends the SCE module data (up to ~20 KB) in the padding after the read-only
+		# segment, or fails with "Cannot allocate N bytes for SCE data at end of segment 0; segment 1 overlaps".
+		# Older SDKs pad by one maximum page, so a 64 KB page is enough; since the 2026-08 binutils update the
+		# padding depends on code size and only `__sce_headroom` guarantees it (vitasdk/buildscripts#144).
+		target_link_options(${target} PRIVATE "LINKER:-z,max-page-size=0x10000" "LINKER:--defsym=__sce_headroom=0x10000")
+	elseif(WIN32)
+		# Force Unicode mode on Windows
+		target_compile_definitions(${target} PRIVATE "_UNICODE" "UNICODE")
+		if(WINDOWS_PHONE OR WINDOWS_STORE)
+			target_compile_definitions(${target} PUBLIC "DEATH_TARGET_WINDOWS_RT")
+
+			# C++/WinRT requires coroutine support. In C++17 mode it falls back to <experimental/coroutine>,
+			# which MSVC 14.51 turned into a hard error, so enable standard C++20 coroutines instead
+			# (/await:strict defines __cpp_impl_coroutine, which makes C++/WinRT pick <coroutine>).
+			# The older /await switch is deprecated and slated for removal.
+			if(MSVC_VERSION GREATER_EQUAL 1929)
+				target_compile_options(${target} PRIVATE "/await:strict")
+			else()
+				# Workaround for "error C1189: The <experimental/coroutine> and <experimental/resumable> headers are only supported with /await"
+				target_compile_options(${target} PRIVATE "/await")
+				# Workaround for "error C2039: 'wait_for': is not a member of 'winrt::impl'"
+				target_compile_options(${target} PRIVATE "/Zc:twoPhase-")
+			endif()
+		endif()
+	endif()
+
+	if(MSVC)
+		target_compile_options(${target} PRIVATE
+			# Enable extra warnings (similar to -Wall)
+			"/W4"
+			# Suppress linker warning about templates
+			"/wd4251"
+			# Suppress warnings about "conditional expression is constant"
+			"/wd4127"
+			# Suppress warnings about "conversion from '<bigger int type>' to '<smaller int type>'",
+			# "conversion from 'size_t' to '<smaller int type>', possible loss of data"
+			"/wd4244" "/wd4267"
+			# Suppress warnings about "structure was padded due to alignment specifier"
+			"/wd4324"
+			# Suppress warnings about "new behavior: elements of array will be default initialized"
+			"/wd4351"
+			# Suppress warnings about "previous versions of the compiler did not override when parameters
+			# only differed by const/volatile qualifiers"
+			"/wd4373"
+			# Suppress warnings about "default constructor could not be generated/can never be instantiated"
+			"/wd4510" "/wd4610"
+			# Suppress warnings about "assignment operator could not be generated"
+			"/wd4512"
+			# Suppress warnings about "no suitable definition for explicit template instantiation"
+			"/wd4661"
+			# Suppress warnings about "unreachable code"
+			"/wd4702"
+			# Suppress warnings about "assignment within conditional expression"
+			"/wd4706"
+			# Suppress warnings about "forcing value to bool 'true' or 'false' (performance warning)"
+			"/wd4800"
+			# Suppress warnings about "unreferenced formal parameter"
+			"/wd4100"
+			# Suppress warnings about "switch statement contains 'default' but no 'case' labels"
+			"/wd4065"
+			# Suppress warnings about "unreferenced local function has been removed"
+			"/wd4505"
+			# Suppress warnings about "local variable is initialized but not referenced"
+			"/wd4189"
+			# Suppress warnings about "cast truncates constant value"
+			"/wd4310")
+
+		# Enable parallel compilation and force UTF-8
+		target_compile_options(${target} PRIVATE "/MP" "/utf-8")
+		# Enable standards-conforming compiler behavior
+		if(MSVC_VERSION GREATER_EQUAL 1913)
+			target_compile_options(${target} PRIVATE "/permissive-")
+		endif()
+		# Always use the non-debug version of the runtime library
+		if(VC_LTL_FOUND)
+			set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+			# VC-LTL rewrites the CRT "RuntimeLibrary" detect_mismatch token (MT -> MT_LTL), so the
+			# application and every static library linked into it must be built with VC-LTL or linking
+			# fails with LNK2038. Import the helper props into each target so they stay consistent.
+			target_compile_definitions(${target} PRIVATE "_DISABLE_DEPRECATE_LTL_MESSAGE")
+			set_target_properties(${target} PROPERTIES VS_GLOBAL_VC_LTL_Root ${VC_LTL_Root})
+			if(EXISTS "${NCINE_ROOT}/VC-LTL helper for Visual Studio.props")
+				set_target_properties(${target} PROPERTIES VS_PROJECT_IMPORT "${NCINE_ROOT}/VC-LTL helper for Visual Studio.props")
+			else()
+				set_target_properties(${target} PROPERTIES VS_PROJECT_IMPORT "${VC_LTL_Root}/VC-LTL helper for Visual Studio.props")
+			endif()
+		else()
+			set_property(TARGET ${target} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+		endif()
+
+		# Exceptions
+		if(ARGS_ALLOW_EXCEPTIONS)
+			target_compile_options(${target} PRIVATE "/EHsc")
+			if((MSVC_VERSION GREATER_EQUAL 1929) AND NOT ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang"))
+				# Use the undocumented compiler flag to make our binary smaller on x64
+				# https://devblogs.microsoft.com/cppblog/making-cpp-exception-handling-smaller-x64/
+				target_compile_options(${target} PRIVATE "/d2FH4")
+			endif()
+		else()
+			# It seems MSVC 19.38.33135.0 can't link the project for 32-bit x86 without "/EHsc"
+			if("${CMAKE_GENERATOR_PLATFORM}" STREQUAL "Win32")
+				target_compile_options(${target} PRIVATE "/EHsc")
+			else()
+				target_compile_options(${target} PRIVATE "/EHs-c-" "/wd4530" "/wd4577")
+			endif()
+			target_compile_definitions(${target} PRIVATE "_HAS_EXCEPTIONS=0")
+		endif()
+		if(ARGS_DISABLE_RTTI)
+			target_compile_options(${target} PRIVATE "/GR-")
+		endif()
+
+		# Extra optimizations in Release
+		target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/O2 /Oi /Qpar /Gy>)
+		if(DEATH_USE_FAST_MATH)
+			target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/fp:fast>)
+		endif()
+
+		if(DEATH_DEBUG_SYMBOLS)
+			# Include PDB debug information in Release and enable hot reloading in Debug
+			if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" OR NCINE_ADDRESS_SANITIZER)
+				# clang-cl doesn't support EditAndContinue, nor does AddressSanitizer
+				if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.25.0")
+					set_property(TARGET ${target} PROPERTY MSVC_DEBUG_INFORMATION_FORMAT ProgramDatabase)
+				else()
+					target_compile_options(${target} PRIVATE /Zi)
+				endif()
+			else()
+				if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.25.0")
+					set_property(TARGET ${target} PROPERTY MSVC_DEBUG_INFORMATION_FORMAT $<IF:$<CONFIG:Debug>,EditAndContinue,ProgramDatabase>)
+				else()
+					target_compile_options(${target} PRIVATE $<IF:$<CONFIG:Debug>,/ZI,/Zi>)
+				endif()
+			endif()
+			target_link_options(${target} PRIVATE $<$<CONFIG:Release>:/DEBUG:FULL>)
+		endif()
+
+		# Turn off SAFESEH because of OpenAL on x86 and also UAC
+		target_link_options(${target} PRIVATE "/SAFESEH:NO" "/MANIFESTUAC:NO")
+		target_link_options(${target} PRIVATE $<$<CONFIG:Release>:/OPT:REF /OPT:NOICF>)
+
+		# Specifies the architecture for code generation (IA32, SSE, SSE2, AVX, AVX2, AVX512)
+		if(NCINE_ARCH_EXTENSIONS)
+			if(target_is_executable)
+				message(STATUS "Specified architecture extensions for code generation: ${NCINE_ARCH_EXTENSIONS}")
+			endif()
+			target_compile_options(${target} PRIVATE "/arch:${NCINE_ARCH_EXTENSIONS}")
+		endif()
+
+		if(NCINE_AUTOVECTORIZATION_REPORT)
+			target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:/Qvec-report:2 /Qpar-report:2>)
+		endif()
+		
+		if(NCINE_ADDRESS_SANITIZER)
+			target_compile_options(${target} PUBLIC "/fsanitize=address>")
+		endif()
+
+		if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+			target_compile_options(${target} PRIVATE "-Wno-switch" "-Wno-unknown-pragmas"
+				"-Wno-reorder-ctor" "-Wno-braced-scalar-init" "-Wno-deprecated-builtins")
+		endif()
+	else() # GCC and LLVM
+		target_compile_options(${target} PRIVATE 
+			"-Wall" "-Wextra"
+			"-Winit-self" "-Wno-old-style-cast" "-Wno-unused-parameter" "-Wno-variadic-macros"
+			"-Wno-multichar" "-Wno-switch" "-Wno-unknown-pragmas"
+			# `-Werror=return-type` doesn't work on nvcc, use it just for C and C++
+			"$<$<OR:$<STREQUAL:$<TARGET_PROPERTY:LINKER_LANGUAGE>,C>,$<STREQUAL:$<TARGET_PROPERTY:LINKER_LANGUAGE>,CXX>>:-Werror=return-type>"
+			"-Wmissing-declarations"
+			"-fvisibility=hidden" "-fvisibility-inlines-hidden"
+			"-fno-strict-aliasing")
+
+		if(ARGS_ALLOW_EXCEPTIONS)
+			target_compile_options(${target} PRIVATE "-fexceptions")
+		else()
+			target_compile_options(${target} PRIVATE "-fno-exceptions")
+		endif()
+		if(ARGS_DISABLE_RTTI)
+			target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>")
+		endif()
+		if(DEATH_USE_FAST_MATH)
+			target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-ffast-math>)
+		endif()
+
+		if(MINGW OR MSYS)
+			target_link_options(${target} PRIVATE "-municode")
+		endif()
+
+		if(NCINE_ARCH_EXTENSIONS AND UNIX AND NOT APPLE AND NOT ANDROID AND NOT NINTENDO_SWITCH)
+			if(target_is_executable)
+				message(STATUS "Specified architecture extensions for code generation: ${NCINE_ARCH_EXTENSIONS}")
+			endif()
+			target_compile_options(${target} PRIVATE "-march=${NCINE_ARCH_EXTENSIONS}")
+		endif()
+	
+		# Preserve debug information
+		if(DEATH_DEBUG_SYMBOLS)
+			target_compile_options(${target} PRIVATE "-g")
+			target_link_options(${target} PRIVATE "-g")
+		elseif(EMSCRIPTEN)
+			# It's probably added automatically on other platforms
+			target_compile_options(${target} PRIVATE $<$<CONFIG:Debug>:-g>)
+			target_link_options(${target} PRIVATE $<$<CONFIG:Debug>:-g>)
+		endif()
+
+		# Only in Debug
+		if(NCINE_ADDRESS_SANITIZER)
+			# Add ASan options as public so that targets linking the library will also use them
+			if(EMSCRIPTEN)
+				target_compile_options(${target} PUBLIC $<$<CONFIG:Debug>:-O1 -g -fsanitize=address>) # Needs "ALLOW_MEMORY_GROWTH" which is already passed to the linker
+				target_link_options(${target} PUBLIC $<$<CONFIG:Debug>:-fsanitize=address>)
+			elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
+				target_compile_options(${target} PUBLIC $<$<CONFIG:Debug>:-O1 -g -fsanitize=address -fsanitize-address-use-after-scope -fno-optimize-sibling-calls -fno-common -fno-omit-frame-pointer>)
+				target_link_options(${target} PUBLIC $<$<CONFIG:Debug>:-fsanitize=address>)
+				
+				# Don't add `-rdynamic` on GCC/MinGW
+				if(NOT ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" AND (MINGW OR MSYS)))
+					target_compile_options(${target} PUBLIC $<$<CONFIG:Debug>:-rdynamic>)
+				endif()
+			endif()
+		endif()
+
+		# Only in Debug
+		if(NCINE_UNDEFINED_SANITIZER)
+			# Add UBSan options as public so that targets linking the library will also use them
+			if(EMSCRIPTEN)
+				target_compile_options(${target} PUBLIC $<$<CONFIG:Debug>:-O1 -g -fsanitize=undefined>)
+				target_link_options(${target} PUBLIC $<$<CONFIG:Debug>:-fsanitize=undefined>)
+			elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
+				target_compile_options(${target} PUBLIC $<$<CONFIG:Debug>:-O1 -g -fsanitize=undefined -fno-omit-frame-pointer>)
+				target_link_options(${target} PUBLIC $<$<CONFIG:Debug>:-fsanitize=undefined>)
+			endif()
+		endif()
+		
+		# Only in Debug
+		if(NCINE_THREAD_SANITIZER)
+			# Add TSan options as public so that targets linking the library will also use them
+			if(EMSCRIPTEN)
+				target_compile_options(${target} PUBLIC $<$<CONFIG:Debug>:-O1 -g -fsanitize=thread>)
+				target_link_options(${target} PUBLIC $<$<CONFIG:Debug>:-fsanitize=thread>)
+			elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
+				target_compile_options(${target} PUBLIC $<$<CONFIG:Debug>:-O1 -g -fsanitize=thread -fno-omit-frame-pointer>)
+				target_link_options(${target} PUBLIC $<$<CONFIG:Debug>:-fsanitize=thread>)
+			endif()
+		endif()
+
+		# Only in Debug
+		if(("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang") AND NCINE_CODE_COVERAGE)
+			# Add code coverage options as public so that targets linking the library will also use them
+			target_compile_options(${target} PUBLIC $<$<CONFIG:Debug>:--coverage>)
+			target_link_options(${target} PUBLIC $<$<CONFIG:Debug>:--coverage>)
+		endif()
+
+		if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
+			target_compile_options(${target} PRIVATE "-fdiagnostics-color=auto")
+			target_compile_options(${target} PRIVATE "-Wno-long-long" "-Wno-ignored-qualifiers"
+				"-Wcast-align"  "-Wno-reorder" "-Wno-sign-compare" "-Wno-free-nonheap-object" "-Wdouble-promotion"
+				"$<$<STREQUAL:$<TARGET_PROPERTY:LINKER_LANGUAGE>,CXX>:-Wzero-as-null-pointer-constant>")
+
+			target_compile_options(${target} PRIVATE $<$<CONFIG:Debug>:-fvar-tracking-assignments>)
+
+			if(PLATFORM_N64 OR NINTENDO_WII OR NINTENDO_GAMECUBE OR NINTENDO_3DS OR PLATFORM_DREAMCAST OR PLATFORM_PSP OR PLATFORM_PS2 OR PLATFORM_PS3 OR PLATFORM_AMIGA)
+				# Nothing reads errno after a math call, and without this every `std::sqrt` is the hardware square root
+				# followed by a NaN check and a fallback call into newlib's `sqrtf` to set it (seen in the SH-4 and
+				# MIPS output alike), and GCC cannot treat libm calls as pure for common-subexpression elimination.
+				# `-ffast-math` implies it, but these consoles deliberately do not use that (see below).
+				target_compile_options(${target} PRIVATE -fno-math-errno)
+			endif()
+
+			# Extra optimizations in Release
+			if(NINTENDO_SWITCH)
+				# -O3/-Ofast is crashing on Nintendo Switch for some reason, use -O2 instead
+				target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O2>)
+			elseif(PLATFORM_N64 OR NINTENDO_WII OR NINTENDO_GAMECUBE OR PLATFORM_DREAMCAST OR PLATFORM_PSP OR PLATFORM_PS3 OR PLATFORM_AMIGA)
+				# Conservative optimization on the PowerPC consoles, Dreamcast, PSP and PS3, where -O3's extra
+				# inlining and loop transformations aren't worth the code they add (24 MB GameCube, 16 MB
+				# Dreamcast, 24 MB usable of the PSP's 32 MB) - and where `DEATH_USE_FAST_MATH`, if it's turned on
+				# at all, is the least advisable: fast-math reordering is untested on Gekko/Broadway paired
+				# singles and on the Allegrex's single-precision-only FPU, the PS3 compiles with a GCC 7.2 that
+				# no other target in this project uses (and is the hardest one to attach a debugger to when a
+				# fast-math difference does surface), and the classic Amiga's floating point comes from either
+				# a 68060 FPU or the Apollo core's - two implementations that differ in what they trap.
+				# The N64 already compiles everything with libdragon's own fast-math triplet from the toolchain
+				# file, and with 4-8 MB of RDRAM it has the strictest code-size budget of them all.
+				target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O2>)
+			elseif(DEATH_USE_FAST_MATH)
+				target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-Ofast>)
+			else()
+				target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O3>)
+			endif()
+			target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-funsafe-loop-optimizations -ftree-loop-if-convert-stores>)
+
+			if(NCINE_AUTOVECTORIZATION_REPORT)
+				target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-fopt-info-vec-optimized>)
+			endif()
+
+			# Enabling strong stack protector of GCC 4.9
+			if(NCINE_GCC_HARDENING AND NOT (MINGW OR MSYS))
+				target_compile_options(${target} PUBLIC $<$<CONFIG:Release>:-Wformat -Wformat-security -fstack-protector-strong>)
+				target_compile_definitions(${target} PUBLIC $<$<CONFIG:Release>:_FORTIFY_SOURCE=2>)
+				target_link_options(${target} PUBLIC $<$<CONFIG:Release>:-Wl,-z,relro -Wl,-z,now>)
+				# Let CMake pick the correct flags for the target type (`-fPIC` for static libraries, `-fPIE`
+				# together with `-pie` for the executable). Unlike the options above, this property can't
+				# be restricted to Release, so PIE applies to all configurations.
+				set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+			endif()
+		elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
+			target_compile_options(${target} PRIVATE "-fcolor-diagnostics")
+			target_compile_options(${target} PRIVATE "-Wmissing-prototypes" "-Wno-shorten-64-to-32"
+				"-Wno-gnu-zero-variadic-macro-arguments" "-Wno-c++11-long-long" "-Wno-missing-braces"
+				"-Wno-reorder-ctor" "-Wno-braced-scalar-init")
+
+			if(NOT EMSCRIPTEN)
+				# Extra optimizations in Release
+				if(DEATH_USE_FAST_MATH)
+					target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-Ofast>)
+				else()
+					target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-O3>)
+				endif()
+			endif()
+
+			if(NCINE_AUTOVECTORIZATION_REPORT)
+				target_compile_options(${target} PRIVATE $<$<CONFIG:Release>:-Rpass=loop-vectorize -Rpass-analysis=loop-vectorize>)
+			endif()
+		endif()
+	endif()
+endfunction()
+
+function(ncine_add_dependency target target_type)
+	add_library(${target} ${target_type})
+	set_target_properties(${target} PROPERTIES FOLDER "Dependencies")
+	ncine_apply_compiler_options(${target} ${ARGN})
+endfunction()
+
+# Makes the specified runtime libraries (DLLs) available to the application. UWP has to deploy them as
+# package content, because a post-build copy would never end up in the package, while all other Windows
+# builds copy them next to the executable if `NCINE_COPY_DEPENDENCIES` is enabled. Other platforms
+# resolve their dependencies without any help, so the call is a no-op there.
+function(ncine_deploy_runtime_dependencies)
+	if(NOT WIN32 OR NOT ARGN)
+		return()
+	endif()
+
+	if(WINDOWS_PHONE OR WINDOWS_STORE)
+		target_sources(${NCINE_APP} PRIVATE ${ARGN})
+		set_property(SOURCE ${ARGN} PROPERTY VS_DEPLOYMENT_CONTENT 1)
+		set_property(SOURCE ${ARGN} PROPERTY VS_DEPLOYMENT_LOCATION ".")
+		source_group("Dependencies" FILES ${ARGN})
+	elseif(NCINE_COPY_DEPENDENCIES)
+		foreach(DEPENDENCY ${ARGN})
+			add_custom_command(TARGET ${NCINE_APP} POST_BUILD
+				COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DEPENDENCY} $<TARGET_FILE_DIR:${NCINE_APP}>
+				VERBATIM)
+		endforeach()
+	endif()
+endfunction()
+
+function(ncine_assign_source_group)
+	cmake_parse_arguments(PARSE_ARGV 0 ARGS "SKIP_EXTERNAL" "" "PATH_PREFIX;FILES")
+	
+	# Normalize and ensure trailing slashes for all PATH_PREFIX values
+	if(NOT ARGS_PATH_PREFIX)
+		set(PATH_PREFIXES "")
+		set(PATH_REPLACEMENTS "")
+	else()
+		set(PATH_PREFIXES "")
+		set(PATH_REPLACEMENTS "")
+		foreach(CURRENT_PREFIX ${ARGS_PATH_PREFIX})
+			# Check if PREFIX contains colon (prefix:replace format)
+			string(FIND "${CURRENT_PREFIX}" ":" COLON_POS REVERSE)
+			if(COLON_POS GREATER 1)
+				# Split into prefix and replacement
+				string(SUBSTRING "${CURRENT_PREFIX}" 0 ${COLON_POS} PREFIX_PART)
+				math(EXPR REPLACE_START "${COLON_POS} + 1")
+				string(SUBSTRING "${CURRENT_PREFIX}" ${REPLACE_START} -1 REPLACE_PART)
+
+				if(NOT IS_ABSOLUTE "${PREFIX_PART}")
+					get_filename_component(PREFIX_PART "${PREFIX_PART}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+				endif()
+				string(REPLACE "\\" "/" PREFIX_PART "${PREFIX_PART}")
+				if(NOT PREFIX_PART MATCHES "/$")
+					set(PREFIX_PART "${PREFIX_PART}/")
+				endif()
+
+				string(REPLACE "\\" "/" REPLACE_PART "${REPLACE_PART}")
+				if(NOT REPLACE_PART MATCHES "/$")
+					set(REPLACE_PART "${REPLACE_PART}/")
+				endif()
+				
+				list(APPEND PATH_PREFIXES "${PREFIX_PART}")
+				list(APPEND PATH_REPLACEMENTS "${REPLACE_PART}")
+			else()
+				# No replacement
+				if(NOT IS_ABSOLUTE "${CURRENT_PREFIX}")
+					get_filename_component(CURRENT_PREFIX "${CURRENT_PREFIX}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+				endif()
+				string(REPLACE "\\" "/" CURRENT_PREFIX "${CURRENT_PREFIX}")
+				if(NOT CURRENT_PREFIX MATCHES "/$")
+					set(CURRENT_PREFIX "${CURRENT_PREFIX}/")
+				endif()
+				list(APPEND PATH_PREFIXES "${CURRENT_PREFIX}")
+				list(APPEND PATH_REPLACEMENTS "/")
+			endif()
+		endforeach()
+	endif()
+
+	foreach(FILE ${ARGS_FILES})
+		# Make file path absolute if relative
+		if(NOT IS_ABSOLUTE "${FILE}")
+			get_filename_component(FILE "${FILE}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+		endif()
+		
+		get_filename_component(PARENT_DIR "${FILE}" DIRECTORY)
+		# Convert backslashes to forward slashes
+		string(REPLACE "\\" "/" PARENT_DIR "${PARENT_DIR}")
+		# Ensure trailing slash for comparison
+		if(NOT PARENT_DIR MATCHES "/$")
+			set(PARENT_DIR "${PARENT_DIR}/")
+		endif()
+		
+		set(MATCHED_PREFIX "")
+		set(MATCHED_REPLACEMENT "")
+		set(GROUP "")
+		
+		# Try to match against each path prefix
+		list(LENGTH PATH_PREFIXES PREFIX_COUNT)
+		math(EXPR LAST_INDEX "${PREFIX_COUNT} - 1")
+		foreach(IDX RANGE ${LAST_INDEX})
+			list(GET PATH_PREFIXES ${IDX} PREFIX)
+			list(GET PATH_REPLACEMENTS ${IDX} REPLACEMENT)
+			
+			string(LENGTH "${PREFIX}" PREFIX_LENGTH)
+			string(SUBSTRING "${PARENT_DIR}" 0 ${PREFIX_LENGTH} PATH_START)
+			if(PATH_START STREQUAL "${PREFIX}")
+				set(MATCHED_PREFIX "${PREFIX}")
+				set(MATCHED_REPLACEMENT "${REPLACEMENT}")
+				break()
+			endif()
+		endforeach()
+		
+		if(NOT "${MATCHED_PREFIX}" STREQUAL "")
+			# Found a matching prefix
+			string(LENGTH "${MATCHED_PREFIX}" MATCHED_PREFIX_LENGTH)
+			string(SUBSTRING "${PARENT_DIR}" ${MATCHED_PREFIX_LENGTH} -1 GROUP)
+			# Remove trailing slash
+			if(GROUP MATCHES "/$")
+				string(REGEX REPLACE "/$" "" GROUP "${GROUP}")
+			endif()
+			
+			# Apply replacement if specified
+			if(NOT "${MATCHED_REPLACEMENT}" STREQUAL "/")
+				# Remove leading and trailing slash from replacement if present
+				string(REGEX REPLACE "^/" "" MATCHED_REPLACEMENT "${MATCHED_REPLACEMENT}")
+				string(REGEX REPLACE "/$" "" MATCHED_REPLACEMENT "${MATCHED_REPLACEMENT}")
+				
+				if(GROUP STREQUAL "")
+					set(GROUP "/${MATCHED_REPLACEMENT}")
+				else()
+					set(GROUP "/${MATCHED_REPLACEMENT}/${GROUP}")
+				endif()
+			else()
+				if(NOT GROUP STREQUAL "" AND NOT GROUP MATCHES "^/")
+					set(GROUP "/${GROUP}")
+				endif()
+			endif()
+
+			# Group into "Source Files" and "Header Files"
+			if("${FILE}" MATCHES ".*\\.(c|cpp|asm|s)$")
+				set(GROUP "/Source Files${GROUP}/")
+			elseif("${FILE}" MATCHES ".*\\.h$")
+				set(GROUP "/Header Files${GROUP}/")
+			elseif("${FILE}" MATCHES ".*\\.rc$")
+				set(GROUP "/Resource Files${GROUP}/")
+			else()
+				set(GROUP "/")
+			endif()
+		elseif(ARGS_SKIP_EXTERNAL)
+			set(GROUP "/")
+		else()
+			# Path doesn't have common prefix, put it into "Dependencies"
+			set(GROUP "/Dependencies/")
+		endif()
+
+		source_group("${GROUP}" FILES "${FILE}")
+	endforeach()
+endfunction()

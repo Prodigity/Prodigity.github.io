@@ -1,0 +1,1003 @@
+#include "FontPacker.h"
+#include "PngCodec.h"
+
+#include "../../Jazz2/ContentFileTypes.h"
+#include "../../Jazz2/UI/FontFormat.h"
+#include "../../Jazz2/Compatibility/JJ2Anims.h"
+#include "../../Jazz2/Compatibility/JJ2Anims.Palettes.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <string_view>
+
+#include <Base/Format.h>
+#include <Containers/GrowableArray.h>
+#include <Containers/SmallVector.h>
+#include <Containers/String.h>
+#include <Containers/StringConcatenable.h>
+#include <Core/Logger.h>
+#include <IO/FileStream.h>
+#include <IO/FileSystem.h>
+#include <IO/MemoryStream.h>
+#include <IO/Compression/DeflateStream.h>
+#include <Utf8.h>
+
+#include <jsoncpp/json.h>
+
+using namespace Death;
+using namespace Death::Containers;
+using namespace Death::Containers::Literals;
+using namespace Death::IO;
+using namespace Death::IO::Compression;
+using namespace Jazz2::UI;
+
+namespace Jazz2::AssetPacker
+{
+	namespace
+	{
+		/** @brief One character of a font, as it is being converted */
+		struct Glyph
+		{
+			/** @brief Codepoint, or @ref FontFormat::FallbackCodepoint for the "unknown character" entry */
+			char32_t Codepoint = 0;
+			/** @brief Whether this is one of the characters of the contiguous ASCII range */
+			bool IsAscii = false;
+			/** @brief Where the inked pixels sit, in the source image or in the packed atlas */
+			std::int32_t X = 0, Y = 0, Width = 0, Height = 0;
+			/** @brief Where the inked pixels sit relative to the pen */
+			std::int32_t BearingX = 0, BearingY = 0;
+			/** @brief How far the pen moves after drawing this character */
+			std::int32_t Advance = 0;
+		};
+
+		/** @brief Everything a font is made of, independent of which form it was read from */
+		struct FontData
+		{
+			std::int32_t LineHeight = 0;
+			std::int32_t BaseSpacing = 0;
+			std::uint8_t AsciiFirst = 0;
+			std::uint8_t AsciiCount = 0;
+			SmallVector<Glyph, 0> Glyphs;
+		};
+
+		/**
+			@brief Reads the character list that accompanies a grid image
+
+			The list is the form the fonts have always been authored in: the cell size and how many of them fit
+			in a row, the pen advance of every character, and the characters outside the ASCII range spelled out
+			in UTF-8. An entry that decodes to nothing is the "unknown character" placeholder, which still owns a
+			cell of its own.
+		*/
+		bool ReadCharacterList(StringView path, FontData& font, std::int32_t& cellWidth, std::int32_t& cellHeight, std::int32_t& columns)
+		{
+			FileStream s(path, FileAccess::Read);
+			if (!s.IsValid()) {
+				LOGE("Cannot open \"{}\" for reading", path);
+				return false;
+			}
+
+			/*std::uint8_t flags =*/ s.ReadValue<std::uint8_t>();
+			cellWidth = s.ReadValueAsLE<std::uint16_t>();
+			cellHeight = s.ReadValueAsLE<std::uint16_t>();
+			columns = s.ReadValue<std::uint8_t>();
+			font.LineHeight = cellHeight;
+			font.BaseSpacing = s.ReadValueAsLE<std::int16_t>();
+			font.AsciiFirst = s.ReadValue<std::uint8_t>();
+			font.AsciiCount = s.ReadValue<std::uint8_t>();
+
+			if (cellWidth <= 0 || cellHeight <= 0 || columns <= 0) {
+				LOGE("\"{}\" is corrupted", path);
+				return false;
+			}
+
+			for (std::int32_t i = 0; i < font.AsciiCount; i++) {
+				Glyph& glyph = font.Glyphs.emplace_back();
+				glyph.Codepoint = char32_t(font.AsciiFirst + i);
+				glyph.IsAscii = true;
+				glyph.Advance = s.ReadValue<std::uint8_t>();
+			}
+
+			const std::int32_t unicodeCount = s.ReadValueAsLE<std::int32_t>();
+			for (std::int32_t i = 0; i < unicodeCount; i++) {
+				// A corrupted count would otherwise try to emplace billions of glyphs before the final check
+				if (!s.IsValid()) {
+					break;
+				}
+				char encoded[5] {};
+				s.Read(encoded, 1);
+
+				const std::int32_t remainingBytes =
+					((encoded[0] & 240) == 240) ? 3 : (
+					((encoded[0] & 224) == 224) ? 2 : (
+					((encoded[0] & 192) == 192) ? 1 : 0
+				));
+
+				Glyph& glyph = font.Glyphs.emplace_back();
+				if (remainingBytes > 0) {
+					s.Read(encoded + 1, remainingBytes);
+					glyph.Codepoint = Utf8::NextChar(encoded, 0).first();
+				} else {
+					// Anything that isn't the start of a well-formed sequence is the placeholder
+					glyph.Codepoint = FontFormat::FallbackCodepoint;
+				}
+				glyph.Advance = s.ReadValue<std::uint8_t>();
+			}
+
+			if (!s.IsValid()) {
+				LOGE("\"{}\" is corrupted", path);
+				return false;
+			}
+			return true;
+		}
+
+		/** @brief Writes the character list back out in the form @ref ReadCharacterList expects */
+		bool WriteCharacterList(StringView path, const FontData& font, std::int32_t cellWidth, std::int32_t cellHeight, std::int32_t columns)
+		{
+			FileStream s(path, FileAccess::Write);
+			if (!s.IsValid()) {
+				LOGE("Cannot open \"{}\" for writing", path);
+				return false;
+			}
+
+			s.WriteValue<std::uint8_t>(0x00);	// Flags
+			s.WriteValueAsLE<std::uint16_t>(std::uint16_t(cellWidth));
+			s.WriteValueAsLE<std::uint16_t>(std::uint16_t(cellHeight));
+			s.WriteValue<std::uint8_t>(std::uint8_t(columns));
+			s.WriteValueAsLE<std::int16_t>(std::int16_t(font.BaseSpacing));
+			s.WriteValue<std::uint8_t>(font.AsciiFirst);
+			s.WriteValue<std::uint8_t>(font.AsciiCount);
+
+			for (std::int32_t i = 0; i < font.AsciiCount; i++) {
+				s.WriteValue<std::uint8_t>(std::uint8_t(font.Glyphs[i].Advance));
+			}
+
+			const std::int32_t unicodeCount = std::int32_t(font.Glyphs.size()) - font.AsciiCount;
+			s.WriteValueAsLE<std::int32_t>(unicodeCount);
+
+			for (std::int32_t i = font.AsciiCount; i < std::int32_t(font.Glyphs.size()); i++) {
+				const Glyph& glyph = font.Glyphs[i];
+				if (glyph.Codepoint == FontFormat::FallbackCodepoint) {
+					// The placeholder has no character of its own, so it is written as a single zero byte
+					s.WriteValue<std::uint8_t>(0x00);
+				} else {
+					char encoded[4];
+					const std::size_t length = Utf8::FromCodePoint(glyph.Codepoint, encoded);
+					s.Write(encoded, std::int64_t(length));
+				}
+				s.WriteValue<std::uint8_t>(std::uint8_t(glyph.Advance));
+			}
+
+			return s.IsValid();
+		}
+
+		/** @brief Appends a whole number to a description being assembled */
+		void AppendNumber(Array<char>& target, std::int64_t value)
+		{
+			char buffer[24];
+			arrayAppend(target, StringView{buffer, formatInto(buffer, "{}", value)});
+		}
+
+		/**
+			@brief Whether a character can be written into a description as itself
+
+			Every character a font holds has a codepoint, but not every codepoint has a spelling that survives
+			being written into a text file and read back: control characters are invisible, surrogates are not
+			characters at all, and anything past the last plane cannot be encoded. Those are written as bare
+			numbers instead.
+		*/
+		bool HasVisibleSpelling(char32_t codepoint)
+		{
+			return (codepoint >= 0x20 && codepoint != 0x7F && (codepoint < 0x80 || codepoint > 0x9F)
+				&& (codepoint < 0xD800 || codepoint > 0xDFFF) && codepoint <= 0x10FFFF);
+		}
+
+		/** @brief Appends a JSON string holding a single character */
+		void AppendCharacterLiteral(Array<char>& target, char32_t codepoint)
+		{
+			char encoded[4];
+			const std::size_t length = Utf8::FromCodePoint(codepoint, encoded);
+
+			arrayAppend(target, '"');
+			for (std::size_t i = 0; i < length; i++) {
+				// Only the two characters JSON gives a meaning of their own need escaping - everything that
+				// would take more than a backslash is kept out of here by the caller
+				if (encoded[i] == '"' || encoded[i] == '\\') {
+					arrayAppend(target, '\\');
+				}
+				arrayAppend(target, encoded[i]);
+			}
+			arrayAppend(target, '"');
+		}
+
+		/**
+			@brief Writes the character list as the JSON description a font is edited through
+
+			Holds the same as @ref WriteCharacterList, spelled out: the cell size and the metrics as named
+			fields, then every character on a line of its own, written as the character itself wherever it has
+			a spelling. Assembled by hand rather than handed to a JSON writer, which would spread every
+			character over four lines - a font has hundreds of them, and being editable is the whole point of
+			the file.
+		*/
+		bool WriteCharacterListJson(StringView path, const FontData& font, std::int32_t cellWidth, std::int32_t cellHeight, std::int32_t columns)
+		{
+			Array<char> text;
+			arrayReserve(text, font.Glyphs.size() * 40 + 256);
+
+			arrayAppend(text, "{\n\t\"CellWidth\": "_s);
+			AppendNumber(text, cellWidth);
+			arrayAppend(text, ",\n\t\"CellHeight\": "_s);
+			AppendNumber(text, cellHeight);
+			arrayAppend(text, ",\n\t\"Columns\": "_s);
+			AppendNumber(text, columns);
+			arrayAppend(text, ",\n\t\"LineHeight\": "_s);
+			AppendNumber(text, font.LineHeight);
+			arrayAppend(text, ",\n\t\"BaseSpacing\": "_s);
+			AppendNumber(text, font.BaseSpacing);
+			arrayAppend(text, ",\n\t\"AsciiFirst\": "_s);
+			AppendNumber(text, font.AsciiFirst);
+			arrayAppend(text, ",\n\t\"AsciiCount\": "_s);
+			AppendNumber(text, font.AsciiCount);
+			arrayAppend(text, ",\n\t\"Characters\": ["_s);
+
+			for (std::size_t i = 0; i < font.Glyphs.size(); i++) {
+				const Glyph& glyph = font.Glyphs[i];
+				arrayAppend(text, (i > 0 ? ",\n\t\t{ "_s : "\n\t\t{ "_s));
+				if (glyph.Codepoint == FontFormat::FallbackCodepoint) {
+					arrayAppend(text, "\"Fallback\": true"_s);
+				} else if (HasVisibleSpelling(glyph.Codepoint)) {
+					arrayAppend(text, "\"Char\": "_s);
+					AppendCharacterLiteral(text, glyph.Codepoint);
+				} else {
+					arrayAppend(text, "\"Codepoint\": "_s);
+					AppendNumber(text, std::int64_t(glyph.Codepoint));
+				}
+				arrayAppend(text, ", \"Advance\": "_s);
+				AppendNumber(text, glyph.Advance);
+				arrayAppend(text, " }"_s);
+			}
+
+			arrayAppend(text, "\n\t]\n}\n"_s);
+
+			FileStream s(path, FileAccess::Write);
+			if (!s.IsValid()) {
+				LOGE("Cannot open \"{}\" for writing", path);
+				return false;
+			}
+
+			s.Write(text.data(), std::int64_t(text.size()));
+			return s.IsValid();
+		}
+
+		/**
+			@brief Reads one whole-number field of a JSON description
+
+			Fails on a field that is there but unusable, which is a mistake worth stopping for. A field that
+			isn't there at all leaves @p value alone and succeeds, so whatever it was initialized with is what
+			says the field was missing - and whether it had to be there is the caller's to decide.
+		*/
+		bool TryReadNumber(StringView path, const Json::Value& parent, const char* name,
+			std::int32_t min, std::int32_t max, std::int32_t& value)
+		{
+			const Json::Value& item = parent[name];
+			if (item.isNull()) {
+				return true;
+			}
+
+			std::int64_t result;
+			if (item.get(result) != Json::SUCCESS) {
+				LOGE("\"{}\" has \"{}\" that is not a whole number", path, name);
+				return false;
+			}
+			if (result < min || result > max) {
+				LOGE("\"{}\" has \"{}\" of {}, outside the {} to {} it may be", path, name, result, min, max);
+				return false;
+			}
+
+			value = std::int32_t(result);
+			return true;
+		}
+
+		/**
+			@brief Reads one entry of the character list of a JSON description
+
+			A character is named the way it is easiest to write down: as itself wherever it has a spelling, as
+			a bare codepoint where it hasn't, and as @cpp "Fallback": true @ce for the one entry that stands
+			for no character at all - what is drawn in place of anything the font doesn't have.
+		*/
+		bool ReadCharacter(StringView path, const Json::Value& item, std::int32_t index, Glyph& glyph)
+		{
+			if (!item.isObject()) {
+				LOGE("\"{}\" has a character at position {} that is not an object", path, index);
+				return false;
+			}
+
+			bool isFallback = false;
+			const Json::Value& fallbackItem = item["Fallback"];
+			if (!fallbackItem.isNull() && fallbackItem.get(isFallback) != Json::SUCCESS) {
+				LOGE("\"{}\" has a character at position {} whose \"Fallback\" is not true or false", path, index);
+				return false;
+			}
+
+			// Json::Value hands strings out as std::string_view, so that is the only place it appears
+			std::string_view spelledRaw;
+			const Json::Value& charItem = item["Char"];
+			if (!charItem.isNull() && charItem.get(spelledRaw) != Json::SUCCESS) {
+				LOGE("\"{}\" has a character at position {} whose \"Char\" is not a string", path, index);
+				return false;
+			}
+			StringView spelled{spelledRaw.data(), spelledRaw.size()};
+
+			std::int64_t codepoint = -1;
+			const Json::Value& codepointItem = item["Codepoint"];
+			if (!codepointItem.isNull() && (codepointItem.get(codepoint) != Json::SUCCESS
+					|| codepoint < 0 || codepoint > UINT32_MAX)) {
+				LOGE("\"{}\" has a character at position {} whose \"Codepoint\" is not a codepoint", path, index);
+				return false;
+			}
+
+			if (isFallback) {
+				glyph.Codepoint = FontFormat::FallbackCodepoint;
+			} else if (!charItem.isNull()) {
+				if (spelled.empty()) {
+					LOGE("\"{}\" has a character at position {} whose \"Char\" is empty; the entry standing for "
+						"no character at all is written as \"Fallback\": true", path, index);
+					return false;
+				}
+				auto next = Utf8::NextChar(spelled, 0);
+				if (next.first() == U'\xffffffff' || next.second() != spelled.size()) {
+					LOGE("\"{}\" has a character at position {} whose \"Char\" is not a single character", path, index);
+					return false;
+				}
+				glyph.Codepoint = next.first();
+			} else if (codepoint >= 0) {
+				glyph.Codepoint = char32_t(codepoint);
+			} else {
+				LOGE("\"{}\" has a character at position {} with no \"Char\", \"Codepoint\" or \"Fallback\"", path, index);
+				return false;
+			}
+
+			std::int32_t advance = -1;
+			if (!TryReadNumber(path, item, "Advance", 0, UINT8_MAX, advance)) {
+				return false;
+			}
+			if (advance < 0) {
+				LOGE("\"{}\" has a character at position {} with no \"Advance\"", path, index);
+				return false;
+			}
+
+			glyph.Advance = advance;
+			return true;
+		}
+
+		/**
+			@brief Reads the JSON description a font is edited through
+
+			The same content @ref ReadCharacterList reads out of the binary form, in the form meant to be
+			edited by hand - which is why so little of it is required. Only the cell size and the character
+			list have to be there: the line height defaults to the cell height, the base spacing to none, and
+			where the ASCII range starts and how far it reaches is worked out from the list itself unless the
+			description says otherwise.
+		*/
+		bool ReadCharacterListJson(StringView path, FontData& font, std::int32_t& cellWidth, std::int32_t& cellHeight, std::int32_t& columns)
+		{
+			FileStream s(path, FileAccess::Read);
+			if (!s.IsValid()) {
+				LOGE("Cannot open \"{}\" for reading", path);
+				return false;
+			}
+
+			const std::int64_t fileSize = s.GetSize();
+			if (fileSize <= 0 || fileSize > 16 * 1024 * 1024) {
+				LOGE("\"{}\" has an unexpected size of {} bytes", path, fileSize);
+				return false;
+			}
+
+			auto buffer = std::make_unique<char[]>(std::size_t(fileSize));
+			if (s.Read(buffer.get(), fileSize) != fileSize) {
+				LOGE("Cannot read \"{}\"", path);
+				return false;
+			}
+
+			Json::CharReaderBuilder builder;
+			auto reader = std::unique_ptr<Json::CharReader>(builder.newCharReader());
+			Json::Value doc; std::string errors;
+			if (!reader->parse(buffer.get(), buffer.get() + fileSize, &doc, &errors)) {
+				LOGE("\"{}\" cannot be parsed: {}", path, StringView(errors.data(), errors.size()).trimmed());
+				return false;
+			}
+			if (!doc.isObject()) {
+				LOGE("\"{}\" does not describe a font", path);
+				return false;
+			}
+
+			cellWidth = cellHeight = columns = 0;
+			std::int32_t lineHeight = 0, baseSpacing = 0, asciiFirst = -1, asciiCount = -1;
+			if (!TryReadNumber(path, doc, "CellWidth", 1, UINT16_MAX, cellWidth)
+					|| !TryReadNumber(path, doc, "CellHeight", 1, UINT16_MAX, cellHeight)
+					|| !TryReadNumber(path, doc, "Columns", 1, UINT8_MAX, columns)
+					|| !TryReadNumber(path, doc, "LineHeight", 1, UINT16_MAX, lineHeight)
+					|| !TryReadNumber(path, doc, "BaseSpacing", INT16_MIN, INT16_MAX, baseSpacing)
+					|| !TryReadNumber(path, doc, "AsciiFirst", 0, UINT8_MAX, asciiFirst)
+					|| !TryReadNumber(path, doc, "AsciiCount", 0, UINT8_MAX, asciiCount)) {
+				return false;
+			}
+
+			if (cellWidth <= 0 || cellHeight <= 0 || columns <= 0) {
+				LOGE("\"{}\" has to specify \"CellWidth\", \"CellHeight\" and \"Columns\"", path);
+				return false;
+			}
+
+			// How far one line of text sits below the previous one belongs to the font rather than to the grid
+			// it is authored in, so it can be set on its own - it just rarely is anything but the cell height
+			font.LineHeight = (lineHeight > 0 ? lineHeight : cellHeight);
+			font.BaseSpacing = baseSpacing;
+
+			const Json::Value& characters = doc["Characters"];
+			if (!characters.isArray() || characters.empty()) {
+				LOGE("\"{}\" has to list at least one character in \"Characters\"", path);
+				return false;
+			}
+
+			// The order the characters are listed in is the order of the cells they are authored in, so it is
+			// kept as it is read
+			const std::int32_t count = std::int32_t(characters.size());
+			font.Glyphs.reserve(count);
+			for (std::int32_t i = 0; i < count; i++) {
+				if (!ReadCharacter(path, characters[Json::ArrayIndex(i)], i, font.Glyphs.emplace_back())) {
+					return false;
+				}
+			}
+
+			// The packed font keeps the ASCII characters as one run it indexes straight into and everything
+			// else keyed by codepoint, so where that run begins and how far it reaches has to be known. A list
+			// written out by this tool starts with the run, so both are read off the list unless spelled out.
+			if (asciiFirst < 0) {
+				asciiFirst = (font.Glyphs[0].Codepoint <= UINT8_MAX ? std::int32_t(font.Glyphs[0].Codepoint) : 0);
+			}
+			if (asciiCount < 0) {
+				const std::int32_t longestRun = std::min<std::int32_t>(count, std::min<std::int32_t>(UINT8_MAX, 256 - asciiFirst));
+				asciiCount = 0;
+				while (asciiCount < longestRun && font.Glyphs[asciiCount].Codepoint == char32_t(asciiFirst + asciiCount)) {
+					asciiCount++;
+				}
+			}
+
+			if (asciiCount > count) {
+				LOGE("\"{}\" says its ASCII range is {} characters long, but lists only {}", path, asciiCount, count);
+				return false;
+			}
+			if (asciiFirst + asciiCount > 256) {
+				LOGE("\"{}\" has an ASCII range of {} characters starting at U+{:.4X}, reaching past the U+00FF "
+					"it has to end at", path, asciiCount, std::uint32_t(asciiFirst));
+				return false;
+			}
+			for (std::int32_t i = 0; i < asciiCount; i++) {
+				if (font.Glyphs[i].Codepoint != char32_t(asciiFirst + i)) {
+					LOGE("\"{}\" has to list the ASCII range first, one character after another from U+{:.4X}, but "
+						"the character at position {} is U+{:.4X} where U+{:.4X} was expected", path,
+						std::uint32_t(asciiFirst), i, std::uint32_t(font.Glyphs[i].Codepoint), std::uint32_t(asciiFirst + i));
+					return false;
+				}
+				font.Glyphs[i].IsAscii = true;
+			}
+
+			font.AsciiFirst = std::uint8_t(asciiFirst);
+			font.AsciiCount = std::uint8_t(asciiCount);
+
+			// The game looks every character below U+0080 up in the ASCII range and nowhere else, so one that
+			// isn't part of it is never drawn - and a range reaching past U+007F is kept only that far
+			if (asciiFirst + asciiCount > 0x80) {
+				LOGW("\"{}\" has an ASCII range reaching U+{:.4X}, but only the part of it below U+0080 is kept",
+					path, std::uint32_t(asciiFirst + asciiCount - 1));
+			}
+			for (std::int32_t i = asciiCount; i < count; i++) {
+				const char32_t codepoint = font.Glyphs[i].Codepoint;
+				if (codepoint != FontFormat::FallbackCodepoint && codepoint < 0x80) {
+					LOGW("\"{}\" lists U+{:.4X} outside its ASCII range, where the game will not look for it - "
+						"extend \"AsciiFirst\" and \"AsciiCount\" to cover it", path, std::uint32_t(codepoint));
+				}
+			}
+
+			// A codepoint listed twice would otherwise quietly become a glyph that is never drawn
+			SmallVector<char32_t, 0> codepoints;
+			codepoints.reserve(font.Glyphs.size());
+			for (const Glyph& glyph : font.Glyphs) {
+				codepoints.push_back(glyph.Codepoint);
+			}
+			std::sort(codepoints.begin(), codepoints.end());
+			for (std::size_t i = 1; i < codepoints.size(); i++) {
+				if (codepoints[i] == codepoints[i - 1] && (i < 2 || codepoints[i] != codepoints[i - 2])) {
+					LOGW("\"{}\" lists U+{:.4X} more than once", path, std::uint32_t(codepoints[i]));
+				}
+			}
+
+			return true;
+		}
+
+		/**
+			@brief Reduces every glyph to the pixels it actually inks
+
+			The cell a character is authored in is only a container: the glyph inside it is usually narrower and
+			almost always shorter. What is left of the cell is recorded as the glyph's bearing, so drawing it at
+			the trimmed size in the trimmed place puts every pixel exactly where the full cell used to put it.
+		*/
+		void MeasureGlyphs(FontData& font, const Image& image, std::int32_t cellWidth, std::int32_t cellHeight, std::int32_t columns)
+		{
+			for (std::int32_t i = 0; i < std::int32_t(font.Glyphs.size()); i++) {
+				Glyph& glyph = font.Glyphs[i];
+				const std::int32_t cellX = (i % columns) * cellWidth;
+				const std::int32_t cellY = (i / columns) * cellHeight;
+
+				std::int32_t minX = cellWidth, minY = cellHeight, maxX = -1, maxY = -1;
+				for (std::int32_t y = 0; y < cellHeight; y++) {
+					const std::int32_t sourceY = cellY + y;
+					if (sourceY >= image.Height) {
+						break;
+					}
+					for (std::int32_t x = 0; x < cellWidth; x++) {
+						const std::int32_t sourceX = cellX + x;
+						if (sourceX >= image.Width) {
+							break;
+						}
+						const std::uint8_t* pixel = &image.Pixels[(std::size_t(sourceY) * image.Width + sourceX) * 4];
+						// A pixel counts as inked if it is both visible and not the transparent palette entry
+						if (pixel[3] == 0 || pixel[0] == 0) {
+							continue;
+						}
+						if (x < minX) minX = x;
+						if (y < minY) minY = y;
+						if (x > maxX) maxX = x;
+						if (y > maxY) maxY = y;
+					}
+				}
+
+				if (maxX < 0) {
+					// Nothing inked at all, which is what a space looks like
+					glyph.X = glyph.Y = glyph.Width = glyph.Height = 0;
+					glyph.BearingX = glyph.BearingY = 0;
+					continue;
+				}
+
+				glyph.X = cellX + minX;
+				glyph.Y = cellY + minY;
+				glyph.Width = maxX - minX + 1;
+				glyph.Height = maxY - minY + 1;
+				glyph.BearingX = minX;
+				glyph.BearingY = minY;
+			}
+		}
+
+		/**
+			@brief Lays the measured glyphs out in an atlas of their own
+
+			The layout is the sprite sheets' (see @ref Compatibility::JJ2Anims::PackRectangles()), so the atlas
+			gets the same treatment: the least memory once rounded up to powers of two, stored at its exact
+			size, and never a glyph across the page line of a backend that has to split it. Every glyph keeps
+			@ref FontFormat::GlyphMargin of empty space on each side, putting two pixels between neighbours -
+			enough that a bilinear sample taken at the very edge of one glyph cannot reach the next.
+
+			Returns the position each glyph ended up at, in `positions`.
+		*/
+		bool PackGlyphs(const FontData& font, SmallVectorImpl<std::int32_t>& positions,
+			std::int32_t& atlasWidth, std::int32_t& atlasHeight)
+		{
+			constexpr std::int32_t Margin = FontFormat::GlyphMargin;
+
+			// Each glyph is packed together with its margins, so no further spacing is needed between them
+			SmallVector<Compatibility::JJ2Anims::PackedFrame, 0> items;
+			SmallVector<std::int32_t, 0> itemGlyphs;
+			for (std::int32_t i = 0; i < std::int32_t(font.Glyphs.size()); i++) {
+				const Glyph& glyph = font.Glyphs[i];
+				if (glyph.Width <= 0 || glyph.Height <= 0) {
+					continue;
+				}
+				Compatibility::JJ2Anims::PackedFrame& item = items.emplace_back();
+				item.X = item.Y = 0;
+				item.W = glyph.Width + 2 * Margin;
+				item.H = glyph.Height + 2 * Margin;
+				item.OffsetX = item.OffsetY = 0;
+				itemGlyphs.push_back(i);
+			}
+
+			if (items.empty()) {
+				LOGE("The font has no glyphs with any pixels in them");
+				return false;
+			}
+
+			if (!Compatibility::JJ2Anims::PackRectangles(items, 0, atlasWidth, atlasHeight)) {
+				LOGE("The font does not fit into a {}x{} atlas", Compatibility::JJ2Anims::MaxSheetSize,
+					Compatibility::JJ2Anims::MaxSheetSize);
+				return false;
+			}
+			if (std::any_of(items.begin(), items.end(), Compatibility::JJ2Anims::LiesAcrossPageLine)) {
+				LOGW("Some glyphs lie across a {}-pixel page line of the {}x{} atlas, a platform that splits the texture into pages draws them cut off",
+					Compatibility::JJ2Anims::SheetPageSize, atlasWidth, atlasHeight);
+			}
+
+			positions.clear();
+			positions.resize_for_overwrite(font.Glyphs.size() * 2);
+			std::memset(positions.data(), 0, positions.size() * sizeof(std::int32_t));
+			for (std::int32_t i = 0; i < std::int32_t(items.size()); i++) {
+				positions[itemGlyphs[i] * 2 + 0] = items[i].X + Margin;
+				positions[itemGlyphs[i] * 2 + 1] = items[i].Y + Margin;
+			}
+			return true;
+		}
+	}
+
+	bool FontPacker::Pack(StringView sourcePath, StringView targetPath)
+	{
+		Image image;
+		if (!PngCodec::Read(sourcePath, image)) {
+			return false;
+		}
+
+		// The JSON description is the one meant to be edited, so it is preferred wherever it exists; the binary
+		// form is read only when there is none, which is what an older unpack left behind
+		String descriptionPath = String(sourcePath + ".json"_s);
+		const bool isJsonDescription = fs::IsReadableFile(descriptionPath);
+		if (!isJsonDescription) {
+			descriptionPath = String(sourcePath + ".font"_s);
+		}
+
+		LOGI("Reading the character list from \"{}\"", descriptionPath);
+
+		FontData font;
+		std::int32_t cellWidth, cellHeight, columns;
+		const bool descriptionRead = (isJsonDescription
+			? ReadCharacterListJson(descriptionPath, font, cellWidth, cellHeight, columns)
+			: ReadCharacterList(descriptionPath, font, cellWidth, cellHeight, columns));
+		if (!descriptionRead) {
+			return false;
+		}
+
+		// What the ASCII range doesn't cover is stored keyed by codepoint, behind a 16-bit count
+		const std::int32_t unicodeCount = std::int32_t(font.Glyphs.size()) - font.AsciiCount;
+		if (unicodeCount > UINT16_MAX) {
+			LOGE("The font has {} characters outside its ASCII range, more than the {} it may have",
+				unicodeCount, UINT16_MAX);
+			return false;
+		}
+
+		MeasureGlyphs(font, image, cellWidth, cellHeight, columns);
+
+		for (const Glyph& glyph : font.Glyphs) {
+			if (glyph.Width > FontFormat::MaxGlyphSize || glyph.Height > FontFormat::MaxGlyphSize) {
+				LOGE("Glyph U+{:.4X} is {}x{}, larger than the {} pixels a glyph may be",
+					std::uint32_t(glyph.Codepoint), glyph.Width, glyph.Height, FontFormat::MaxGlyphSize);
+				return false;
+			}
+			if (glyph.BearingX > FontFormat::MaxGlyphBearing || glyph.BearingY > FontFormat::MaxGlyphBearing) {
+				LOGE("Glyph U+{:.4X} sits at [{}, {}] in its cell, further than the {} pixels a bearing may be",
+					std::uint32_t(glyph.Codepoint), glyph.BearingX, glyph.BearingY, FontFormat::MaxGlyphBearing);
+				return false;
+			}
+		}
+
+		// Every pixel of a font is either one of the palette's colors or nothing at all - the shading comes from
+		// the palette entry, not from blending the glyph into what is behind it. The source images say that two
+		// different ways (the transparent index, and no coverage) and a few pixels manage to say neither, so
+		// they are all resolved to one of the two here. What that leaves is an image of palette indices, which
+		// is how it is stored.
+		std::int32_t transparentFixed = 0, coverageFixed = 0;
+		for (std::size_t i = 0; i < std::size_t(image.Width) * image.Height; i++) {
+			std::uint8_t* pixel = &image.Pixels[i * 4];
+			if (pixel[0] == 0 || pixel[3] == 0) {
+				if (pixel[0] != 0 || pixel[3] != 0) {
+					transparentFixed++;
+				}
+				pixel[0] = 0;
+				pixel[3] = 0;
+			} else if (pixel[3] != 255) {
+				// Partially covered, which a font cannot express - it is drawn as the color it names
+				coverageFixed++;
+				pixel[3] = 255;
+			}
+		}
+
+		if (transparentFixed > 0) {
+			LOGW("{} pixels of \"{}\" were transparent in one channel but not the other, and were made fully transparent",
+				transparentFixed, sourcePath);
+		}
+		if (coverageFixed > 0) {
+			LOGW("{} pixels of \"{}\" were partially covered, which a font cannot store, and were made fully opaque",
+				coverageFixed, sourcePath);
+		}
+
+		constexpr std::int32_t channelCount = 1;
+
+		SmallVector<std::int32_t, 0> positions;
+		std::int32_t atlasWidth, atlasHeight;
+		if (!PackGlyphs(font, positions, atlasWidth, atlasHeight)) {
+			return false;
+		}
+
+		// Copy every glyph to where it landed, leaving the margins as the transparent palette entry
+		auto atlas = std::make_unique<std::uint8_t[]>(std::size_t(atlasWidth) * atlasHeight * channelCount);
+		std::memset(atlas.get(), 0, std::size_t(atlasWidth) * atlasHeight * channelCount);
+
+		for (std::int32_t i = 0; i < std::int32_t(font.Glyphs.size()); i++) {
+			Glyph& glyph = font.Glyphs[i];
+			if (glyph.Width <= 0 || glyph.Height <= 0) {
+				continue;
+			}
+
+			const std::int32_t targetX = positions[i * 2 + 0];
+			const std::int32_t targetY = positions[i * 2 + 1];
+			for (std::int32_t y = 0; y < glyph.Height; y++) {
+				for (std::int32_t x = 0; x < glyph.Width; x++) {
+					const std::uint8_t* source = &image.Pixels[(std::size_t(glyph.Y + y) * image.Width + (glyph.X + x)) * 4];
+					std::uint8_t* target = &atlas[(std::size_t(targetY + y) * atlasWidth + (targetX + x)) * channelCount];
+					target[0] = source[0];
+				}
+			}
+
+			glyph.X = targetX;
+			glyph.Y = targetY;
+		}
+
+		FileStream so(targetPath, FileAccess::Write);
+		if (!so.IsValid()) {
+			LOGE("Cannot open \"{}\" for writing", targetPath);
+			return false;
+		}
+
+		// Everything but the few identifying bytes is deflated. The image encoding on its own leaves a lot on
+		// the table for this kind of picture - a glyph atlas is small, high-contrast and repetitive, which is
+		// what deflate is good at and what the per-pixel encoding cannot see - and the glyph records compress
+		// well too, being mostly small numbers that barely change from one entry to the next.
+		MemoryStream ms(256 * 1024);
+		{
+			DeflateWriter co(ms);
+
+			co.WriteValueAsLE<std::uint16_t>(std::uint16_t(atlasWidth));
+			co.WriteValueAsLE<std::uint16_t>(std::uint16_t(atlasHeight));
+			co.WriteValueAsLE<std::uint16_t>(std::uint16_t(font.LineHeight));
+			co.WriteValueAsLE<std::int16_t>(std::int16_t(font.BaseSpacing));
+			co.WriteValue<std::uint8_t>(font.AsciiFirst);
+			co.WriteValue<std::uint8_t>(font.AsciiCount);
+			co.WriteValueAsLE<std::uint16_t>(std::uint16_t(unicodeCount));
+
+			for (std::int32_t i = 0; i < std::int32_t(font.Glyphs.size()); i++) {
+				const Glyph& glyph = font.Glyphs[i];
+				if (i >= font.AsciiCount) {
+					co.WriteValueAsLE<std::uint32_t>(std::uint32_t(glyph.Codepoint));
+				}
+				co.WriteValueAsLE<std::uint16_t>(std::uint16_t(glyph.X));
+				co.WriteValueAsLE<std::uint16_t>(std::uint16_t(glyph.Y));
+				co.WriteValue<std::uint8_t>(std::uint8_t(glyph.Width));
+				co.WriteValue<std::uint8_t>(std::uint8_t(glyph.Height));
+				co.WriteValue<std::int8_t>(std::int8_t(glyph.BearingX));
+				co.WriteValue<std::int8_t>(std::int8_t(glyph.BearingY));
+				co.WriteValue<std::uint8_t>(std::uint8_t(glyph.Advance));
+			}
+
+			Compatibility::JJ2Anims::WriteImageContent(co, atlas.get(), atlasWidth, atlasHeight, channelCount);
+		}
+
+		constexpr std::int64_t headerSize = sizeof(std::uint64_t) + 3 * sizeof(std::uint8_t) + sizeof(std::int32_t);
+		so.WriteValueAsLE<std::uint64_t>(FontFormat::Signature);
+		so.WriteValue<std::uint8_t>(ContentFileType::Font);
+		so.WriteValue<std::uint8_t>(FontFormat::CurrentVersion);
+		so.WriteValue<std::uint8_t>(0x00);	// Flags
+		so.WriteValueAsLE<std::int32_t>(std::int32_t(ms.GetSize()));
+		so.Write(ms.GetBuffer(), ms.GetSize());
+
+		const std::int64_t sourceArea = std::int64_t(image.Width) * image.Height;
+		const std::int64_t targetArea = std::int64_t(atlasWidth) * atlasHeight;
+		LOGI("{} glyphs packed into {}x{} ({}% of the {}x{} grid), {} bytes",
+			font.Glyphs.size(), atlasWidth, atlasHeight, (sourceArea > 0 ? targetArea * 100 / sourceArea : 0),
+			image.Width, image.Height, headerSize + ms.GetSize());
+
+		return so.IsValid();
+	}
+
+	bool FontPacker::Unpack(StringView sourcePath, StringView targetPath)
+	{
+		FileStream s(sourcePath, FileAccess::Read);
+		if (!s.IsValid()) {
+			LOGE("Cannot open \"{}\" for reading", sourcePath);
+			return false;
+		}
+
+		const std::uint64_t signature = s.ReadValueAsLE<std::uint64_t>();
+		const std::uint8_t fileType = s.ReadValue<std::uint8_t>();
+		const std::uint8_t version = s.ReadValue<std::uint8_t>();
+		/*std::uint8_t flags =*/ s.ReadValue<std::uint8_t>();
+		if (signature != FontFormat::Signature || fileType != ContentFileType::Font) {
+			LOGE("\"{}\" is not a packed font", sourcePath);
+			return false;
+		}
+		if (version != FontFormat::CurrentVersion) {
+			LOGE("\"{}\" is version {}, but only version {} is supported", sourcePath, version, FontFormat::CurrentVersion);
+			return false;
+		}
+
+		const std::int32_t compressedSize = s.ReadValueAsLE<std::int32_t>();
+		DeflateStream uc(s, compressedSize);
+
+		const std::int32_t atlasWidth = uc.ReadValueAsLE<std::uint16_t>();
+		const std::int32_t atlasHeight = uc.ReadValueAsLE<std::uint16_t>();
+
+		FontData font;
+		font.LineHeight = uc.ReadValueAsLE<std::uint16_t>();
+		font.BaseSpacing = uc.ReadValueAsLE<std::int16_t>();
+		font.AsciiFirst = uc.ReadValue<std::uint8_t>();
+		font.AsciiCount = uc.ReadValue<std::uint8_t>();
+		const std::int32_t unicodeCount = uc.ReadValueAsLE<std::uint16_t>();
+
+		for (std::int32_t i = 0; i < font.AsciiCount + unicodeCount; i++) {
+			Glyph& glyph = font.Glyphs.emplace_back();
+			if (i < font.AsciiCount) {
+				glyph.Codepoint = char32_t(font.AsciiFirst + i);
+				glyph.IsAscii = true;
+			} else {
+				glyph.Codepoint = char32_t(uc.ReadValueAsLE<std::uint32_t>());
+			}
+			glyph.X = uc.ReadValueAsLE<std::uint16_t>();
+			glyph.Y = uc.ReadValueAsLE<std::uint16_t>();
+			glyph.Width = uc.ReadValue<std::uint8_t>();
+			glyph.Height = uc.ReadValue<std::uint8_t>();
+			glyph.BearingX = uc.ReadValue<std::int8_t>();
+			glyph.BearingY = uc.ReadValue<std::int8_t>();
+			glyph.Advance = uc.ReadValue<std::uint8_t>();
+		}
+
+		if (!uc.IsValid() || atlasWidth <= 0 || atlasHeight <= 0) {
+			LOGE("\"{}\" is corrupted", sourcePath);
+			return false;
+		}
+		for (const Glyph& glyph : font.Glyphs) {
+			// Each glyph has to lie inside the atlas and sit inside its rebuilt cell, otherwise the copy
+			// below would run out of both buffers
+			if (glyph.X + glyph.Width > atlasWidth || glyph.Y + glyph.Height > atlasHeight
+					|| glyph.BearingX < 0 || glyph.BearingY < 0) {
+				LOGE("\"{}\" is corrupted", sourcePath);
+				return false;
+			}
+		}
+
+		constexpr std::int32_t channelCount = 1;
+		const std::size_t atlasPixels = std::size_t(atlasWidth) * atlasHeight;
+		// The decoder always stores four bytes per pixel, however few of them the image carries, so the buffer
+		// is sized for that and the result is spread out afterwards
+		auto atlas = std::make_unique<std::uint8_t[]>(atlasPixels * 4);
+		Compatibility::JJ2Anims::ReadImageContent(uc, atlas.get(), atlasWidth, atlasHeight, channelCount);
+
+		// Rebuild the grid: cells as tall as a line and as wide as the widest glyph reaches, laid out in a
+		// roughly square sheet. It only has to hold every glyph where its bearing says it sits - packing the
+		// result again measures the pixels afresh and arrives back at the same font.
+		std::int32_t cellWidth = 1;
+		for (const Glyph& glyph : font.Glyphs) {
+			cellWidth = std::max(cellWidth, glyph.BearingX + glyph.Width);
+			cellWidth = std::max(cellWidth, glyph.Advance);
+		}
+		const std::int32_t cellHeight = std::max(font.LineHeight, 1);
+
+		const std::int32_t glyphCount = std::int32_t(font.Glyphs.size());
+		// As many columns as it takes for the sheet to come out roughly square, which is only a convenience for
+		// whoever opens it - the column count is stored alongside, and nothing depends on the particular value
+		std::int32_t columns = std::int32_t(std::lround(std::sqrt(double(glyphCount) * cellHeight / cellWidth)));
+		columns = std::clamp(columns, 1, 255);
+		const std::int32_t rows = (glyphCount + columns - 1) / columns;
+
+		Image image;
+		image.Width = columns * cellWidth;
+		image.Height = rows * cellHeight;
+		image.Pixels = std::make_unique<std::uint8_t[]>(std::size_t(image.Width) * image.Height * 4);
+		std::memset(image.Pixels.get(), 0, std::size_t(image.Width) * image.Height * 4);
+
+		for (std::int32_t i = 0; i < glyphCount; i++) {
+			const Glyph& glyph = font.Glyphs[i];
+			const std::int32_t cellX = (i % columns) * cellWidth;
+			const std::int32_t cellY = (i / columns) * cellHeight;
+
+			for (std::int32_t y = 0; y < glyph.Height; y++) {
+				for (std::int32_t x = 0; x < glyph.Width; x++) {
+					const std::uint8_t* source = &atlas[(std::size_t(glyph.Y + y) * atlasWidth + (glyph.X + x)) * channelCount];
+					std::uint8_t* target = &image.Pixels[(std::size_t(cellY + glyph.BearingY + y) * image.Width
+						+ (cellX + glyph.BearingX + x)) * 4];
+					target[0] = target[1] = target[2] = source[0];
+					target[3] = (source[0] != 0 ? 255 : 0);
+				}
+			}
+		}
+
+		if (!PngCodec::Write(targetPath, image)) {
+			return false;
+		}
+		// Both forms of the character list are written: the JSON one to edit, which is also what packing the
+		// result back takes, and the binary one the game's own content has always been kept in
+		if (!WriteCharacterList(String(targetPath + ".font"_s), font, cellWidth, cellHeight, columns)) {
+			return false;
+		}
+		if (!WriteCharacterListJson(String(targetPath + ".json"_s), font, cellWidth, cellHeight, columns)) {
+			return false;
+		}
+
+		LOGI("{} glyphs unpacked into a {}x{} grid of {}x{} cells", glyphCount, columns, rows, cellWidth, cellHeight);
+		return true;
+	}
+
+	bool FontPacker::ApplyPalette(StringView sourcePath, StringView targetPath)
+	{
+		Image image;
+		if (!PngCodec::Read(sourcePath, image)) {
+			return false;
+		}
+
+		for (std::size_t i = 0; i < std::size_t(image.Width) * image.Height; i++) {
+			std::uint8_t* pixel = &image.Pixels[i * 4];
+			const Color& color = SpritePalette[pixel[0]];
+			pixel[3] = std::uint8_t(color.A * pixel[3] / 255);
+			pixel[0] = color.R;
+			pixel[1] = color.G;
+			pixel[2] = color.B;
+		}
+
+		if (!PngCodec::Write(targetPath, image)) {
+			return false;
+		}
+
+		LOGI("Palette applied to a {}x{} image", image.Width, image.Height);
+		return true;
+	}
+
+	bool FontPacker::ConvertToIndices(StringView sourcePath, StringView targetPath)
+	{
+		Image image;
+		if (!PngCodec::Read(sourcePath, image)) {
+			return false;
+		}
+
+		// Only fully opaque entries are candidates: index 0 is the transparent one and stands for "no pixel",
+		// and coverage is carried by the alpha channel rather than by picking a different index
+		SmallVector<std::int32_t, 0> candidates;
+		for (std::int32_t i = 1; i < 256; i++) {
+			if (SpritePalette[i].A == 255) {
+				candidates.push_back(i);
+			}
+		}
+
+		std::int32_t worstDistance = 0;
+		for (std::size_t i = 0; i < std::size_t(image.Width) * image.Height; i++) {
+			std::uint8_t* pixel = &image.Pixels[i * 4];
+			if (pixel[3] == 0) {
+				pixel[0] = pixel[1] = pixel[2] = 0;
+				continue;
+			}
+
+			std::int32_t bestIndex = candidates.empty() ? 0 : candidates[0];
+			std::int32_t bestDistance = INT32_MAX;
+			for (std::int32_t index : candidates) {
+				const Color& color = SpritePalette[index];
+				const std::int32_t dr = std::int32_t(color.R) - pixel[0];
+				const std::int32_t dg = std::int32_t(color.G) - pixel[1];
+				const std::int32_t db = std::int32_t(color.B) - pixel[2];
+				const std::int32_t distance = dr * dr + dg * dg + db * db;
+				if (distance < bestDistance) {
+					bestDistance = distance;
+					bestIndex = index;
+					if (distance == 0) {
+						break;
+					}
+				}
+			}
+
+			worstDistance = std::max(worstDistance, bestDistance);
+			pixel[0] = pixel[1] = pixel[2] = std::uint8_t(bestIndex);
+		}
+
+		if (!PngCodec::Write(targetPath, image)) {
+			return false;
+		}
+
+		if (worstDistance > 0) {
+			LOGW("Some colors are not in the palette and were replaced by the nearest one (off by up to {} per channel)",
+				std::int32_t(std::sqrt(double(worstDistance))));
+		}
+		LOGI("A {}x{} image converted back to palette indices", image.Width, image.Height);
+		return true;
+	}
+}

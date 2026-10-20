@@ -1,0 +1,72 @@
+namespace Death {
+//###==##====#=====--==~--~=~- --- -- -  -  -   -
+
+/** @dir Shared
+	@brief Namespace @ref Death
+*/
+/** @namespace Death
+	@brief Shared root namespace
+	
+	The shared root namespace contains definitions and classes that don't depend on any other namespace.
+	Most of the definitions are defined in @ref CommonBase.h, which should be included (even transitively)
+	in every `.h`/`.cpp` file to avoid issues due to missing configuration-specific and platform-specific
+	definitions. Besides that, some definitions are @ref Death.dox "listed separately". Most of the time
+	@ref Common.h should be used instead, which also includes @cpp <cstddef> @ce, @cpp <cstdint> @ce
+	and some function-like macros. For event tracing and assertions, see @ref Asserts.h.
+*/
+
+/** @dir Shared/Base
+	@brief Basic utilities for memory management and type information
+*/
+
+/** @dir Shared/Containers
+	@brief Namespace @ref Death::Containers, @ref Death::Containers::Literals
+*/
+
+/** @dir Shared/Core
+	@brief Namespace @ref Death::Backward, @ref Death::Trace
+*/
+
+/** @dir Shared/Cryptography
+	@brief Namespace @ref Death::Cryptography
+*/
+/** @namespace Death::Cryptography
+	@brief Cryptographic and hashing utilities
+
+	Provides cryptographic services, including secure encoding and decoding
+	of data, as well as many other operations, such as hashing, random number
+	generation, and message authentication.
+*/
+
+/** @dir Shared/IO
+	@brief Namespace @ref Death::IO
+*/
+/** @namespace Death::IO
+	@brief File system, streaming and IO-related classes
+
+	Contains types that allow reading and writing to files and data streams,
+	and types that provide basic file and directory support.
+*/
+
+/** @dir Shared/IO/Compression
+	@brief Namespace @ref Death::IO::Compression
+*/
+/** @namespace Death::IO::Compression
+	@brief Data compression streaming interfaces
+*/
+
+/** @dir Shared/Threading
+	@brief Namespace @ref Death::Threading
+*/
+/** @namespace Death::Threading
+	@brief Multithreading-related classes
+
+	Provides classes that enable multithreaded programming, synchronizing
+	thread activities and access to data.
+*/
+
+/** @namespace Death::Trace
+	@brief Runtime event tracing implementation, should be used along with @ref Asserts.h
+*/
+
+}

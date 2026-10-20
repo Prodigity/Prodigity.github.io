@@ -1,0 +1,171 @@
+﻿#include "GemRing.h"
+#include "../../ContentResolver.h"
+#include "../../ILevelHandler.h"
+#include "../../Tiles/TileMap.h"
+#include "../Player.h"
+
+#include "../../../nCine/Graphics/RenderQueue.h"
+
+namespace Jazz2::Actors::Collectibles
+{
+	GemRing::GemRing()
+		: _phase(0.0f), _collected(false), _collectedPhase(0.0f)
+	{
+	}
+
+	void GemRing::Preload(const ActorActivationDetails& details)
+	{
+		PreloadMetadataAsync("Collectible/Gems"_s);
+	}
+
+	Task<bool> GemRing::OnActivatedAsync(const ActorActivationDetails& details)
+	{
+		async_await CollectibleBase::OnActivatedAsync(details);
+
+		std::int32_t length = (details.Params[0] > 0 ? details.Params[0] : 8);
+		_speed = (details.Params[1] > 0 ? details.Params[1] : 8) * 0.00625f;
+		_untouched = false;
+
+		SetState(ActorState::SkipPerPixelCollisions, true);
+
+		async_await RequestMetadataAsync("Collectible/Gems"_s);
+
+		auto& resolver = ContentResolver::Get();
+		if (!resolver.IsHeadless()) {
+			for (std::int32_t i = 0; i < length; i++) {
+				ChainPiece& piece = _pieces.emplace_back();
+				piece.Scale = 0.8f;
+				piece.Command = std::make_unique<RenderCommand>(RenderCommand::Type::Sprite);
+				piece.Command->GetMaterial().SetShaderProgramType(Material::ShaderProgramType::Sprite);
+				piece.Command->GetMaterial().SetBlendingEnabled(true);
+				piece.Command->GetMaterial().ReserveUniformsDataMemory();
+				piece.Command->GetGeometry().SetDrawParameters(PrimitiveType::TriangleStrip, 0, 4);
+
+				auto* textureUniform = piece.Command->GetMaterial().Uniform(Material::TextureUniformName);
+				if (textureUniform && textureUniform->GetIntValue(0) != 0) {
+					textureUniform->SetIntValue(0); // GL_TEXTURE0
+				}
+			}
+		}
+
+		async_return true;
+	}
+
+	void GemRing::OnUpdate(float timeMult)
+	{
+		if (_collected) {
+			if (_collectedPhase > 100.0f) {
+				DecreaseHealth(INT32_MAX);
+				return;
+			}
+
+			for (int i = 0; i < _pieces.size(); i++) {
+				float angle = _phase * (1.0f + _collectedPhase * 0.001f) + (i * fTwoPi / _pieces.size());
+				float distance = 8 * 4 + _collectedPhase * 3.6f;
+				float sinAngle, cosAngle;
+				sincosApprox(angle, sinAngle, cosAngle);
+				_pieces[i].Pos = Vector2f(_pos.X + cosAngle * distance, _pos.Y + sinAngle * distance);
+				_pieces[i].Angle = angle + fPiOver2;
+				_pieces[i].Scale += 0.02f * timeMult;
+			}
+
+			_phase += timeMult * _speed * 3.0f;
+			_collectedPhase += timeMult;
+		} else {
+			for (int i = 0; i < _pieces.size(); i++) {
+				float angle = _phase + (i * fTwoPi / _pieces.size());
+				float distance = 8 * (4 + sinApprox(_phase * 1.1f));
+				float sinAngle, cosAngle;
+				sincosApprox(angle, sinAngle, cosAngle);
+				_pieces[i].Pos = Vector2f(_pos.X + cosAngle * distance, _pos.Y + sinAngle * distance);
+				_pieces[i].Angle = angle + fPiOver2;
+			}
+
+			_phase += timeMult * _speed;
+		}
+	}
+
+	void GemRing::OnUpdateHitbox()
+	{
+		AABBInner = AABBf(
+			_pos.X - 20.0f,
+			_pos.Y - 20.0f,
+			_pos.X + 20.0f,
+			_pos.Y + 20.0f
+		);
+	}
+
+	void GemRing::OnSerializeState(Stream& dest)
+	{
+		CollectibleBase::OnSerializeState(dest);
+
+		dest.WriteValueAsLE<float>(_phase);
+		dest.WriteValue<std::uint8_t>(_collected ? 1 : 0);
+		dest.WriteValueAsLE<float>(_collectedPhase);
+	}
+
+	void GemRing::OnDeserializeState(Stream& src)
+	{
+		CollectibleBase::OnDeserializeState(src);
+
+		_phase = src.ReadValueAsLE<float>();
+		_collected = (src.ReadValue<std::uint8_t>() != 0);
+		_collectedPhase = src.ReadValueAsLE<float>();
+
+		if (_collected) {
+			// Pieces grow by the same rate as the collected phase advances
+			for (auto& piece : _pieces) {
+				piece.Scale = 0.8f + _collectedPhase * 0.02f;
+			}
+		}
+	}
+
+	bool GemRing::OnDraw(RenderQueue& renderQueue)
+	{
+		if (!_pieces.empty()) {
+			auto* res = _metadata->FindAnimation(AnimState::Default); // GemRed
+			if (res != nullptr && res->Base->TextureDiffuse != nullptr) {
+				Vector2i texSize = res->Base->TextureDiffuse->GetSize();
+				auto& resolver = ContentResolver::Get();
+				bool indexed = ((res->Base->Flags & GenericGraphicResourceFlags::Indexed) == GenericGraphicResourceFlags::Indexed);
+
+				for (std::int32_t i = 0; i < _pieces.size(); i++) {
+					auto command = _pieces[i].Command.get();
+					resolver.ConfigureSpriteShader(*command, indexed);
+
+					std::int32_t curAnimFrame = res->FrameOffset + (i % res->FrameCount);
+					Recti frameRect = res->Base->GetFrameRect(curAnimFrame);
+					float texScaleX = (float(frameRect.W) / float(texSize.X));
+					float texBiasX = (float(frameRect.X) / float(texSize.X));
+					float texScaleY = (float(frameRect.H) / float(texSize.Y));
+					float texBiasY = (float(frameRect.Y) / float(texSize.Y));
+
+					auto instanceBlock = command->GetInstanceBlock();
+					instanceBlock->GetUniform(Material::TexRectUniformName)->SetFloatValue(texScaleX, texBiasX, texScaleY, texBiasY);
+					instanceBlock->GetUniform(Material::SpriteSizeUniformName)->SetFloatValue(frameRect.W * _pieces[i].Scale, frameRect.H * _pieces[i].Scale);
+					instanceBlock->GetUniform(Material::ColorUniformName)->SetFloatVector(Colorf(1.0f, 1.0f, 1.0f, 0.7f).Data());
+
+					auto& pos = _pieces[i].Pos;
+					command->SetTransformation(Matrix4x4f::Translation(pos.X, pos.Y, 0.0f).RotateZ(_pieces[i].Angle));
+					command->SetLayer(_renderer.layer() - 2);
+					resolver.BindSpritePalette(*command, *res->Base->TextureDiffuse.get(), indexed, res->PaletteOffset);
+
+					renderQueue.AddCommand(command);
+				}
+			}
+		}
+
+		return true;
+	}
+
+	void GemRing::OnCollect(Player* player)
+	{
+		if (!_collected) {
+			_collected = true;
+			SetState(ActorState::CollideWithOtherActors, false);
+
+			player->AddGems(0, (std::int32_t)_pieces.size());
+			player->AddScore(800);
+		}
+	}
+}

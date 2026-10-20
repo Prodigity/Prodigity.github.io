@@ -1,0 +1,516 @@
+namespace Death {
+//###==##====#=====--==~--~=~- --- -- -  -  -   -
+
+/** @mainpage
+
+This is an API documentation for Jazz² Resurrection. For user documentation, please visit [project homepage](https://de4th.dev/jazz2/).
+Additionaly, the project is hosted on https://github.com/deathkiller/jazz2-native/.
+
+Jazz² Resurrection is reimplementation of the game Jazz Jackrabbit 2 released in 1998. Supports
+various versions of the game (Shareware Demo, Holiday Hare '98, The Secret Files and Christmas
+Chronicles). Also, it partially supports some features of JJ2+ extension and MLLE. **Online multiplayer**
+and **scripting support** (AngelScript) is currently in development, everything else, including
+story episodes fully playable in cooperation, is already implemented.
+
+To get in touch with the developers and the community, you can use the official [Discord server](https://discord.gg/Y7SBvkD).
+
+For getting started guide, see @ref building --- and @ref consoles "Building for consoles" for the
+console targets. For game-specific API documentation, see @ref Jazz2
+namespace. For common utility functions and generic containers, see @ref Death "the shared root namespace".
+In addition, @ref CommonBase.h contains common configuration-specific and platform-specific
+definitions. For **nCine** game engine documentation, see @ref nCine namespace. The **nCine** game
+engine used in this game has been extensively modified, so the original documentation no longer
+matches the current implementation.
+
+@section mainpage-platforms Supported platforms
+
+- **Android**
+- **FreeBSD**
+- **Linux** and other Unix-like systems
+- **macOS**
+- **iOS** (iPhone and iPad) with a **Metal** or OpenGL|ES 3.0 rendering backend, see @ref building-ios
+- **Windows**
+- **Xbox** (Universal Windows Platform)
+- **Web** (WebAssembly) using [Emscripten](https://kripken.github.io/emscripten-site/)
+- **Nintendo Switch** using [devkitPro toolchain](https://devkitpro.org/wiki/devkitPro_pacman),
+  see @ref consoles-switch
+- **Nintendo Wii** and **Nintendo GameCube** using fixed-function GX rendering backend,
+  see @ref consoles-wii and @ref consoles-gamecube
+- **Nintendo 3DS** using fixed-function PICA200 rendering backend, see @ref consoles-3ds
+- **Nintendo 64** using fixed-function RDP rendering backend, see @ref consoles-n64
+- **Sega Dreamcast** using fixed-function PowerVR rendering backend, see @ref consoles-dreamcast
+- **PlayStation Portable** using fixed-function GU rendering backend, see @ref consoles-psp
+- **PlayStation 2** using fixed-function Graphics Synthesizer rendering backend, see @ref consoles-ps2
+- **PlayStation 3** using native **libgcm** rendering backend for the RSX, see @ref consoles-ps3
+- **PlayStation Vita** using native **sceGxm** rendering backend, or OpenGL|ES 2.0 through vitaGL, see @ref consoles-vita
+- **libretro** core for RetroArch, see @ref consoles-libretro
+- **AmigaOS 3.x** on 68040/68060, PiStorm and Vampire machines, using
+  Intuition/RTG window backend and CPU software rasterizer, see @ref amiga-classic
+- **AmigaOS 4.1** and **MorphOS** on PowerPC, using fixed-function `LegacyGL`
+  rendering backend on the OpenGL 1.x each of them provides
+  @m_span{m-text m-dim} (MiniGL over Warp3D, resp. TinyGL) @m_endspan, see @ref amiga-os4 and
+  @ref amiga-morphos
+
+The code is mainly optimized to run on 64-bit **x86** and **ARM** processors including advanced
+instruction sets. Additionally, the application requires a rendering backend --- **OpenGL**
+3.3, **OpenGL|ES** 3.0, **WebGL** 2.0, **Direct3D** 11, **Vulkan**, **Metal** and a CPU software rasterizer
+are all fully supported and interchangeable, so any of them can be used depending on the target
+platform. The platforms above are where that stops being a free choice: seven of the consoles have no
+programmable shaders at all and are driven by one of six rendering backends written for their
+fixed-function graphics hardware @m_span{m-text m-dim} (the Wii and the GameCube share one)
+@m_endspan, a seventh such backend drives the fixed-function OpenGL 1.x of the two PowerPC Amigas, while
+the PlayStation Vita and the PlayStation 3 have real shaders and drive their native APIs --- **sceGxm** and **libgcm** ---
+directly. The classic Amiga has no usable graphics hardware at all, so there the software rasterizer
+is the renderer rather than a fallback. See also @ref consoles-common-features "the list of features each console supports",
+which is where the platform differences are the largest.
+	
+@section mainpage-license License
+
+This project is licensed under the terms of the [GNU General Public License v3.0](https://github.com/deathkiller/jazz2-native/blob/master/LICENSE).
+See also @ref third-party for the licenses of the libraries used.
+
+*/
+
+/** @file Main.h
+	@brief Common nCine header file, includes @ref Common.h and project metadata
+*/
+/** @dir nCine
+	@brief Namespace @ref nCine
+*/
+/** @namespace nCine
+	@brief Root namespace of nCine game engine
+*/
+/** @file nCine/AppConfiguration.h
+	@brief Class @ref nCine::AppConfiguration
+*/
+/** @file nCine/Application.h
+	@brief Class @ref nCine::Application
+*/
+/** @file nCine/CommonConstants.h
+	@brief Common mathematical constants
+*/
+/** @file nCine/I18n.h
+	@brief Class @ref nCine::I18n
+*/
+/** @file nCine/IAppEventHandler.h
+	@brief Interface @ref nCine::IAppEventHandler
+*/
+/** @file nCine/MainApplication.h
+	@brief Class @ref nCine::MainApplication
+*/
+/** @file nCine/ServiceLocator.h
+	@brief Class @ref nCine::ServiceLocator
+*/
+/** @dir nCine/Backends
+	@brief Namespace @ref nCine::Backends
+*/
+/** @namespace nCine::Backends
+	@brief Platform-specific backends
+*/
+/** @dir nCine/Primitives
+	@brief Namespace @ref nCine::Primitives
+*/
+/** @namespace nCine::Primitives
+	@brief Primitives
+*/
+/** @namespace nCine::Primitives::Literals
+	@brief Literals for primitives
+*/
+/** @dir nCine/Graphics/RHI
+	@brief Namespace @ref nCine::RHI
+*/
+/** @namespace nCine::RHI
+	@brief Render Hardware Interface — compile-time-selectable graphics backend abstraction
+
+	Exactly one backend is compiled into a binary, selected by a `WITH_RHI_*` macro (the OpenGL
+	family is the default). The render pipeline refers only to the backend-neutral aliases declared
+	here (e.g. @cpp nCine::RHI::Device @ce, @cpp nCine::RHI::Texture @ce), so each backend only has to
+	provide the same set of names with the same surface.
+
+	Every backend renders **top-down**: clip-space y = +1 is the top edge of the viewport for a pass onto
+	the screen and for a pass into a render target alike, the first row of a render target is its top
+	one --- so a texture coordinate of `v = 0` samples the top of what was rendered, exactly as it samples
+	the first row of an uploaded image --- and viewport and scissor rectangles are pixels counted from the
+	top-left corner of the target. Cameras are therefore Y-down wherever they render. OpenGL, whose window
+	space starts at the bottom-left corner, is the one family that translates: the engine flips clip-space Y
+	of every pass into a render target, and the device converts the rectangles of a pass onto the screen
+	@m_span{m-text m-dim} (`RHI_RENDER_TARGETS_BOTTOM_UP` in `RhiFwd.h`) @m_endspan.
+*/
+/** @file nCine/Graphics/RHI/Rhi.h
+	@brief Definitions of the classes aliased in @ref nCine::RHI for the selected backend
+*/
+/** @file nCine/Graphics/RHI/RhiFwd.h
+	@brief Compile-time backend selection, forward declarations and the backend-neutral aliases of @ref nCine::RHI
+*/
+/** @dir nCine/Graphics/RHI/GL
+	@brief Namespace @ref nCine::RHI::GL
+*/
+/** @namespace nCine::RHI::GL
+	@brief OpenGL 3.3 core, OpenGL|ES 3.0/2.0 and WebGL 2.0 backend, selected by `WITH_RHI_GL`
+*/
+/** @dir nCine/Graphics/RHI/Software
+	@brief Namespace @ref nCine::RHI::Software
+*/
+/** @namespace nCine::RHI::Software
+	@brief CPU software rasterizer backend, selected by `WITH_RHI_SOFTWARE`
+*/
+/** @namespace nCine::RHI::Software::sw
+	@brief Runtime support types for the transpiled (GLSL→C++) software shaders
+*/
+/** @namespace nCine::RHI::Software::sw::detail
+	@brief Implementation details of the software shader runtime
+*/
+/** @namespace nCine::RHI::Software::UniformTypeInfo
+	@brief Free-function helpers that classify reflected uniform types (component count, float-ness)
+*/
+/** @dir nCine/Graphics/RHI/D3D11
+	@brief Namespace @ref nCine::RHI::D3D11
+*/
+/** @namespace nCine::RHI::D3D11
+	@brief Direct3D 11 backend, selected by `WITH_RHI_D3D11`
+*/
+/** @namespace nCine::RHI::D3D11::UniformTypeInfo
+	@brief Free-function helpers that classify reflected uniform types (component count, float-ness)
+*/
+/** @dir nCine/Graphics/RHI/Vulkan
+	@brief Namespace @ref nCine::RHI::Vulkan
+*/
+/** @namespace nCine::RHI::Vulkan
+	@brief Vulkan backend, selected by `WITH_RHI_VULKAN`
+*/
+/** @namespace nCine::RHI::Vulkan::UniformTypeInfo
+	@brief Free-function helpers that classify reflected uniform types (component count, float-ness)
+*/
+/** @dir nCine/Graphics/RHI/Metal
+	@brief Namespace @ref nCine::RHI::Metal
+*/
+/** @namespace nCine::RHI::Metal
+	@brief Metal backend for macOS and iOS, selected by `WITH_RHI_METAL`
+*/
+/** @namespace nCine::RHI::Metal::UniformTypeInfo
+	@brief Free-function helpers that classify reflected uniform types (component count, float-ness)
+*/
+/** @dir nCine/Graphics/RHI/GX
+	@brief Namespace @ref nCine::RHI::GX
+*/
+/** @namespace nCine::RHI::GX
+	@brief Nintendo Wii and GameCube fixed-function GX backend, selected by `WITH_RHI_GX`
+
+	Has off-screen render targets but no programmable shaders, so every effect is submitted as a list of
+	@ref nCine::RHI::FixedFunctionPass that the device turns into a TEV and blending setup.
+*/
+/** @namespace nCine::RHI::GX::UniformTypeInfo
+	@brief Free-function helpers that classify reflected uniform types (component count, float-ness)
+*/
+/** @dir nCine/Graphics/RHI/PICA
+	@brief Namespace @ref nCine::RHI::PICA
+*/
+/** @namespace nCine::RHI::PICA
+	@brief Nintendo 3DS fixed-function PICA200 backend on top of citro3d, selected by `WITH_RHI_PICA`
+
+	The GPU's one programmable stage is its vertex shader, which here is a passthrough of screen-space
+	vertices the CPU has transformed, so like @ref nCine::RHI::GX it has render targets but no
+	programmable fragment stage and consumes @ref nCine::RHI::FixedFunctionPass, translated into
+	texture-combiner and blending setups. Textures live 8x8-tiled in the linear heap and the GPU
+	samples them bottom-up, which the texture stores are written for.
+*/
+/** @namespace nCine::RHI::PICA::UniformTypeInfo
+	@brief Free-function helpers that classify reflected uniform types (component count, float-ness)
+*/
+/** @dir nCine/Graphics/RHI/PVR
+	@brief Namespace @ref nCine::RHI::PVR
+*/
+/** @namespace nCine::RHI::PVR
+	@brief Sega Dreamcast fixed-function PowerVR backend on top of KallistiOS, selected by `WITH_RHI_PVR`
+
+	Like @ref nCine::RHI::GX it has render targets but no programmable shaders and consumes
+	@ref nCine::RHI::FixedFunctionPass, here translated into tile accelerator polygon headers.
+*/
+/** @namespace nCine::RHI::PVR::UniformTypeInfo
+	@brief Free-function helpers that classify reflected uniform types (component count, float-ness)
+*/
+/** @dir nCine/Graphics/RHI/GU
+	@brief Namespace @ref nCine::RHI::GU
+*/
+/** @namespace nCine::RHI::GU
+	@brief PlayStation Portable fixed-function GU backend, selected by `WITH_RHI_GU`
+
+	Drives the Graphics Engine through `sceGu`, again with render targets, no programmable shaders and
+	effects described by @ref nCine::RHI::FixedFunctionPass.
+*/
+/** @namespace nCine::RHI::GU::UniformTypeInfo
+	@brief Free-function helpers that classify reflected uniform types (component count, float-ness)
+*/
+/** @dir nCine/Graphics/RHI/GS
+	@brief Namespace @ref nCine::RHI::GS
+*/
+/** @namespace nCine::RHI::GS
+	@brief PlayStation 2 fixed-function Graphics Synthesizer backend, selected by `WITH_RHI_GS`
+
+	Driven by writing GIF packets to the hardware directly, so there is no graphics library between
+	the engine and the GS. Render targets are available --- one is nothing but an address written into
+	`FRAME.FBP` --- but there is no programmable stage at all, so effects arrive as
+	@ref nCine::RHI::FixedFunctionPass. Its local memory is small enough to be the port's binding
+	constraint, which is why the backend has a suballocator of its own in @ref nCine::RHI::GS::GsVram.
+*/
+/** @namespace nCine::RHI::GS::UniformTypeInfo
+	@brief Free-function helpers that classify reflected uniform types (component count, float-ness)
+*/
+/** @dir nCine/Graphics/RHI/RDP
+	@brief Namespace @ref nCine::RHI::RDP
+*/
+/** @namespace nCine::RHI::RDP
+	@brief Nintendo 64 fixed-function Reality Display Processor backend, selected by `WITH_RHI_RDP`
+
+	Drives libdragon's rdpq command queue, with @ref nCine::RHI::FixedFunctionPass translated into
+	colour-combiner and blender settings. Unlike the other fixed-function backends it never addresses a
+	texture as a whole: the RDP samples through a 4 KB TMEM window that every primitive loads first,
+	which is what the backend's draw path is built around.
+*/
+/** @namespace nCine::RHI::RDP::UniformTypeInfo
+	@brief Free-function helpers that classify reflected uniform types (component count, float-ness)
+*/
+/** @dir nCine/Graphics/RHI/LegacyGL
+	@brief Namespace @ref nCine::RHI::LegacyGL
+*/
+/** @namespace nCine::RHI::LegacyGL
+	@brief Fixed-function OpenGL 1.x backend, selected by `WITH_RHI_LEGACYGL`
+
+	The one member of this family that is not a console: its target is an OpenGL with no programmable
+	stage at all --- MorphOS' TinyGL @m_span{m-text m-dim} (see @ref amiga-morphos-gl) @m_endspan, and
+	a desktop GL in a compatibility context, which is where that path is developed. It consumes
+	@ref nCine::RHI::FixedFunctionPass like the console backends, with each TEV preset expressed as an
+	OpenGL 1.3 `GL_COMBINE` program.
+*/
+/** @namespace nCine::RHI::LegacyGL::UniformTypeInfo
+	@brief Free-function helpers that classify reflected uniform types (component count, float-ness)
+*/
+/** @dir nCine/Graphics/RHI/GXM
+	@brief Namespace @ref nCine::RHI::GXM
+*/
+/** @namespace nCine::RHI::GXM
+	@brief PlayStation Vita backend driving `sceGxm` natively, selected by `WITH_RHI_GXM`
+
+	Unlike the fixed-function console backends this is a full-pipeline backend, because the console's
+	PowerVR SGX is a unified-shader part --- compared to the OpenGL path on the same console it only
+	removes vitaGL, the OpenGL|ES 2.0 layer that would otherwise sit in between.
+*/
+/** @namespace nCine::RHI::GXM::UniformTypeInfo
+	@brief Free-function helpers that classify reflected uniform types (component count, float-ness)
+*/
+/** @dir nCine/Graphics/RHI/RSX
+	@brief Namespace @ref nCine::RHI::RSX
+*/
+/** @namespace nCine::RHI::RSX
+	@brief PlayStation 3 backend driving the RSX through libgcm natively, selected by `WITH_RHI_RSX`
+
+	The second console backend with real shaders, and like @ref nCine::RHI::GXM a full-pipeline one:
+	the RSX is an NV47, so the whole post-processing chain runs and no
+	@ref nCine::RHI::FixedFunctionPass is ever consumed. What separates it from the Vita is only when
+	its shaders are compiled --- the console has no compiler, so the same Cg the emitter produces there
+	arrives here as microcode compiled before it shipped.
+*/
+/** @namespace nCine::RHI::RSX::UniformTypeInfo
+	@brief Free-function helpers that classify reflected uniform types (component count, float-ness)
+*/
+/** @namespace nCine::RHI::RSX::RsxVram
+	@brief Suballocator for the two address windows the RSX reads --- local GDDR3 and mapped main memory
+*/
+
+/** @dir Jazz2
+	@brief Namespace @ref Jazz2
+*/
+/** @namespace Jazz2
+	@brief Root namespace of Jazz² Resurrection
+*/
+
+/** @dir Jazz2/Actors
+	@brief Namespace @ref Jazz2::Actors
+*/
+/** @namespace Jazz2::Actors
+	@brief Implementation of all objects
+
+	@ref Jazz2::Actors::Player and @ref Jazz2::Actors::ActorBase carry the movement model. Its non-Reforged
+	half is measured against the original game rather than tuned by feel --- see @ref movement-accuracy for
+	every constant, where it came from, and where the two still differ.
+*/
+/** @dir Jazz2/Actors/Collectibles
+	@brief Namespace @ref Jazz2::Actors::Collectibles
+*/
+/** @namespace Jazz2::Actors::Collectibles
+	@brief Collectibles
+*/
+/** @dir Jazz2/Actors/Enemies
+	@brief Namespace @ref Jazz2::Actors::Enemies
+*/
+/** @namespace Jazz2::Actors::Enemies
+	@brief Enemies
+*/
+/** @dir Jazz2/Actors/Enemies/Bosses
+	@brief Namespace @ref Jazz2::Actors::Bosses
+*/
+/** @namespace Jazz2::Actors::Bosses
+	@brief Enemy bosses
+*/
+/** @dir Jazz2/Actors/Environment
+	@brief Namespace @ref Jazz2::Actors::Environment
+*/
+/** @namespace Jazz2::Actors::Environment
+	@brief Environmental objects
+*/
+/** @dir Jazz2/Actors/Lighting
+	@brief Namespace @ref Jazz2::Actors::Lighting
+*/
+/** @namespace Jazz2::Actors::Lighting
+	@brief Lighting effects
+*/
+/** @dir Jazz2/Actors/Multiplayer
+	@brief Namespace @ref Jazz2::Actors::Multiplayer
+*/
+/** @namespace Jazz2::Actors::Multiplayer
+	@brief Multiplayer-related objects, compiled only if `WITH_MULTIPLAYER`
+*/
+/** @dir Jazz2/Actors/Solid
+	@brief Namespace @ref Jazz2::Actors::Solid
+*/
+/** @namespace Jazz2::Actors::Solid
+	@brief Solid objects
+*/
+/** @dir Jazz2/Actors/Weapons
+	@brief Namespace @ref Jazz2::Actors::Weapons
+*/
+/** @namespace Jazz2::Actors::Weapons
+	@brief Weapons
+*/
+
+/** @dir Jazz2/Collisions
+	@brief Namespace @ref Jazz2::Collisions
+*/
+/** @namespace Jazz2::Collisions
+	@brief Collision checking
+*/
+/** @dir Jazz2/Compatibility
+	@brief Namespace @ref Jazz2::Compatibility
+*/
+/** @namespace Jazz2::Compatibility
+	@brief Translation layer for original data files
+*/
+/** @dir Jazz2/Events
+	@brief Namespace @ref Jazz2::Events
+*/
+/** @namespace Jazz2::Events
+	@brief Events and object spawning
+*/
+/** @dir Jazz2/Formats
+	@brief Namespace @ref Jazz2::Formats
+*/
+/** @namespace Jazz2::Formats
+	@brief The game's own level and tile set formats
+
+	The only places that know the layout of a level or a tile set file --- the converter of the original files, the
+	game and the level editor all read and write them through these (see @ref editor-formats).
+*/
+/** @dir Jazz2/Input
+	@brief Namespace @ref Jazz2::Input
+*/
+/** @namespace Jazz2::Input
+	@brief Input handling
+*/
+/** @dir Jazz2/Multiplayer
+	@brief Namespace @ref Jazz2::Multiplayer
+*/
+/** @namespace Jazz2::Multiplayer
+	@brief Multiplayer-related classes, compiled only if `WITH_MULTIPLAYER`
+
+	See @ref multiplayer for how to run, configure and join a server.
+
+	@experimental
+*/
+/** @dir Jazz2/Multiplayer/GameModes
+	@brief Namespace @ref Jazz2::Multiplayer::GameModes
+*/
+/** @namespace Jazz2::Multiplayer::GameModes
+	@brief Rules and HUD of the particular multiplayer game modes, compiled only if `WITH_MULTIPLAYER`
+
+	@experimental
+*/
+/** @dir Jazz2/Rendering
+	@brief Namespace @ref Jazz2::Rendering
+*/
+/** @namespace Jazz2::Rendering
+	@brief Scene rendering and viewport management
+*/
+/** @namespace Jazz2::Resources
+	@brief Structures for game resources
+*/
+/** @dir Jazz2/Scripting
+	@brief Namespace @ref Jazz2::Scripting
+*/
+/** @namespace Jazz2::Scripting
+	@brief Scripting-related classes, compiled only if `WITH_ANGELSCRIPT`
+	
+	@experimental
+*/
+/** @namespace Jazz2::Scripting::Legacy
+	@brief Legacy JJ2+ definitions
+	
+	@experimental
+*/
+/** @dir Jazz2/Tests
+	@brief Namespace @ref Jazz2::Tests
+*/
+/** @namespace Jazz2::Tests
+	@brief Measurement harnesses, compiled only if `WITH_PHYSICS_PROBE`
+
+	Not unit tests --- these drive the game and record what it does, so the result can be compared against
+	a reference capture of the *original* Jazz Jackrabbit 2 rather than against an expectation somebody
+	wrote down. See @ref movement-accuracy for the model that came out of it.
+*/
+/** @dir Jazz2/Tiles
+	@brief Namespace @ref Jazz2::Tiles
+*/
+/** @namespace Jazz2::Tiles
+	@brief Tile sets and maps
+*/
+/** @dir Jazz2/UI
+	@brief Namespace @ref Jazz2::UI
+*/
+/** @namespace Jazz2::UI
+	@brief User interface and menus
+*/
+/** @dir Jazz2/UI/Menu
+	@brief Namespace @ref Jazz2::UI::Menu
+*/
+/** @namespace Jazz2::UI::Menu
+	@brief Menu implementation
+*/
+/** @namespace Jazz2::UI::Menu::Resources
+	@brief Common menu resources defined in `Metadata/UI/MainMenu.res`
+*/
+/** @dir Jazz2/UI/Multiplayer
+	@brief Namespace @ref Jazz2::UI::Multiplayer
+*/
+/** @namespace Jazz2::UI::Multiplayer
+	@brief Multiplayer-related user interface, compiled only if `WITH_MULTIPLAYER`
+
+	@experimental
+*/
+
+/** @dir Utilities/AssetPacker
+	@brief Namespace @ref Jazz2::AssetPacker
+*/
+/** @namespace Jazz2::AssetPacker
+	@brief Offline data conversion tool, see @ref asset-packer
+*/
+/** @dir Utilities/ShaderCompiler
+	@brief Namespace @ref ShaderCompiler
+*/
+/** @namespace ShaderCompiler
+	@brief Offline shader preprocessing tool, see @ref shader-compiler
+
+	Shared with the game at runtime: the reflection types the tool writes into the generated shader
+	headers (`Sources/Shaders/Generated`) live in this namespace as well, and that is how the backends
+	of @ref nCine::RHI learn the uniforms and vertex inputs of a compiled shader.
+*/
+
+}

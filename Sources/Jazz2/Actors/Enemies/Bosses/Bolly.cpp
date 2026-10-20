@@ -1,0 +1,473 @@
+#include "Bolly.h"
+#include "../../../ILevelHandler.h"
+#include "../Crab.h"
+#include "../../Player.h"
+#include "../../Explosion.h"
+#include "../../Weapons/ShotBase.h"
+
+#include "../../../../nCine/Base/Random.h"
+
+#include <float.h>
+
+namespace Jazz2::Actors::Bosses
+{
+	Bolly::Bolly()
+		: _state(StateWaiting), _stateTime(0.0f), _endText(0), _noiseCooldown(0.0f), _rocketsLeft(0), _chainPhase(0.0f)
+	{
+	}
+
+	Bolly::~Bolly()
+	{
+		if (_bottom != nullptr) {
+			_bottom->SetState(ActorState::IsDestroyed, true);
+		}
+		/*if (_turret != nullptr) {
+			_turret->SetState(ActorState::IsDestroyed, true);
+		}*/
+		for (std::int32_t i = 0; i < std::int32_t(arraySize(_chain)); i++) {
+			if (_chain[i] != nullptr) {
+				_chain[i]->SetState(ActorState::IsDestroyed, true);
+			}
+		}
+	}
+
+	void Bolly::Preload(const ActorActivationDetails& details)
+	{
+		PreloadMetadataAsync("Boss/Bolly"_s);
+	}
+
+	void Bolly::GetChainOffsets(float chainPhase, std::int32_t chainLength, SmallVectorImpl<Vector2f>& offsets)
+	{
+		float distance = ChainStartDistance;
+		for (std::int32_t i = 0; i < chainLength; i++) {
+			offsets.push_back(GetChainDirection(chainPhase, i) * distance);
+			distance += (IsChainBall(i) ? ChainBallSize : ChainPieceSize);
+		}
+	}
+
+	Vector2f Bolly::GetChainDirection(float chainPhase, std::int32_t index)
+	{
+		// It hangs down and swings, the further from the boss, the later
+		float angle = sinApprox(chainPhase - index * 0.08f) * 1.2f + fPiOver2;
+		float sinAngle, cosAngle;
+		sincosApprox(angle, sinAngle, cosAngle);
+		return Vector2f(cosAngle, sinAngle);
+	}
+
+	Task<bool> Bolly::OnActivatedAsync(const ActorActivationDetails& details)
+	{
+		_endText = details.Params[1];
+		_originPos = _pos;
+
+		SetState(ActorState::CollideWithTileset | ActorState::CollideWithSolidObjects | ActorState::CanBeFrozen | ActorState::ApplyGravitation, false);
+
+		_scoreValue = 3000;
+
+		async_await RequestMetadataAsync("Boss/Bolly"_s);
+		SetAnimation(AnimState::Idle);
+
+		_bottom = std::make_shared<BollyPart>();
+		std::uint8_t bottomParams[1] = { std::uint8_t(BottomAnimation) };
+		_bottom->OnActivated(ActorActivationDetails(
+			_levelHandler,
+			Vector3i((std::int32_t)_pos.X, (std::int32_t)_pos.Y, _renderer.layer() + 2),
+			bottomParams
+		));
+		_levelHandler->AddActor(_bottom);
+
+		/*_turret = std::make_shared<BollyPart>();
+		uint8_t turretParams[1] = { 2 };
+		_turret->OnActivated({
+			.LevelHandler = _levelHandler,
+			.Pos = Vector3i((std::int32_t)_pos.X, (std::int32_t)_pos.Y, _renderer.layer() + 6),
+			.Params = turretParams
+		});
+		_levelHandler->AddActor(_turret);*/
+
+		std::int32_t chainLength = (_levelHandler->GetDifficulty() < GameDifficulty::Hard ? NormalChainLength : HardChainLength);
+		for (std::int32_t i = 0; i < chainLength; i++) {
+			_chain[i] = std::make_shared<BollyPart>();
+			std::uint8_t chainParams[1] = { std::uint8_t(IsChainBall(i) ? ChainBallAnimation : ChainPieceAnimation) };
+			_chain[i]->OnActivated(ActorActivationDetails(
+				_levelHandler,
+				Vector3i((std::int32_t)_pos.X, (std::int32_t)_pos.Y, _renderer.layer() - (IsChainBall(i) ? 2 : 4)),
+				chainParams
+			));
+			_levelHandler->AddActor(_chain[i]);
+		}
+
+		async_return true;
+	}
+
+	bool Bolly::OnActivatedBoss()
+	{
+		SetHealthByDifficulty(42);
+		MoveInstantly(_originPos, MoveType::Absolute | MoveType::Force);
+		FollowNearestPlayer(StateFlying, 100.0f);
+		return true;
+	}
+
+	void Bolly::OnUpdate(float timeMult)
+	{
+		HandleBlinking(timeMult);
+
+		MoveInstantly(Vector2f(_speed.X * timeMult, _speed.Y * timeMult), MoveType::Relative | MoveType::Force);
+
+		switch (_state) {
+			case StateFlying: {
+				if (_stateTime <= 0.0f) {
+					if (Random().NextFloat() < 0.1f) {
+						_state = StatePrepairingToAttack;
+						_stateTime = 120.0f;
+						_speed.X = 0;
+						_speed.Y = 0;
+					} else {
+						_state = StateNewDirection;
+						_stateTime = 50.0f;
+					}
+				}
+				break;
+			}
+
+			case StateNewDirection: {
+				if (_stateTime <= 0.0f) {
+					FollowNearestPlayer(StateFlying, 1.0f);
+				}
+				break;
+			}
+
+			case StatePrepairingToAttack: {
+				if (_stateTime <= 0.0f) {
+					_state = StateAttacking;
+					_stateTime = 20.0f;
+					_rocketsLeft = 5;
+
+					PlaySfx("PreAttack"_s);
+				}
+				break;
+			}
+
+			case StateAttacking: {
+				if (_stateTime <= 0.0f) {
+					if (_rocketsLeft > 0) {
+						_stateTime = 20.0f;
+
+						FireRocket();
+						_rocketsLeft--;
+
+						PlaySfx("Attack"_s);
+					} else {
+						_state = StateNewDirection;
+						_stateTime = 100.0f;
+
+						PlaySfx("PostAttack"_s);
+					}
+				}
+				break;
+			}
+		}
+
+		if (_bottom != nullptr) {
+			_bottom->MoveInstantly(Vector2f(_pos.X + _speed.X * timeMult, _pos.Y + _speed.Y * timeMult), MoveType::Absolute | MoveType::Force);
+			_bottom->SetFacingLeft(IsFacingLeft());
+		}
+		/*if (_turret != nullptr) {
+			UpdateTurret(timeMult);
+		}*/
+
+		// The chain comes off one **segment** at a time and only from the free end - see ChainBallHealth. Find
+		// what the free end currently is, which is the last entry still present.
+		std::int32_t tail = -1;
+		for (std::int32_t i = std::int32_t(arraySize(_chain)) - 1; i >= 0; i--) {
+			if (_chain[i] != nullptr) {
+				tail = i;
+				break;
+			}
+		}
+		if (tail >= 0) {
+			if (_chain[tail]->GetState(ActorState::IsDestroyed)) {
+				// The ball takes its own two pieces with it, back as far as the previous ball. The ball has
+				// already perished - that is how it was found - so only the pieces need killing, and they are
+				// killed rather than simply unhooked so they go through BollyPart::OnPerish() and come apart
+				// the same way it did.
+				for (std::int32_t j = tail; j > tail - ChainPiecesPerSegment && j >= 0; j--) {
+					if (_chain[j] != nullptr) {
+						if (j != tail) {
+							_chain[j]->DecreaseHealth(INT32_MAX, this);
+						}
+						_chain[j] = nullptr;
+					}
+				}
+				// Whatever is left ends in the previous ball, and that one becomes the shootable one on the
+				// next frame through the branch below
+			} else {
+				// Only the end of the chain can be hit at all. Every ball further in stays invulnerable, which
+				// is what makes a shot into the middle of the chain do nothing rather than cut it there.
+				_chain[tail]->SetState(ActorState::IsInvulnerable, false);
+			}
+		}
+
+		float distance = ChainStartDistance;
+		for (std::int32_t i = 0; i < std::int32_t(arraySize(_chain)); i++) {
+			if (_chain[i] != nullptr) {
+				Vector2f piecePos = _pos + GetChainDirection(_chainPhase, i) * distance;
+				_chain[i]->MoveInstantly(piecePos, MoveType::Absolute | MoveType::Force);
+
+				distance += _chain[i]->Size;
+			}
+		}
+
+		if (_noiseCooldown > 0.0f) {
+			_noiseCooldown -= timeMult;
+		} else {
+			_noiseCooldown = 120.0f;
+			PlaySfx("Noise"_s, 0.2f);
+		}
+
+		_stateTime -= timeMult;
+		_chainPhase += timeMult * 0.06f;
+	}
+
+	bool Bolly::OnPerish(ActorBase* collider)
+	{
+		Explosion::Create(_levelHandler, Vector3i(std::int32_t(_pos.X), std::int32_t(_pos.Y), _renderer.layer() + 2), Explosion::Type::Large);
+
+		CreateParticleDebrisOnPerish(collider);
+		_levelHandler->PlayCommonSfx("Splat"_s, Vector3f(_pos.X, _pos.Y, 0.0f));
+
+		StringView text = _levelHandler->GetLevelText(_endText);
+		_levelHandler->ShowLevelText(text);
+
+		return BossBase::OnPerish(collider);
+	}
+
+	/*void Bolly::UpdateTurret(float timeMult)
+	{
+		bool found = false;
+		Vector2f targetPos = Vector2f(FLT_MAX, FLT_MAX);
+
+		auto& players = _levelHandler->GetPlayers();
+		for (auto& player : players) {
+			Vector2f newPos = player->GetPos();
+			if ((_pos - newPos).Length() < (_pos - targetPos).Length()) {
+				targetPos = newPos;
+				found = true;
+			}
+		}
+
+		if (found) {
+			bool facingLeft = (targetPos.X < _pos.X);
+			Vector2f diff = (targetPos - _pos).Normalized();
+			_turret->_renderer.setRotation(facingLeft ? atan2Approx(-diff.Y, -diff.X) : atan2Approx(diff.Y, diff.X));
+			_turret->SetFacingLeft(facingLeft);
+		}
+
+		_turret->MoveInstantly(Vector2f(_pos.X + (IsFacingLeft() ? 10.0f : -10.0f) + _speed.X * timeMult, _pos.Y + 10.0f + _speed.Y * timeMult), MoveType::Absolute | MoveType::Force);
+	}*/
+
+	void Bolly::FollowNearestPlayer(std::int32_t newState, float time)
+	{
+		bool found = false;
+		Vector2f targetPos = Vector2f(FLT_MAX, FLT_MAX);
+
+		auto players = _levelHandler->GetPlayers();
+		for (auto* player : players) {
+			if (player->GetHealth() <= 0) {
+				continue;
+			}
+
+			Vector2f newPos = player->GetPos();
+			if ((_pos - newPos).SqrLength() < (_pos - targetPos).SqrLength()) {
+				targetPos = newPos;
+				found = true;
+			}
+		}
+
+		if (found) {
+			_state = newState;
+			_stateTime = time;
+
+			targetPos.Y += Random().FastFloat(-100.0f, 20.0f);
+
+			SetFacingLeft(targetPos.X < _pos.X);
+
+			float speedMultiplier = (_levelHandler->GetDifficulty() < GameDifficulty::Hard ? 0.6f : 0.8f);
+			Vector2f speed = (targetPos - _pos).Normalized();
+			_speed.X = speed.X * speedMultiplier;
+			_speed.Y = speed.Y * speedMultiplier;
+		}
+	}
+
+	void Bolly::FireRocket()
+	{
+		bool found = false;
+		Vector2f targetPos = Vector2f(FLT_MAX, FLT_MAX);
+
+		auto players = _levelHandler->GetPlayers();
+		for (auto* player : players) {
+			if (player->GetHealth() <= 0) {
+				continue;
+			}
+
+			Vector2f newPos = player->GetPos();
+			if ((_pos - newPos).SqrLength() < (_pos - targetPos).SqrLength()) {
+				targetPos = newPos;
+				found = true;
+			}
+		}
+
+		if (found) {
+			Vector2f diff = (targetPos - _pos).Normalized();
+
+			std::shared_ptr<Rocket> rocket = std::make_shared<Rocket>();
+			rocket->OnActivated(ActorActivationDetails(
+				_levelHandler,
+				Vector3i((std::int32_t)_pos.X + (IsFacingLeft() ? 10 : -10), (std::int32_t)_pos.Y + 10, _renderer.layer() - 4)
+			));
+			rocket->_renderer.setRotation(atan2Approx(diff.Y, diff.X));
+			_levelHandler->AddActor(rocket);
+		}
+	}
+
+	Task<bool> Bolly::BollyPart::OnActivatedAsync(const ActorActivationDetails& details)
+	{
+		uint8_t partType = details.Params[0];
+
+		SetState(ActorState::IsInvulnerable, true);
+		SetState(ActorState::CollideWithTileset | ActorState::CollideWithSolidObjects | ActorState::CanBeFrozen | ActorState::ApplyGravitation, false);
+
+		_health = INT32_MAX;
+
+		async_await RequestMetadataAsync("Boss/Bolly"_s);
+		SetAnimation((AnimState)partType);
+
+		switch (partType) {
+			case 1: // Bottom
+				SetState(ActorState::IsSolidObject, true);
+				SetState(ActorState::CollideWithOtherActors, false);
+				CanCollideWithShots = true;
+				Size = 0.0f;
+				break;
+			case 2: // Turret
+				SetState(ActorState::CollideWithOtherActors, false);
+				CanCollideWithShots = false;
+				Size = 0.0f;
+				break;
+			// The chain is shootable, which is the reported *"the Sonic boss should have a breakable chain"*,
+			// and only the **balls** are - see ChainBallHealth for the whole rule. `CanCollideWithShots` is
+			// what makes a shot pass straight through the small pieces between them, which is the "you have to
+			// hit the ball" half of it; `IsInvulnerable` stays on from here and is cleared by Bolly::OnUpdate()
+			// on the one ball at the end of the chain, which is the other half.
+			//
+			// `_scoreValue` is deliberately left at the zero EnemyBase starts it at: a link is a piece of the
+			// boss coming off rather than a kill, and five segments paying out would be worth a fair share of
+			// the 3000 the boss itself is.
+			case 3: // Chain ball
+				CanCollideWithShots = true;
+				_health = ChainBallHealth;
+				Size = ChainBallSize;
+				break;
+			case 4: // Chain piece
+				CanCollideWithShots = false;
+				Size = ChainPieceSize;
+				break;
+		}
+
+		async_return true;
+	}
+
+	void Bolly::BollyPart::OnUpdate(float timeMult)
+	{
+	}
+
+	bool Bolly::BollyPart::OnPerish(ActorBase* collider)
+	{
+		// A piece of the chain comes apart the way an enemy does - an explosion and the sprite shredded into
+		// debris. Drawn here rather than where the segment is taken out, so the ball the player actually shot
+		// and the two pieces that are cut with it go the same way; EnemyBase::OnPerish() adds a score and
+		// nothing visible, which is why every part of this boss that wants to be seen going draws its own.
+		Explosion::Create(_levelHandler, Vector3i((std::int32_t)_pos.X, (std::int32_t)_pos.Y,
+			_renderer.layer() + 2), Explosion::Type::Small);
+		CreateParticleDebrisOnPerish(collider);
+
+		return EnemyBase::OnPerish(collider);
+	}
+
+	Task<bool> Bolly::Rocket::OnActivatedAsync(const ActorActivationDetails& details)
+	{
+		SetState(ActorState::IsInvulnerable, true);
+		SetState(ActorState::CanBeFrozen | ActorState::ApplyGravitation, false);
+		CanCollideWithShots = false;
+
+		_timeLeft = 300.0f;
+		_health = INT32_MAX;
+
+		async_await RequestMetadataAsync("Boss/Bolly"_s);
+		SetAnimation((AnimState)5);
+
+		async_return true;
+	}
+
+	void Bolly::Rocket::OnUpdate(float timeMult)
+	{
+		float angle = _renderer.rotation();
+		float sinAngle, cosAngle;
+		sincosApprox(angle, sinAngle, cosAngle);
+		_speed.X += cosAngle * 0.14f * timeMult;
+		_speed.Y += sinAngle * 0.14f * timeMult;
+
+		EnemyBase::OnUpdate(timeMult);
+
+		if (_timeLeft <= 0.0f) {
+			DecreaseHealth(INT32_MAX);
+		} else {
+			_timeLeft -= timeMult;
+		}
+	}
+
+	void Bolly::Rocket::OnUpdateHitbox()
+	{
+		UpdateHitbox(20, 20);
+	}
+
+	void Bolly::Rocket::OnEmitLights(SmallVectorImpl<LightEmitter>& lights)
+	{
+		auto& light = lights.emplace_back();
+		light.Pos = _pos;
+		light.Intensity = 0.8f;
+		light.Brightness = 0.8f;
+		light.RadiusNear = 3.0f;
+		light.RadiusFar = 12.0f;
+	}
+
+	bool Bolly::Rocket::OnHandleCollision(ActorBase* other)
+	{
+		if (auto* player = runtime_cast<Player>(other)) {
+			DecreaseHealth(INT32_MAX);
+		}
+
+		return ActorBase::OnHandleCollision(other);
+	}
+
+	bool Bolly::Rocket::OnPerish(ActorBase* collider)
+	{
+		Explosion::Create(_levelHandler, Vector3i((std::int32_t)_pos.X, (std::int32_t)_pos.Y, _renderer.layer() + 2), Explosion::Type::RF);
+
+		return EnemyBase::OnPerish(collider);
+	}
+
+	void Bolly::Rocket::OnHitFloor(float timeMult)
+	{
+		DecreaseHealth(INT32_MAX);
+	}
+
+	void Bolly::Rocket::OnHitWall(float timeMult)
+	{
+		DecreaseHealth(INT32_MAX);
+	}
+
+	void Bolly::Rocket::OnHitCeiling(float timeMult)
+	{
+		DecreaseHealth(INT32_MAX);
+	}
+}

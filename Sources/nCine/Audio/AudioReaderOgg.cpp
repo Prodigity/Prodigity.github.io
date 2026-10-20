@@ -1,0 +1,139 @@
+#include "AudioReaderOgg.h"
+
+#if defined(WITH_VORBIS)
+
+#if defined(DEATH_TARGET_WINDOWS) && !defined(CMAKE_BUILD) && !defined(WITH_VORBIS_DYNAMIC)
+#	if defined(_M_X64)
+#		pragma comment(lib, "../Libs/Windows/x64/libvorbisfile.lib")
+#	elif defined(_M_IX86)
+#		pragma comment(lib, "../Libs/Windows/x86/libvorbisfile.lib")
+#	else
+#		error Unsupported architecture
+#	endif
+#endif
+
+using namespace Death::IO;
+
+namespace nCine
+{
+#if defined(WITH_VORBIS_DYNAMIC)
+	HMODULE AudioReaderOgg::_ovLib = nullptr;
+	bool AudioReaderOgg::_ovLibInitialized = false;
+	AudioReaderOgg::ov_clear_t* AudioReaderOgg::_ov_clear = nullptr;
+	AudioReaderOgg::ov_read_t* AudioReaderOgg::_ov_read = nullptr;
+	AudioReaderOgg::ov_raw_seek_t* AudioReaderOgg::_ov_raw_seek = nullptr;
+	AudioReaderOgg::ov_info_t* AudioReaderOgg::_ov_info = nullptr;
+	AudioReaderOgg::ov_open_callbacks_t* AudioReaderOgg::_ov_open_callbacks = nullptr;
+	AudioReaderOgg::ov_pcm_total_t* AudioReaderOgg::_ov_pcm_total = nullptr;
+	AudioReaderOgg::ov_time_total_t* AudioReaderOgg::_ov_time_total = nullptr;
+#endif
+
+	AudioReaderOgg::AudioReaderOgg(std::unique_ptr<Stream> fileHandle, const OggVorbis_File& oggFile)
+		: _fileHandle(std::move(fileHandle)), _oggFile(oggFile)
+	{
+		DEATH_ASSERT(_fileHandle->IsValid());
+	}
+
+	AudioReaderOgg::~AudioReaderOgg()
+	{
+#if defined(WITH_VORBIS_DYNAMIC)
+		_ov_clear(&_oggFile);
+#else
+		ov_clear(&_oggFile);
+#endif
+	}
+
+	std::int32_t AudioReaderOgg::read(void* buffer, std::int32_t bufferSize) const
+	{
+		// Declared as plain `int` because that is what ov_read() takes a pointer to - on targets where
+		// `std::int32_t` is `long int` (MIPS, among others) the two are distinct types of the same width
+		int bitStream = 0;
+		long bytes = 0;
+		std::int32_t bufferSeek = 0;
+
+		// The buffer formats of IAudioDevice are native-endian, which is what the module decoder
+		// produces as well, so the samples have to come out of Vorbis in the host byte order too
+#if defined(DEATH_TARGET_BIG_ENDIAN)
+		constexpr int BigEndianPacking = 1;
+#else
+		constexpr int BigEndianPacking = 0;
+#endif
+
+		do {
+			// Read up to a buffer's worth of decoded sound data (2: 16bit, 1: signed)
+#if defined(WITH_VORBIS_DYNAMIC)
+			bytes = _ov_read(&_oggFile, static_cast<char*>(buffer) + bufferSeek, bufferSize - bufferSeek, BigEndianPacking, 2, 1, &bitStream);
+#else
+			bytes = ov_read(&_oggFile, static_cast<char*>(buffer) + bufferSeek, bufferSize - bufferSeek, BigEndianPacking, 2, 1, &bitStream);
+#endif
+			if (bytes < 0) {
+#if defined(WITH_VORBIS_DYNAMIC)
+				_ov_clear(&_oggFile);
+#else
+				ov_clear(&_oggFile);
+#endif
+				LOGE("Error decoding at bitstream {}", bitStream);
+			}
+
+			// Reset the static variable at the end of a decoding process
+			if (bytes <= 0) {
+				bitStream = 0;
+			}
+			bufferSeek += bytes;
+		} while (bytes > 0 && bufferSize - bufferSeek > 0);
+
+		return bufferSeek;
+	}
+
+	void AudioReaderOgg::rewind() const
+	{
+#if defined(WITH_VORBIS_DYNAMIC)
+		_ov_raw_seek(&_oggFile, 0);
+#else
+		ov_raw_seek(&_oggFile, 0);
+#endif
+	}
+
+#if defined(WITH_VORBIS_DYNAMIC)
+	bool AudioReaderOgg::TryLoadLibrary()
+	{
+		if (_ovLibInitialized) {
+			return (_ovLib != nullptr);
+		}
+
+		_ovLibInitialized = true;
+#if defined(WITH_OPENMPT)
+		const wchar_t* LibraryName = L"openmpt-vorbis.dll";
+#else
+		const wchar_t* LibraryName = L"libvorbisfile.dll";
+#endif
+#if defined(DEATH_TARGET_WINDOWS_RT)
+		_ovLib = ::LoadPackagedLibrary(LibraryName, NULL);
+#else
+		_ovLib = ::LoadLibrary(LibraryName);
+#endif
+		if (_ovLib == nullptr) {
+			return false;
+		}
+
+		_ov_clear = (ov_clear_t*)::GetProcAddress(_ovLib, "ov_clear");
+		_ov_read = (ov_read_t*)::GetProcAddress(_ovLib, "ov_read");
+		_ov_raw_seek = (ov_raw_seek_t*)::GetProcAddress(_ovLib, "ov_raw_seek");
+		_ov_info = (ov_info_t*)::GetProcAddress(_ovLib, "ov_info");
+		_ov_open_callbacks = (ov_open_callbacks_t*)::GetProcAddress(_ovLib, "ov_open_callbacks");
+		_ov_pcm_total = (ov_pcm_total_t*)::GetProcAddress(_ovLib, "ov_pcm_total");
+		_ov_time_total = (ov_time_total_t*)::GetProcAddress(_ovLib, "ov_time_total");
+
+		if (_ov_clear == nullptr || _ov_read == nullptr || _ov_raw_seek == nullptr || _ov_info == nullptr ||
+			_ov_open_callbacks == nullptr || _ov_pcm_total == nullptr || _ov_time_total == nullptr) {
+			::FreeLibrary(_ovLib);
+			_ovLib = nullptr;
+			return false;
+		}
+
+		return true;
+	}
+#endif
+}
+
+#endif

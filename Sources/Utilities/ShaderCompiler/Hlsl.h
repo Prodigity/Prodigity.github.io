@@ -1,0 +1,87 @@
+#pragma once
+
+/**
+	@file Hlsl.h
+
+	HLSL (Direct3D 11, Shader Model 4/5) source-to-source emitter for ShaderCompiler.
+
+	The tool lowers each ".shader" into a MODERN-GLSL stage source (in/out, texture(), "out vec4 COLOR;",
+	std140 UBO blocks, gl_VertexID). This emitter grows a real per-statement/expression AST from that
+	source (on the SAME reusable lexer + preprocessor the GLSL-to-C++ transpiler uses — @ref GlslExprTokenizer
+	and @ref Preprocessor) and emits an HLSL translation of one stage, then the offline `--hlsl-check` mode
+	compiles each stage via d3dcompiler_47's `D3DCompile` to validate it. This is TOOL-ONLY: it adds no RHI
+	backend and touches no engine code.
+
+	The key GLSL -> HLSL rewrites:
+	- Types: vec2/3/4 -> float2/3/4, mat3/4 -> float3x3/float4x4, ivecN -> intN, bvecN -> boolN; precision
+	  and layout qualifiers are dropped.
+	- Matrix algebra: a `*` whose operands are matrix/vector (never scalar) becomes `mul(a, b)` — GLSL
+	  `M * v` -> HLSL `mul(M, v)` (column-vector convention). A lightweight type inference over the AST
+	  decides matrix-vs-componentwise per multiply.
+	- Uniforms: `layout(std140) uniform Block { ... }` -> `cbuffer Block : register(b#)`; loose uniforms
+	  gather into one `cbuffer`. Block members are global names in HLSL, so bare-member and instance-name
+	  qualified (`block.member`) accesses both resolve to the member name.
+	- Textures: `uniform sampler2D uTex` -> `Texture2D uTex : register(t#); SamplerState uTex_sampler : register(s#);`
+	  and `texture(uTex, uv)` -> `uTex.Sample(uTex_sampler, uv)` (`textureLod` -> `.SampleLevel`).
+	- I/O: vertex attributes + `gl_VertexID` (SV_VertexID) form the VS input struct; VS `out` varyings +
+	  `gl_Position` (SV_Position) form the VS output struct; FS `in` varyings + `gl_FragCoord` (SV_Position)
+	  form the PS input struct; a single FS `out` (the usual `out vec4 COLOR`) is returned as SV_Target.
+	  MULTIPLE FS `out` declarations render to SV_Target0..N in DECLARATION ORDER (of the emitted stage
+	  source) through an emitted PsOutput struct — the same order the offline SPIR-V emission assigns as
+	  `layout(location = 0..N)`, so both backends write the same attachment for the same output (explicit
+	  `layout(location)` qualifiers on fragment outputs are declined to keep that scheme unambiguous).
+	  Attributes/varyings/gl_* are copied to/from file-scope `static` globals so helper functions read
+	  them exactly as in GLSL.
+	- Built-ins: mix->lerp, fract->frac, dFdx/dFdy->ddx/ddy, inversesqrt->rsqrt, atan(y,x)->atan2(y,x),
+	  mod(a,b)->(a - b*floor(a/b)); dot/length/normalize/clamp/... keep their names.
+
+	Constructs outside the handled subset (e.g. geometry/compute features) make Transform() return false
+	with a diagnostic rather than emit invalid HLSL.
+*/
+
+#include "GlslReflect.h"		// StageReflection (texture units, block strides), Diagnostic, StringView
+
+namespace ShaderCompiler
+{
+	/** @brief Transforms an already-lowered modern-GLSL stage source into HLSL (Shader Model 4/5) */
+	class HlslEmitter
+	{
+	public:
+		/**
+			@brief Which member of the HLSL/Cg dialect family to emit
+
+			`Cg` targets the PS Vita's sceGxm backend, whose shaders are compiled on the console by
+			SceShaccCg. It is the same language family - `floatN`, `mul()`, `lerp`/`frac`/`ddx` and
+			`TEXCOORD<i>` interpolant semantics are shared, which is why it lives here instead of in an
+			emitter of its own - and differs only in the places listed below:
+
+			- Entry points are both named `main` (`VSMain`/`PSMain` in HLSL)
+			- System semantics: `POSITION` for the clip position, `WPOS` for the fragment position and
+			  `COLOR` for the colour output, instead of `SV_Position`/`SV_Target`
+			- Uniforms are plain `uniform` declarations (there is no `cbuffer`); the samplers are combined
+			  `sampler2D`/`sampler3D` objects carrying the GXM `TEXUNIT<n>` semantic, sampled with
+			  `tex2D()`/`tex2Dlod()` instead of `Texture2D` + `SamplerState` + `.Sample()`
+			- There is no vertex-ID or instance-ID input at all - the GXM parameter semantics are the
+			  fixed-function-era Cg set - so a stage still referencing `gl_VertexID`/`gl_InstanceID` after
+			  @ref VertexIdRewrite has run is rejected with a diagnostic rather than mis-emitted
+		*/
+		enum class Dialect {
+			Hlsl,
+			Cg
+		};
+
+		/**
+			Transforms @p modernSource (as produced by ShaderParser::BuildStageSource) into HLSL, writing the
+			result to @p out. @p vertexStage selects the vertex-vs-fragment lowering; @p reflection supplies
+			texture-unit register assignments and the batched instance-block stride (for the emitted array
+			size). Returns false and fills @p diag when the source uses a construct the emitter does not handle.
+
+			@p maxBatchSize caps the `BATCH_SIZE` baked into a batched shader. Zero, the default, means the
+			only bound is the 64 KB uniform block the desktop and Vita tiers have. The PlayStation 3 needs a
+			far smaller one: its batched instance array reaches the vertex program through constant
+			registers rather than a bindable buffer, so `--emit-rsx` passes the batch its backend supports.
+		*/
+		static bool Transform(StringView modernSource, bool vertexStage, const StageReflection& reflection,
+			String& out, Diagnostic& diag, Dialect dialect = Dialect::Hlsl, std::int32_t maxBatchSize = 0);
+	};
+}

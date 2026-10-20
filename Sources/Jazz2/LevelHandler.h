@@ -1,0 +1,605 @@
+﻿#pragma once
+
+#include "ILevelHandler.h"
+#include "IResumable.h"
+#include "IStateHandler.h"
+#include "IRootController.h"
+#include "LevelDescriptor.h"
+#include "WeatherType.h"
+#include "Events/EventMap.h"
+#include "Events/EventSpawner.h"
+#include "Tiles/ITileMapOwner.h"
+#include "Tiles/TileMap.h"
+#include "Collisions/DynamicTreeBroadPhase.h"
+#include "Input/RumbleProcessor.h"
+#include "Input/ControlScheme.h"
+#include "Rendering/UpscaleRenderPass.h"
+
+#include "../nCine/Graphics/Shader.h"
+#include "../nCine/Audio/AudioBufferPlayer.h"
+#include "../nCine/Audio/AudioStreamPlayer.h"
+
+#if defined(WITH_IMGUI)
+#	include <imgui.h>
+#endif
+
+using namespace Jazz2::Input;
+
+namespace Jazz2
+{
+	namespace Actors
+	{
+		class Player;
+	}
+
+	namespace Actors::Bosses
+	{
+		class BossBase;
+	}
+
+	namespace Rendering
+	{
+		class LightingRenderer;
+		class BlurRenderPass;
+		class CombineRenderer;
+		class PlayerViewport;
+	}
+
+#if defined(WITH_ANGELSCRIPT)
+	namespace Scripting
+	{
+		class LevelScriptLoader;
+	}
+#endif
+
+	namespace UI
+	{
+		class HUD;
+		class InGameConsole;
+		class BatteryInGameMenu;
+	}
+
+	namespace UI::Menu
+	{
+		class InGameMenu;
+	}
+
+#if defined(WITH_PHYSICS_PROBE)
+	namespace Tests
+	{
+		class PhysicsProbe;
+	}
+#endif
+
+	/**
+		@brief Level handler of a local game session
+		
+		Concrete state handler that runs a single-player or local-multiplayer level: it loads the level descriptor,
+		owns the tile map, event map and collision broad-phase, spawns and updates actors and players, drives
+		rendering, lighting and audio, and serializes resumable state.
+	*/
+	class LevelHandler : public ILevelHandler, public IStateHandler, public IResumable, public Tiles::ITileMapOwner
+	{
+		DEATH_RUNTIME_OBJECT(ILevelHandler, IStateHandler);
+
+		friend class Rendering::LightingRenderer;
+		friend class Rendering::BlurRenderPass;
+		friend class Rendering::CombineRenderer;
+		friend class Rendering::PlayerViewport;
+#if defined(WITH_ANGELSCRIPT)
+		friend class Scripting::LevelScriptLoader;
+#endif
+		friend class UI::HUD;
+		friend class UI::Menu::InGameMenu;
+#if defined(WITH_PHYSICS_PROBE)
+		friend class Tests::PhysicsProbe;
+#endif
+
+	public:
+		/** @{ @name Constants */
+
+		/** @brief Default width of viewport (see @ref Rendering::UpscaleRenderPass::DefaultViewWidth) */
+		static constexpr std::int32_t DefaultWidth = Rendering::UpscaleRenderPass::DefaultViewWidth;
+		/** @brief Default height of viewport */
+		static constexpr std::int32_t DefaultHeight = Rendering::UpscaleRenderPass::DefaultViewHeight;
+		/**
+		 * @brief Range of tile activation, in tiles either side of a player
+		 *
+		 * Everything inside this square around a player is spawned from the event map, and everything whose
+		 * origin tile leaves it by a further 4 tiles is destroyed again. Nothing culls an actor's *update*,
+		 * only its drawing, so every actor in here - enemies, platforms, and the gems, ammo and crates that
+		 * are just as much actors - runs a full movement and tile-collision step every frame. The range is
+		 * therefore a direct lever on how much the level costs to simulate, quadratically: 26 is a 52x52
+		 * tile box, 18 is 36x36, or 48% of the area.
+		 *
+		 * The consoles below take the smaller value because their screens are small enough that it is still
+		 * entirely off-screen. What has to stay off-screen is the margin between the box and the edge of the
+		 * view, which at 32 pixels to the tile is 8 tiles (256 px) on the widest of them (the 640-wide
+		 * Dreamcast, GameCube and PlayStation 2, whose visible half-width is 10 tiles) and 13 tiles on the
+		 * Nintendo 64. Even the tightest of those is about half a second of travel at @ref Player::MaxDashingSpeed,
+		 * and lowering @ref PreferencesCache::RenderingResolutionPercent only ever shows *less* of the world,
+		 * so it cannot eat into the margin. The Wii is deliberately not in the list - it is the fastest
+		 * machine here and renders the same 640 columns - but it would be safe if it ever needs the room.
+		 */
+#if defined(DEATH_TARGET_N64) || defined(DEATH_TARGET_DREAMCAST) || defined(DEATH_TARGET_PS2) || \
+	defined(DEATH_TARGET_GAMECUBE) || defined(DEATH_TARGET_PSP) || defined(DEATH_TARGET_3DS)
+		static constexpr std::int32_t ActivateTileRange = 18;
+#else
+		static constexpr std::int32_t ActivateTileRange = 26;
+#endif
+
+		/** @} */
+
+		/**
+		 * @brief Creates a new instance
+		 *
+		 * @param root	Root controller that owns the handler
+		 */
+		LevelHandler(IRootController* root);
+		~LevelHandler() override;
+
+		bool Initialize(const LevelInitialization& levelInit) override;
+		bool Initialize(Stream& src, std::uint16_t version) override;
+
+		Events::EventSpawner* EventSpawner() override;
+		Events::EventMap* EventMap() override;
+		Tiles::TileMap* TileMap() override;
+
+		GameDifficulty GetDifficulty() const override;
+		bool IsLocalSession() const override;
+		bool IsServer() const override;
+		bool IsPausable() const override;
+		bool IsReforged() const override;
+		bool CanActivateSugarRush() const override;
+		bool CanEventDisappear(EventType eventType) const override;
+		bool CanPlayersCollide() const override;
+		Recti GetLevelBounds() const override;
+		float GetElapsedFrames() const override;
+		float GetGravity() const override;
+		float GetWaterLevel() const override;
+		float GetHurtInvulnerableTime() const override;
+		bool GetActiveBossHealth(std::int32_t& health, std::int32_t& maxHealth) const override;
+
+		ArrayView<const std::shared_ptr<Actors::ActorBase>> GetActors() const override;
+		ArrayView<Actors::Player* const> GetPlayers() const override;
+		Actors::ActorBase* FindPlayerToStandOn(Actors::Player* player, float timeMult) override;
+
+		/** @brief Returns the internal name (path) of the current level */
+		StringView GetLevelName() const override {
+			return _levelName;
+		}
+		/** @brief Returns the display (title) name of the current level */
+		StringView GetLevelDisplayName() const {
+			return _levelDisplayName;
+		}
+		/** @brief Overrides the display (title) name of the current level */
+		void SetLevelDisplayName(StringView value) {
+			_levelDisplayName = value;
+		}
+
+		float GetDefaultAmbientLight() const override;
+		float GetAmbientLight(Actors::Player* player) const override;
+		void SetAmbientLight(Actors::Player* player, float value) override;
+
+		Vector2i GetViewSize() const override;
+
+		void OnBeginFrame() override;
+		void OnEndFrame() override;
+		void OnInitializeViewport(std::int32_t width, std::int32_t height) override;
+		/** @brief Called when a console command is entered */
+		virtual bool OnConsoleCommand(StringView line);
+
+		void OnKeyPressed(const KeyboardEvent& event) override;
+		void OnKeyReleased(const KeyboardEvent& event) override;
+		void OnTextInput(const TextInputEvent& event) override;
+#if defined(NCINE_HAS_TOUCH_CONTROLS)
+		void OnTouchEvent(const TouchEvent& event) override;
+#endif
+
+		void AddActor(std::shared_ptr<Actors::ActorBase> actor) override;
+
+		std::shared_ptr<AudioBufferPlayer> PlaySfx(Actors::ActorBase* self, StringView identifier, AudioBuffer* buffer, const Vector3f& pos, bool sourceRelative, float gain, float pitch, SfxFlags flags) override;
+		void StopSfx(Actors::ActorBase* self, StringView identifier, AudioBufferPlayer* player) override;
+		std::shared_ptr<AudioBufferPlayer> PlayCommonSfx(StringView identifier, const Vector3f& pos, float gain = 1.0f, float pitch = 1.0f) override;
+		void WarpCameraToTarget(Actors::ActorBase* actor, bool fast = false) override;
+		bool IsPositionEmpty(Actors::ActorBase* self, const AABBf& aabb, Tiles::TileCollisionParams& params, Actors::ActorBase** collider) override;
+		void FindCollisionActorsByAABB(const Actors::ActorBase* self, const AABBf& aabb, Function<bool(Actors::ActorBase*)>&& callback) override;
+		void FindCollisionActorsByRadius(float x, float y, float radius, Function<bool(Actors::ActorBase*)>&& callback) override;
+		void GetCollidingPlayers(const AABBf& aabb, Function<bool(Actors::ActorBase*)>&& callback) override;
+
+		void BroadcastTriggeredEvent(Actors::ActorBase* initiator, EventType eventType, std::uint8_t* eventParams) override;
+		void BeginLevelChange(Actors::ActorBase* initiator, ExitType exitType, StringView nextLevel = {}) override;
+		bool CanTakeLevelExit(ExitType exitType, StringView nextLevel) const override;
+
+		void SendPacket(const Actors::ActorBase* self, ArrayView<const std::uint8_t> data) override;
+
+		void HandleBossActivated(Actors::Bosses::BossBase* boss, Actors::ActorBase* initiator = nullptr) override;
+		void HandleLevelChange(LevelInitialization&& levelInit) override;
+		void HandleGameOver(Actors::Player* player) override;
+		void SetAudioPaused(bool paused) override;
+		bool HandlePlayerDied(Actors::Player* player) override;
+		void HandlePlayerWarped(Actors::Player* player, Vector2f prevPos, WarpFlags flags) override;
+		void HandlePlayerCoins(Actors::Player* player, std::int32_t prevCount, std::int32_t newCount) override;
+		void HandlePlayerGems(Actors::Player* player, std::uint8_t gemType, std::int32_t prevCount, std::int32_t newCount) override;
+		void SetCheckpoint(Actors::Player* player, Vector2f pos) override;
+		void RollbackToCheckpoint(Actors::Player* player) override;
+		void HandleActivateSugarRush(Actors::Player* player) override;
+		void HandleCreateParticleDebrisOnPerish(const Actors::ActorBase* self, Actors::ParticleDebrisEffect effect, Vector2f speed) override;
+		void HandleCreateSpriteDebris(const Actors::ActorBase* self, AnimState state, std::int32_t count) override;
+		void ShowLevelText(StringView text, Actors::ActorBase* initiator = nullptr) override;
+		StringView GetLevelText(std::uint32_t textId, std::int32_t index = -1, std::uint32_t delimiter = 0) override;
+		void OverrideLevelText(std::uint32_t textId, StringView value) override;
+		Vector2f GetCameraPos(Actors::Player* player) const override;
+		void LimitCameraView(Actors::Player* player, Vector2f playerPos, std::int32_t left, std::int32_t width) override;
+		void OverrideCameraView(Actors::Player* player, float x, float y, bool topLeft = false) override;
+		void ShakeCameraView(Actors::Player* player, float duration) override;
+		void ShakeCameraViewNear(Vector2f pos, float duration) override;
+		bool GetTrigger(std::uint8_t triggerId) override;
+		void SetTrigger(std::uint8_t triggerId, bool newState) override;
+		void SetWeather(WeatherType type, std::uint8_t intensity) override;
+		bool BeginPlayMusic(StringView path, bool setDefault = false, bool forceReload = false) override;
+
+		bool PlayerActionPressed(Actors::Player* player, PlayerAction action, bool includeGamepads = true) override;
+		bool PlayerActionPressed(Actors::Player* player, PlayerAction action, bool includeGamepads, bool& isGamepad) override;
+		bool PlayerActionHit(Actors::Player* player, PlayerAction action, bool includeGamepads = true) override;
+		bool PlayerActionHit(Actors::Player* player, PlayerAction action, bool includeGamepads, bool& isGamepad) override;
+		float PlayerHorizontalMovement(Actors::Player* player) override;
+		float PlayerVerticalMovement(Actors::Player* player) override;
+		void PlayerExecuteRumble(Actors::Player* player, StringView rumbleEffect) override;
+
+		bool SerializeResumableToStream(Stream& dest) override;
+
+#if defined(WITH_EDITOR) || defined(DOXYGEN_GENERATING_OUTPUT)
+		/** @brief Returns 	rue if the level can be opened in the level editor from the pause menu */
+		virtual bool CanOpenInEditor() const;
+		/** @brief Leaves the level and opens it in the level editor */
+		void OpenInEditor();
+		/** @brief Takes the level off the screen, until its viewports are initialized again */
+		void SuspendRendering();
+#	if defined(WITH_AUDIO)
+		/**
+		 * @brief Hands the music over to another level handler of the same level, so it goes on playing
+		 *
+		 * Returns `false` if the other handler plays something else. The music is muffled by @p lowPass, 1 for not
+		 * at all.
+		 */
+		bool HandOverMusic(LevelHandler& target, float lowPass);
+		/** @brief Takes the music out of the level handler, so another one can go on playing it, see @ref ContinueMusic() */
+		std::unique_ptr<AudioStreamPlayer> TakeMusic(String& path);
+		/**
+		 * @brief Goes on playing music taken from another level handler instead of its own
+		 *
+		 * Returns `false` and leaves @p music as it is if it plays something else than @p path. The music is muffled
+		 * by @p lowPass, 1 for not at all.
+		 */
+		bool ContinueMusic(std::unique_ptr<AudioStreamPlayer>& music, StringView path, float lowPass);
+		/** @brief Muffles the music playing now by @p lowPass, 1 for not at all, as the editor fades it between its modes */
+		void SetMusicMuffling(float lowPass);
+#	endif
+		/** @brief Returns `true` if the level is played from the level editor, it returns there when it's left */
+		virtual bool IsEditorPlayTest() const;
+		/** @brief Leaves the level editor the level is played from */
+		virtual void ExitEditor();
+#endif
+
+		void OnAdvanceDestructibleTileAnimation(std::int32_t tx, std::int32_t ty, std::int32_t amount) override {}
+		void OnTileFrozen(std::int32_t x, std::int32_t y) override;
+#if defined(TILEMAP_LAYER_EFFECTS)
+		Tiles::LayerEffectsTarget* GetLayerEffectsTarget(const Viewport* view) override;
+		void OnLayerEffectsChanged() override;
+#endif
+
+	protected:
+		/** @brief Describes current input state of a player */
+		struct PlayerInput {
+			/** @brief Bitmask of actions pressed in the current frame */
+			std::uint64_t PressedActions;
+			/** @brief Bitmask of actions pressed in the previous frame */
+			std::uint64_t PressedActionsLast;
+			/** @brief Desired movement vector */
+			Vector2f RequiredMovement;
+			/** @brief Movement vector applied while the input is frozen */
+			Vector2f FrozenMovement;
+			/** @brief Whether the input is frozen */
+			bool Frozen;
+
+			/** @brief Creates a new instance */
+			PlayerInput();
+		};
+
+#ifndef DOXYGEN_GENERATING_OUTPUT
+		// Hide these members from documentation before refactoring
+		IRootController* _root;
+
+#if defined(RHI_CAP_SHADERS) && defined(RHI_CAP_FRAMEBUFFERS)
+		// Post-processing shaders (bloom + lighting compositing). Only backends with cheap programmable shaders
+		// run the full-screen post-process chain, so these are absent on the software backend (see RhiFwd.h)
+		Shader* _lightingMeshShader;
+		Shader* _blurShader;
+		Shader* _downsampleShader;
+		Shader* _combineShader;
+#else
+		// Software renderer and the console fixed-function tiers: the bloom/lighting chain is gated out, but the
+		// viewport compositor still needs the Combine programs so the device recognizes the draw (object label
+		// "Combine" -> SwEffect::Combine, or the generated fixed-function entry's LightingCombine stage) and runs
+		// the CPU dynamic-lighting combine in its place. Default-initialized here so no constructor arm is needed.
+		Shader* _combineShader = nullptr;
+#endif
+		// Acquired on EVERY tier: the water variant's own program is what carries the water description. On the
+		// shader path that is its fragment stage, on the console tiers the fixed_function block that draws the
+		// tint band over whatever the lighting stage produced (see CombineWithWater.shader)
+		Shader* _combineWithWaterShader = nullptr;
+
+		Rendering::UpscaleRenderPassWithClipping _upscalePass;
+		// When the scene is supersampled (splitscreen zoom-out), the HUD and the in-game menu are rendered through this
+		// separate pass at the native resolution and composited on top, so they stay crisp instead of being
+		// supersampled with the scene
+		Rendering::UpscaleRenderPassWithClipping _hudUpscalePass;
+		bool _hudOverlayActive = false;
+#if defined(DEATH_DEBUG)
+		// Console commands given on the command line by `/console <command>`, run on the first frame
+		SmallVector<String, 0> _debugStartupCommands;
+#endif
+
+		std::unique_ptr<SceneNode> _rootNode;
+		std::unique_ptr<Texture> _noiseTexture;
+		SmallVector<std::unique_ptr<Rendering::PlayerViewport>, 0> _assignedViewports;
+
+#if defined(WITH_ANGELSCRIPT)
+		std::unique_ptr<Scripting::LevelScriptLoader> _scripts;
+#endif
+		SmallVector<std::shared_ptr<Actors::ActorBase>, 0> _actors;
+		SmallVector<Actors::Player*, LevelInitialization::MaxPlayerCount> _players;
+
+		String _levelName;
+		String _levelDisplayName;
+		String _defaultNextLevel;
+		String _defaultSecretLevel;
+		GameDifficulty _difficulty;
+		WeatherType _weatherType;
+		std::uint8_t _weatherIntensity;
+		ExitType _nextLevelType;
+		float _nextLevelTime;
+		String _nextLevelName;
+		String _musicDefaultPath, _musicCurrentPath;
+		Recti _levelBounds;
+		bool _isReforged, _cheatsUsed;
+		bool _checkpointCreated;
+		SmallVector<String, 0> _levelTexts;
+#if defined(WITH_EDITOR)
+		// The level wasn't exported only to be played, see LevelFlags::NotEditable
+		bool _levelEditable = true;
+#endif
+
+		Events::EventSpawner _eventSpawner;
+		std::unique_ptr<Events::EventMap> _eventMap;
+		std::unique_ptr<Tiles::TileMap> _tileMap;
+		Collisions::DynamicTreeBroadPhase _collisions;
+
+		Vector2i _viewSize;
+		Rectf _viewBoundsTarget;
+		std::int64_t _elapsedMillisecondsBegin;
+		float _elapsedFrames;
+
+#if defined(WITH_PHYSICS_PROBE)
+		// Created on the first frame of a `/physics-probe` run and owns the whole harness (see Tests/)
+		std::unique_ptr<Tests::PhysicsProbe> _physicsProbe;
+#endif
+
+		float _checkpointFrames;
+		float _waterLevel;
+		Vector4f _defaultAmbientLight;
+#if defined(WITH_AUDIO)
+		std::unique_ptr<AudioStreamPlayer> _music;
+		// Frames left before the level music opened on load starts playing (see OnBeginFrame()), or 0
+		// Frames between two attempts to restart music that was stopped from outside the game
+		static constexpr std::int32_t MusicRestartDelay = 60;
+
+		std::int32_t _musicStartDelay = 0;
+		SmallVector<std::shared_ptr<AudioBufferPlayer>> _playingSounds;
+		std::shared_ptr<AudioBufferPlayer> _sugarRushMusic;
+#endif
+		Metadata* _commonResources;
+		std::unique_ptr<UI::HUD> _hud;
+		std::unique_ptr<UI::InGameConsole> _console;
+		std::shared_ptr<UI::Menu::InGameMenu> _pauseMenu;
+		// BatteryCheck's in-game menu (FUN_0040c4f0(0)), which replaces the stock one
+		std::unique_ptr<UI::BatteryInGameMenu> _batteryMenu;
+		std::shared_ptr<Actors::Bosses::BossBase> _activeBoss;
+
+		// Actors (and the water and weather that go with them) at the last checkpoint, restored when a player dies,
+		// taken at the end of the frame the checkpoint was activated in, when all actors are updated
+		LevelStateSnapshot _checkpointSnapshot;
+		bool _checkpointSnapshotPending = false;
+		// State of the previous level to return to once this (special) level is completed
+		std::shared_ptr<const LevelStateSnapshot> _returnLevelState;
+		// State of this level taken right before it was left to a special level
+		std::shared_ptr<const LevelStateSnapshot> _leftLevelState;
+		// Special levels that were completed from this level, they cannot be entered from it again (see CanTakeLevelExit())
+		SmallVector<String, 0> _completedSpecialLevels;
+
+		BitArray _pressedKeys;
+		std::uint32_t _overrideActions;
+		Vector2f _overrideMovement;
+		PlayerInput _playerInputs[ControlScheme::MaxSupportedPlayers];
+
+#if defined(NCINE_HAS_GAMEPAD_RUMBLE)
+		RumbleProcessor _rumble;
+		HashMap<String, std::shared_ptr<RumbleDescription>> _rumbleEffects;
+#endif
+#endif
+
+		/** @brief Invokes the specified callback asynchronously, usually at the end of current frame */
+		void InvokeAsync(Function<void()>&& callback);
+
+		/** @brief How the viewports of the level are rendered, see @ref GetViewportSetup() */
+		struct ViewportSetup {
+			/** @brief Size of the view the scene is rendered at, in pixels */
+			Vector2i ViewSize;
+			/** @brief Factor the scene is supersampled by, 1 for none */
+			std::int32_t Supersample;
+			/** @brief Whether the view is shown as it is, without the rescale shader --- for a view of the size of the window */
+			bool NativeOutput;
+		};
+
+		/**
+		 * @brief Returns how the viewports of the level are rendered for a given size of the window
+		 *
+		 * The game renders the scene at a smaller size, see @ref DefaultWidth and @ref DefaultHeight, and upscales it.
+		 * The level editor renders it at the size of the window.
+		 */
+		virtual ViewportSetup GetViewportSetup(std::int32_t width, std::int32_t height);
+		/**
+		 * @brief Loads the level of the handler into a level descriptor
+		 *
+		 * The level is looked up by its name, and in the `unknown` episode if it isn't found there.
+		 */
+		virtual bool LoadLevel(LevelDescriptor& descriptor);
+		/** @brief Returns the options the level is loaded with, which decide what events are present */
+		virtual LevelLoadOptions GetLevelLoadOptions() const;
+		/** @brief Attaches all required level components to the handler */
+		virtual void AttachComponents(LevelDescriptor&& descriptor);
+		/**
+		 * @brief Loads the scripts of the level, if there are any and they are allowed
+		 *
+		 * The script is a `.j2as` file next to the level file. The level editor doesn't run scripts while a level is
+		 * being edited.
+		 */
+		virtual void LoadLevelScripts(StringView fullPath);
+		/** @brief Creates HUD */
+		virtual std::unique_ptr<UI::HUD> CreateHUD();
+		/** @brief Spawns all players */
+		virtual void SpawnPlayers(const LevelInitialization& levelInit);
+		/**
+			@brief Returns where a co-op player can actually be placed, given the offset that would separate them
+
+			The offset exists only so players do not start standing inside one another, and applying it blind
+			puts the second one inside the tileset wherever the level starts in a tight space --- reported on
+			`rescue/02_colon2`, where the start is barely taller than the player and the lift buried them from
+			the first frame. Tried at full strength, then at half, then not at all.
+
+			Shared with @ref Multiplayer::MpLevelHandler, which spawns local splitscreen players through its
+			own override and had the same defect with its own copy of the arithmetic --- an unchecked 30 px
+			lift. That is the reason this is a function rather than a few lines at each site: the two paths
+			look alike, are reached by different routes @m_span{m-text m-dim} (the menu's co-op goes through
+			the multiplayer handler, a `/level` start does not) @m_endspan, and a fix applied to one of them
+			silently leaves the other broken.
+
+			@param spawnPosition  Where the level says the player starts
+			@param offset         What to add to separate this player from the others; zero returns the start
+			@return               The first of the offset, half the offset and no offset that the player fits in
+		*/
+		Vector2f FindClearSpawnPosition(Vector2f spawnPosition, Vector2f offset);
+		/** @brief Creates a player instance while restoring a resumable state from a stream (one per serialized player) */
+		virtual std::shared_ptr<Actors::Player> CreateResumablePlayer(std::int32_t index);
+		/** @brief Returns `true` if cheats are enabled for the specified player, `nullptr` refers to the local console */
+		virtual bool IsCheatingAllowed(Actors::Player* player);
+
+		/** @brief Called after the level is loaded and all players were spawned */
+		virtual void OnInitialized();
+		/** @brief Called before an actor (object) is destroyed */
+		virtual void BeforeActorDestroyed(Actors::ActorBase* actor);
+		/** @brief Processes events */
+		virtual void ProcessEvents(float timeMult);
+		/** @brief Processes transition to the next level if queued */
+		virtual void ProcessQueuedNextLevel();
+		/** @brief Prepares @ref LevelInitialization for transition to the next level */
+		virtual void PrepareNextLevelInitialization(LevelInitialization& levelInit);
+		/**
+		 * @brief Returns `true` if actors can be stored in level state snapshots
+		 *
+		 * Snapshots make it possible to roll back all actors to the last checkpoint, to resume them from a saved
+		 * state and to return from a special level to the exact state the previous level was left in.
+		 */
+		virtual bool CanUseLevelStateSnapshots() const;
+		/** @brief Returns full name of the level that follows after the level is exited with the specified exit type */
+		String ResolveNextLevelName(ExitType exitType, StringView nextLevel) const;
+		/**
+		 * @brief Returns `true` if the specified level is a special level
+		 *
+		 * A special level specifies itself as its next level, it has no successor of its own and returns back to
+		 * the level it was entered from once completed (e.g., "Gargoyle's Lair" from "Medieval Kineval").
+		 */
+		static bool IsReturnLevel(StringView levelName);
+
+		/** @brief Returns player viewport bounds */
+		Recti GetPlayerViewportBounds(std::int32_t w, std::int32_t h, std::int32_t index);
+		/** @brief Processes weather */
+		void ProcessWeather(float timeMult);
+		/** @brief Resolves collisions */
+		void ResolveCollisions(float timeMult);
+		/** @brief Assigns viewport */
+		void AssignViewport(Actors::Player* player);
+		/** @brief Unassigns viewport */
+		void UnassignViewport(Actors::Player* player);
+		/** @brief Commits changes in assigned viewports */
+		void CommitViewports();
+		/** @brief Returns the upscale pass that hosts the HUD and in-game menu (the native-resolution overlay pass when the scene is supersampled, otherwise the scene pass) */
+		Rendering::UpscaleRenderPassWithClipping& GetActiveOverlayPass();
+		/** @brief Returns the scene node that the HUD and other overlay UI should attach to */
+		SceneNode* GetHudParentNode();
+		/** @brief Initializes camera for specified viewport */
+		void InitializeCamera(Rendering::PlayerViewport& viewport);
+		/** @brief Updates pressed actions */
+		void UpdatePressedActions();
+		/** @brief Updates rich presence */
+		void UpdateRichPresence();
+		/** @brief Initializes common rumble effects */
+		void InitializeRumbleEffects();
+		/** @brief Registers a rumple effect */
+		RumbleDescription* RegisterRumbleEffect(StringView name);
+
+		/** @brief Pauses the game (BatteryCheck: opens its in-game menu) */
+		virtual void PauseGame();
+		/** @brief Opens the stock JJ2 pause menu (not used by BatteryCheck) */
+		void PauseStockGame();
+		/** @brief Closes BatteryCheck's in-game menu and carries out its @ref UI::BatteryMenu::Action */
+		void CloseBatteryMenu(std::int32_t action);
+		/** @brief Resumes the paused game */
+		virtual void ResumeGame();
+		/** @brief Shows the in-game console */
+		virtual void ShowConsole();
+		/** @brief Hides the in-game console */
+		virtual void HideConsole();
+
+		/**
+		 * @brief Applies the cheat matching the specified command to the specified players
+		 *
+		 * @param line      Command to look up
+		 * @param targets   Players the cheat is applied to, pass an empty view to only check whether @p line is a cheat
+		 * @return `true` if @p line is a known cheat command
+		 *
+		 * The command is not validated against @ref IsCheatingAllowed, the caller is responsible for it.
+		 */
+		bool ApplyCheat(StringView line, ArrayView<Actors::Player* const> targets);
+
+#if defined(WITH_IMGUI)
+		ImVec2 WorldPosToScreenSpace(const Vector2f pos, const Rendering::PlayerViewport& viewport);
+#endif
+
+	private:
+		bool TryInvokeCheat(StringView line);
+
+		// Level state snapshots, see CanUseLevelStateSnapshots()
+		void CreateCheckpointSnapshot();
+		void RestoreCheckpointSnapshot();
+		void SerializeActorsToStream(Stream& dest);
+		void InitializeActorsFromStream(Stream& src);
+		void SerializeLevelState(Stream& dest, StringView specialLevel);
+		bool InitializeFromLevelState(const LevelStateSnapshot& state, const LevelInitialization& levelInit);
+
+		void CheatKill(ArrayView<Actors::Player* const> targets);
+		void CheatGod(ArrayView<Actors::Player* const> targets);
+		void CheatNext(ArrayView<Actors::Player* const> targets);
+		void CheatGuns(ArrayView<Actors::Player* const> targets);
+		void CheatRush(ArrayView<Actors::Player* const> targets);
+		void CheatGems(ArrayView<Actors::Player* const> targets);
+		void CheatBird(ArrayView<Actors::Player* const> targets);
+		void CheatLife(ArrayView<Actors::Player* const> targets);
+		void CheatPower(ArrayView<Actors::Player* const> targets);
+		void CheatCoins(ArrayView<Actors::Player* const> targets);
+		void CheatMorph(ArrayView<Actors::Player* const> targets);
+		void CheatShield(ArrayView<Actors::Player* const> targets);
+		void CheatFly(ArrayView<Actors::Player* const> targets);
+	};
+}

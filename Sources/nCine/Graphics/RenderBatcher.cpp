@@ -1,0 +1,547 @@
+#include "RenderBatcher.h"
+#include "RenderCommand.h"
+#include "RenderCommandPool.h"
+#include "RenderResources.h"
+#include "RHI/Rhi.h"
+#include "../Application.h"
+#include "../ServiceLocator.h"
+#include "../Base/StaticHashMapIterator.h"
+
+#include <algorithm>
+#include <cstring> // for memcpy()
+
+namespace nCine
+{
+	std::uint32_t RenderBatcher::UboMaxSize = 0;
+
+	RenderBatcher::RenderBatcher()
+	{
+		const RHI::IRhiCapabilities& caps = theServiceLocator().GetRhiCapabilities();
+		UboMaxSize = std::uint32_t(caps.GetValue(RHI::IRhiCapabilities::IntValues::MaxUniformBlockSizeNormalized));
+
+		// Create the first buffer right away
+		CreateBuffer(UboMaxSize);
+	}
+
+	void RenderBatcher::GetBatchSizeLimits(std::uint32_t& minBatchSize, std::uint32_t& maxBatchSize)
+	{
+		std::uint32_t fixedBatchSize = theApplication().GetAppConfiguration().fixedBatchSize;
+		if (fixedBatchSize == 0) {
+			// A backend that publishes a hard ceiling (IntValues::MaxBatchSize) is one whose shaders were
+			// compiled for exactly that count, so the ceiling below comes from the device rather than from
+			// the rendering settings.
+			const std::int32_t deviceMaxBatchSize = theServiceLocator().GetRhiCapabilities().GetValue(RHI::IRhiCapabilities::IntValues::MaxBatchSize);
+			if (deviceMaxBatchSize > 0) {
+				fixedBatchSize = std::uint32_t(deviceMaxBatchSize);
+			}
+		}
+		if (fixedBatchSize > 0) {
+			// The CEILING must be the count the batched shader was compiled for - a batch may not index past
+			// its instance array - and the loop below clamps to GetBatchSize() for exactly that reason. The
+			// FLOOR does not have to match it: a batch draws `6 * its own size` vertices (see the
+			// SetDrawParameters() calls in CollectCommands) and its instance block is allocated from the
+			// sizes actually accumulated, so a short batch draws and costs only what it holds and never
+			// reads the tail of the array.
+			//
+			// Raising the floor to the ceiling instead left every run shorter than it, and every remainder
+			// past a multiple of it, entirely unbatched - the passthrough at the bottom of the loop. Measured
+			// on a PS Vita back when its ceiling was 10, the credits screen drew 840 of its ~1266 items in 84
+			// batches and the remaining ~426 one draw at a time; at roughly 53 us of frame time per draw call
+			// that was most of a 31 ms frame, and fixing it alone took the worst point from 31.5 to 39 fps.
+			minBatchSize = 2;
+			maxBatchSize = fixedBatchSize;
+		} else {
+			auto& renderingSettings = theApplication().GetRenderingSettings();
+			minBatchSize = renderingSettings.minBatchSize;
+			maxBatchSize = renderingSettings.maxBatchSize;
+		}
+
+		DEATH_ASSERT(minBatchSize > 1);
+		DEATH_ASSERT(maxBatchSize >= minBatchSize);
+	}
+
+	std::uint32_t RenderBatcher::GetInstanceStride(const RHI::UniformBlockCache* singleInstanceBlock)
+	{
+		// The size of the original block without the uniform buffer offset alignment, but with the std140 vec4
+		// alignment every element of an array of structures has
+		const std::uint32_t packedSize = singleInstanceBlock->GetSize() - singleInstanceBlock->GetAlignAmount();
+		return packedSize + (16 - packedSize % 16) % 16;
+	}
+
+	std::uint32_t RenderBatcher::GetNonInstanceUniformsSize(RenderCommand* batchCommand, const RenderCommand* refCommand, const RHI::UniformBlockCache* singleInstanceBlock)
+	{
+		std::uint32_t size = batchCommand->GetMaterial().GetShaderProgram()->GetUniformsSize();
+		// Add the uniform blocks that are not for instances
+		const RHI::ShaderUniformBlocks::UniformHashMapType& allUniformBlocks = refCommand->GetMaterial().GetAllUniformBlocks();
+		for (const RHI::UniformBlockCache& uniformBlockCache : allUniformBlocks) {
+			// The instance block was already resolved, comparing addresses avoids a string comparison
+			if (&uniformBlockCache == singleInstanceBlock) {
+				continue;
+			}
+
+			RHI::UniformBlockCache* batchBlock = batchCommand->GetMaterial().UniformBlock(uniformBlockCache.uniformBlock()->GetName());
+			DEATH_ASSERT(batchBlock);
+			if (batchBlock) {
+				size += uniformBlockCache.GetSize() - uniformBlockCache.GetAlignAmount();
+			}
+		}
+		return size;
+	}
+
+	void RenderBatcher::CopyNonInstanceUniforms(RenderCommand* batchCommand, const RenderCommand* refCommand, const RHI::UniformBlockCache* singleInstanceBlock, bool commandAdded)
+	{
+		// Copying data for non-instances uniform blocks from the first command in the batch
+		const RHI::ShaderUniformBlocks::UniformHashMapType& allUniformBlocks = refCommand->GetMaterial().GetAllUniformBlocks();
+		for (const RHI::UniformBlockCache& uniformBlockCache : allUniformBlocks) {
+			if (&uniformBlockCache == singleInstanceBlock) {
+				continue;
+			}
+
+			RHI::UniformBlockCache* batchBlock = batchCommand->GetMaterial().UniformBlock(uniformBlockCache.uniformBlock()->GetName());
+			const bool dataCopied = batchBlock->CopyData(uniformBlockCache.GetDataPointer());
+			DEATH_ASSERT(dataCopied);
+			batchBlock->SetUsedSize(uniformBlockCache.usedSize());
+		}
+
+		// Setting sampler uniforms for GL_TEXTURE* units
+		const RHI::ShaderUniforms::UniformHashMapType& allUniforms = refCommand->GetMaterial().GetAllUniforms();
+		for (const RHI::UniformCache& uniformCache : allUniforms) {
+			if (uniformCache.GetUniform()->GetType() == ShaderCompiler::UniformType::Sampler2D) {
+				RHI::UniformCache* batchUniformCache = batchCommand->GetMaterial().Uniform(uniformCache.GetUniform()->GetName());
+				const std::int32_t refValue = uniformCache.GetIntValue(0);
+				const std::int32_t batchValue = batchUniformCache->GetIntValue(0);
+				// Also checking if the command has just been added, as the memory at the
+				// uniforms data pointer is not cleared and might contain the reference value
+				if (batchValue != refValue || commandAdded) {
+					batchUniformCache->SetIntValue(refValue);
+				}
+			}
+		}
+	}
+
+	void RenderBatcher::CopyMaterialState(RenderCommand* batchCommand, const RenderCommand* refCommand)
+	{
+		for (std::uint32_t i = 0; i < RHI::Texture::MaxTextureUnits; i++) {
+			batchCommand->GetMaterial().SetTexture(i, refCommand->GetMaterial().GetTexture(i));
+		}
+		batchCommand->GetMaterial().SetBlendingEnabled(refCommand->GetMaterial().IsBlendingEnabled());
+		batchCommand->GetMaterial().SetBlendingFactors(refCommand->GetMaterial().GetSrcBlendingFactor(), refCommand->GetMaterial().GetDestBlendingFactor());
+		// The hint is part of the material sort key, so every command of this batch carries the same value
+		batchCommand->GetMaterial().SetOpaqueContentHint(refCommand->GetMaterial().GetOpaqueContentHint());
+		batchCommand->SetLayer(refCommand->GetLayer());
+		batchCommand->SetVisitOrder(refCommand->GetVisitOrder());
+	}
+
+	void RenderBatcher::CreateBatches(const SmallVectorImpl<RenderCommand*>& srcQueue, SmallVectorImpl<RenderCommand*>& destQueue,
+		std::uint32_t splitLayer)
+	{
+		std::uint32_t minBatchSize, maxBatchSize;
+		GetBatchSizeLimits(minBatchSize, maxBatchSize);
+
+		std::uint32_t lastSplit = 0;
+
+		for (std::uint32_t i = 1; i < srcQueue.size(); i++) {
+			const RenderCommand* command = srcQueue[i];
+			const PrimitiveType primitive = command->GetGeometry().GetPrimitiveType();
+
+			const RenderCommand* prevCommand = srcQueue[i - 1];
+			const PrimitiveType prevPrimitive = prevCommand->GetGeometry().GetPrimitiveType();
+
+			// Should split if material sort key (that takes into account shader program, textures and blending) or primitive type differs
+			// GL_LINE_STRIP is split always, because it cannot be batched
+			// The layer isn't part of that key, so neighbours on two sides of the split layer have to be told apart
+			// on their own - a batch spanning it would be drawn whole in the first part of a split queue
+			const bool shouldSplit = (command->GetLowerMaterialSortKey() != prevCommand->GetLowerMaterialSortKey() || prevPrimitive != primitive ||
+				primitive == PrimitiveType::LineStrip || (prevCommand->GetLayer() < splitLayer) != (command->GetLayer() < splitLayer));
+
+			// Also collect the very last command if it can be batched with the previous one
+			std::uint32_t endSplit = (i == srcQueue.size() - 1 && !shouldSplit ? i + 1 : i);
+
+			// Split point if last command or split condition
+			if (i == srcQueue.size() - 1 || shouldSplit) {
+				const RHI::ShaderProgram* batchedShader = RenderResources::GetBatchedShader(prevCommand->GetMaterial().GetShaderProgram());
+				if (batchedShader && (endSplit - lastSplit) >= minBatchSize) {
+					// Split point for the maximum batch size
+					while (lastSplit < endSplit) {
+						std::uint32_t currentMaxBatchSize = maxBatchSize;
+						const std::uint32_t shaderBatchSize = batchedShader->GetBatchSize();
+						if (shaderBatchSize > 0 && currentMaxBatchSize > shaderBatchSize) {
+							currentMaxBatchSize = shaderBatchSize;
+						}
+
+						const std::uint32_t batchSize = endSplit - lastSplit;
+						std::uint32_t nextSplit = endSplit;
+						if (batchSize > currentMaxBatchSize) {
+							nextSplit = lastSplit + currentMaxBatchSize;
+						} else if (batchSize < minBatchSize) {
+							break;
+						}
+						
+						SmallVectorImpl<RenderCommand*>::const_iterator start = srcQueue.begin() + lastSplit;
+						SmallVectorImpl<RenderCommand*>::const_iterator end = srcQueue.begin() + nextSplit;
+
+						// Handling early splits while collecting (not enough UBO free space)
+						RenderCommand* batchCommand = CollectCommands(start, end, start);
+						if (batchCommand == nullptr) {
+							// Too large to be batched, it goes through as it is
+							destQueue.push_back(*start);
+							lastSplit = std::uint32_t(start - srcQueue.begin()) + 1;
+							continue;
+						}
+						destQueue.push_back(batchCommand);
+						lastSplit = std::uint32_t(start - srcQueue.begin());
+					}
+				}
+
+				// Also collect the very last command
+				endSplit = (i == srcQueue.size() - 1 ? i + 1 : i);
+
+				// Passthrough for unsupported command types and for the last few commands that are less than the minimum batch size
+				for (std::uint32_t j = lastSplit; j < endSplit; j++) {
+					destQueue.push_back(srcQueue[j]);
+				}
+
+				lastSplit = endSplit;
+			}
+		}
+
+		// If the queue has only one command the for loop didn't execute, the command has to passthrough
+		if (srcQueue.size() == 1) {
+			destQueue.push_back(srcQueue[0]);
+		}
+	}
+
+	void RenderBatcher::Reset()
+	{
+		// Reset managed buffers
+		for (ManagedBuffer& buffer : _buffers) {
+			buffer.freeSpace = buffer.size;
+		}
+	}
+
+	bool RenderBatcher::BeginDirectBatch(RenderCommand& refCommand, std::uint32_t maxInstances, DirectBatch& batch, RenderCommand* batchCommand)
+	{
+		batch = DirectBatch();
+		if (maxInstances == 0 || !theApplication().GetRenderingSettings().batchingEnabled) {
+			return false;
+		}
+
+		const RHI::ShaderProgram* refShader = refCommand.GetMaterial().GetShaderProgram();
+		RHI::ShaderProgram* batchedShader = (refShader != nullptr ? RenderResources::GetBatchedShader(refShader) : nullptr);
+		// Only a shader that draws its quads without vertex data qualifies, CollectCommands() copies the vertices
+		// of the others along with their instances
+		if (batchedShader == nullptr || batchedShader->GetAttributeCount() > 1) {
+			return false;
+		}
+		const RHI::UniformBlockCache* singleInstanceBlock = refCommand.GetInstanceBlock();
+		if (singleInstanceBlock == nullptr) {
+			return false;
+		}
+
+		std::uint32_t minBatchSize, maxBatchSize;
+		GetBatchSizeLimits(minBatchSize, maxBatchSize);
+		std::uint32_t capacity = std::min(maxInstances, maxBatchSize);
+		const std::uint32_t shaderBatchSize = batchedShader->GetBatchSize();
+		if (shaderBatchSize > 0 && capacity > shaderBatchSize) {
+			capacity = shaderBatchSize;
+		}
+
+		bool commandAdded = false;
+		if (batchCommand == nullptr) {
+			batchCommand = RenderResources::GetRenderCommandPool().RetrieveOrAdd(batchedShader, commandAdded);
+		} else if (batchCommand->GetMaterial().GetShaderProgram() != batchedShader) {
+			batchCommand->GetMaterial().SetShaderProgram(batchedShader);
+			commandAdded = true;
+		}
+#if defined(NCINE_PROFILING)
+		batchCommand->SetType(refCommand.GetType());
+#endif
+		RHI::UniformBlockCache* instancesBlock = batchCommand->GetInstancesBlock();
+		FATAL_ASSERT_MSG(instancesBlock != nullptr, "Batched shader does not have an \"{}\" uniform block", Material::InstancesBlockName);
+
+		// No more instances than both the instances block and a uniform buffer hold, as in CollectCommands()
+		const std::uint32_t stride = GetInstanceStride(singleInstanceBlock);
+		const std::uint32_t nonInstanceUniformsSize = GetNonInstanceUniformsSize(batchCommand, &refCommand, singleInstanceBlock);
+		const std::uint32_t blockCapacity = std::uint32_t(instancesBlock->GetSize()) / stride;
+		const std::uint32_t bufferCapacity = (UboMaxSize > nonInstanceUniformsSize ? (UboMaxSize - nonInstanceUniformsSize) / stride : 0);
+		capacity = std::min(capacity, std::min(blockCapacity, bufferCapacity));
+		if (capacity == 0) {
+			// The command stays unused in the pool until the end of the frame
+			return false;
+		}
+
+		batchCommand->GetMaterial().SetUniformsDataPointer(AcquireMemory(nonInstanceUniformsSize + capacity * stride));
+		CopyNonInstanceUniforms(batchCommand, &refCommand, singleInstanceBlock, commandAdded);
+		CopyMaterialState(batchCommand, &refCommand);
+
+		batch.Command = batchCommand;
+		batch.InstancesBlock = instancesBlock;
+		batch.Instances = instancesBlock->GetDataPointer();
+		batch.Stride = stride;
+		batch.Capacity = capacity;
+		return true;
+	}
+
+	void RenderBatcher::EndDirectBatch(DirectBatch& batch)
+	{
+		if (batch.Command == nullptr) {
+			return;
+		}
+
+		batch.InstancesBlock->SetUsedSize(batch.Count * batch.Stride);
+		batch.Command->SetBatchSize(std::int32_t(batch.Count));
+		batch.Command->GetGeometry().SetDrawParameters(PrimitiveType::Triangles, 0, 6 * std::int32_t(batch.Count));
+	}
+
+	RenderCommand* RenderBatcher::CollectCommands(
+		SmallVectorImpl<RenderCommand*>::const_iterator start,
+		SmallVectorImpl<RenderCommand*>::const_iterator end,
+		SmallVectorImpl<RenderCommand*>::const_iterator& nextStart)
+	{
+		DEATH_ASSERT(end > start);
+
+		const RenderCommand* refCommand = *start;
+		RenderCommand* batchCommand = nullptr;
+		RHI::UniformBlockCache* instancesBlock = nullptr;
+
+		// Tracking the amount of memory required by uniform blocks, vertices and indices of all instances
+		std::uint32_t instancesBlockSize = 0;
+		std::uint32_t instancesVertexDataSize = 0;
+		std::uint32_t instancesIndicesAmount = 0;
+
+		const RHI::ShaderProgram* refShader = refCommand->GetMaterial().GetShaderProgram();
+		RHI::ShaderProgram* batchedShader = RenderResources::GetBatchedShader(refShader);
+		// The following check should never fail as it is already checked by the calling function
+		FATAL_ASSERT_MSG(batchedShader != nullptr, "Unsupported shader for batch element");
+		bool commandAdded = false;
+		batchCommand = RenderResources::GetRenderCommandPool().RetrieveOrAdd(batchedShader, commandAdded);
+
+		const RHI::UniformBlockCache* singleInstanceBlock = (*start)->GetInstanceBlock();
+		const std::uint32_t singleInstanceBlockSize = GetInstanceStride(singleInstanceBlock);
+
+#if defined(NCINE_PROFILING)
+		batchCommand->SetType(refCommand->GetType());
+#endif
+		instancesBlock = batchCommand->GetInstancesBlock();
+		FATAL_ASSERT_MSG(instancesBlock != nullptr, "Batched shader does not have an \"{}\" uniform block", Material::InstancesBlockName);
+
+		// Determine how much memory is needed by the uniforms and the uniform blocks that are not for instances
+		const std::uint32_t nonInstanceUniformsSize = GetNonInstanceUniformsSize(batchCommand, refCommand, singleInstanceBlock);
+
+		// Set to true if at least one command in the batch has indices or forced by a rendering settings
+		bool batchingWithIndices = theApplication().GetRenderingSettings().batchingWithIndices;
+		// Sum the amount of UBO memory required by the batch and determine if indices are needed
+		SmallVectorImpl<RenderCommand*>::const_iterator it = start;
+		while (it != end) {
+			if ((*it)->GetGeometry().GetIndexCount() > 0) {
+				batchingWithIndices = true;
+			}
+
+			// Don't request more bytes than an instances block or an UBO can hold (also protects against big `RenderingSettings::maxBatchSize` values)
+			const std::uint32_t currentSize = nonInstanceUniformsSize + instancesBlockSize;
+			if (instancesBlockSize + singleInstanceBlockSize > instancesBlock->GetSize() || currentSize + singleInstanceBlockSize > UboMaxSize) {
+				break;
+			}
+			
+			instancesBlockSize += singleInstanceBlockSize;
+			++it;
+		}
+		nextStart = it;
+
+		batchCommand->GetMaterial().SetUniformsDataPointer(AcquireMemory(nonInstanceUniformsSize + instancesBlockSize));
+		CopyNonInstanceUniforms(batchCommand, refCommand, singleInstanceBlock, commandAdded);
+
+		const std::uint32_t maxVertexDataSize = RenderResources::GetBuffersManager().Specs(RenderBuffersManager::BufferTypes::Array).maxSize;
+		const std::uint32_t maxIndexDataSize = RenderResources::GetBuffersManager().Specs(RenderBuffersManager::BufferTypes::ElementArray).maxSize;
+		// Sum the amount of VBO and IBO memory required by the batch
+		it = start;
+		const bool refShaderHasAttributes = (refShader->GetAttributeCount() > 0);
+		while (it != nextStart) {
+			std::uint32_t vertexDataSize = 0;
+			std::uint32_t numIndices = (*it)->GetGeometry().GetIndexCount();
+
+			if (refShaderHasAttributes) {
+				std::uint32_t numVertices = (*it)->GetGeometry().GetVertexCount();
+				if (!batchingWithIndices) {
+					numVertices += 2; // plus two degenerates if indices are not used
+				}
+				const std::uint32_t numElementsPerVertex = (*it)->GetGeometry().GetElementsPerVertex() + 1; // plus the mesh index
+				vertexDataSize = numVertices * numElementsPerVertex * sizeof(float);
+
+				if (batchingWithIndices) {
+					numIndices = (numIndices > 0) ? numIndices + 2 : numVertices + 2;
+				}
+			}
+
+			// Don't request more bytes than a common VBO or IBO can hold
+			if (instancesVertexDataSize + vertexDataSize > maxVertexDataSize ||
+				(instancesIndicesAmount + numIndices) * sizeof(std::uint16_t) > maxIndexDataSize ||
+				instancesIndicesAmount + numIndices > 65535) {
+				break;
+			}
+
+			instancesVertexDataSize += vertexDataSize;
+			instancesIndicesAmount += numIndices;
+			++it;
+		}
+		if (it == start) {
+			// Its vertices alone are more than a batch can hold, it has to be drawn on its own - a batch of nothing
+			// would never move past it
+			nextStart = start;
+			return nullptr;
+		}
+		nextStart = it;
+
+		// Remove the two missing degenerate vertices or indices from first and last elements
+		const std::uint32_t twoVerticesDataSize = 2 * (refCommand->GetGeometry().GetElementsPerVertex() + 1) * sizeof(float);
+		if (instancesIndicesAmount >= 2) {
+			instancesIndicesAmount -= 2;
+		} else if (instancesVertexDataSize >= twoVerticesDataSize) {
+			instancesVertexDataSize -= twoVerticesDataSize;
+		}
+
+		const std::uint32_t NumFloatsVertexFormat = refCommand->GetGeometry().GetElementsPerVertex();
+		const std::uint32_t NumFloatsVertexFormatAndIndex = NumFloatsVertexFormat + 1; // index is an `int`, same size as a `float`
+		const std::uint32_t SizeVertexFormat = NumFloatsVertexFormat * 4;
+		const std::uint32_t SizeVertexFormatAndIndex = SizeVertexFormat + sizeof(std::uint32_t);
+
+		float* destVtx = nullptr;
+		std::uint16_t* destIdx = nullptr;
+
+		const bool batchedShaderHasAttributes = (batchedShader->GetAttributeCount() > 1);
+		if (batchedShaderHasAttributes) {
+			const std::uint32_t numFloats = instancesVertexDataSize / sizeof(float);
+			destVtx = batchCommand->GetGeometry().AcquireVertexPointer(numFloats, NumFloatsVertexFormat + 1); // aligned to vertex format with index
+
+			if (instancesIndicesAmount > 0) {
+				destIdx = batchCommand->GetGeometry().AcquireIndexPointer(instancesIndicesAmount);
+			}
+		}
+
+		it = start;
+		std::uint32_t instancesBlockOffset = 0;
+		std::uint16_t batchFirstVertexId = 0;
+		while (it != nextStart) {
+			RenderCommand* command = *it;
+			command->CommitNodeTransformation();
+
+			const RHI::UniformBlockCache* singleInstanceBlock = command->GetInstanceBlock();
+			const bool dataCopied = instancesBlock->CopyData(instancesBlockOffset, singleInstanceBlock->GetDataPointer(), singleInstanceBlockSize);
+			DEATH_ASSERT(dataCopied);
+			instancesBlockOffset += singleInstanceBlockSize;
+
+			if (batchedShaderHasAttributes) {
+				const std::uint32_t numVertices = command->GetGeometry().GetVertexCount();
+				const std::int32_t meshIndex = std::int32_t(it - start);
+				const float* srcVtx = command->GetGeometry().GetHostVertexPointer();
+				FATAL_ASSERT(srcVtx != nullptr);
+
+				// Vertex of a degenerate triangle, if not a starting element and there are more than one in the batch
+				if (it != start && nextStart - start > 1 && !batchingWithIndices) {
+					std::memcpy(destVtx, srcVtx, SizeVertexFormat);
+					*reinterpret_cast<std::int32_t*>(static_cast<void*>(&destVtx[NumFloatsVertexFormat])) = meshIndex; // last element is the index
+					destVtx += NumFloatsVertexFormatAndIndex;
+				}
+				for (std::uint32_t i = 0; i < numVertices; i++) {
+					std::memcpy(destVtx, srcVtx, SizeVertexFormat);
+					*reinterpret_cast<std::int32_t*>(static_cast<void*>(&destVtx[NumFloatsVertexFormat])) = meshIndex; // last element is the index
+					destVtx += NumFloatsVertexFormatAndIndex;
+					srcVtx += NumFloatsVertexFormat; // source format does not include an index
+				}
+				// Vertex of a degenerate triangle, if not an ending element and there are more than one in the batch
+				if (it != nextStart - 1 && nextStart - start > 1 && !batchingWithIndices) {
+					srcVtx -= NumFloatsVertexFormat;
+					std::memcpy(destVtx, srcVtx, SizeVertexFormat);
+					*reinterpret_cast<std::int32_t*>(static_cast<void*>(&destVtx[NumFloatsVertexFormat])) = meshIndex; // last element is the index
+					destVtx += NumFloatsVertexFormatAndIndex;
+				}
+
+				if (instancesIndicesAmount > 0) {
+					std::uint16_t vertexId = 0;
+					const std::uint32_t numIndices = command->GetGeometry().GetIndexCount() ? command->GetGeometry().GetIndexCount() : numVertices;
+					const std::uint16_t* srcIdx = command->GetGeometry().GetHostIndexPointer();
+
+					// Index of a degenerate triangle, if not a starting element and there are more than one in the batch
+					if (it != start && nextStart - start > 1) {
+						*destIdx = batchFirstVertexId + (srcIdx ? *srcIdx : vertexId);
+						destIdx++;
+					}
+					for (std::uint32_t i = 0; i < numIndices; i++) {
+						*destIdx = batchFirstVertexId + (srcIdx ? *srcIdx : vertexId);
+						destIdx++;
+						vertexId++;
+						if (srcIdx != nullptr) {
+							srcIdx++;
+						}
+					}
+					// Index of a degenerate triangle, if not an ending element and there are more than one in the batch
+					if (it != nextStart - 1 && nextStart - start > 1) {
+						if (srcIdx != nullptr) {
+							srcIdx--;
+						}
+						*destIdx = batchFirstVertexId + (srcIdx ? *srcIdx : vertexId - 1);
+						destIdx++;
+					}
+
+					batchFirstVertexId += srcIdx ? numVertices : vertexId;
+				}
+			}
+
+			++it;
+		}
+		instancesBlock->SetUsedSize(instancesBlockOffset);
+
+		if (batchedShaderHasAttributes) {
+			batchCommand->GetGeometry().ReleaseVertexPointer();
+			if (destIdx) {
+				batchCommand->GetGeometry().ReleaseIndexPointer();
+			}
+		}
+
+		CopyMaterialState(batchCommand, refCommand);
+		batchCommand->SetBatchSize(std::int32_t(nextStart - start));
+
+		if (batchedShaderHasAttributes) {
+			const std::uint32_t totalVertices = instancesVertexDataSize / SizeVertexFormatAndIndex;
+			batchCommand->GetGeometry().SetDrawParameters(refCommand->GetGeometry().GetPrimitiveType(), 0, std::int32_t(totalVertices));
+			batchCommand->GetGeometry().SetElementsPerVertex(NumFloatsVertexFormatAndIndex);
+			batchCommand->GetGeometry().SetIndexCount(instancesIndicesAmount);
+		} else {
+			batchCommand->GetGeometry().SetDrawParameters(PrimitiveType::Triangles, 0, 6 * std::int32_t(nextStart - start));
+		}
+
+		return batchCommand;
+	}
+
+	unsigned char* RenderBatcher::AcquireMemory(std::uint32_t bytes)
+	{
+		FATAL_ASSERT(bytes <= UboMaxSize);
+
+		std::uint8_t* ptr = nullptr;
+
+		for (ManagedBuffer& buffer : _buffers) {
+			if (buffer.freeSpace >= bytes) {
+				const std::uint32_t offset = buffer.size - buffer.freeSpace;
+				ptr = buffer.buffer.get() + offset;
+				buffer.freeSpace -= bytes;
+				break;
+			}
+		}
+
+		if (ptr == nullptr) {
+			CreateBuffer(UboMaxSize);
+			ptr = _buffers.back().buffer.get();
+			_buffers.back().freeSpace -= bytes;
+		}
+
+		return ptr;
+	}
+
+	void RenderBatcher::CreateBuffer(std::uint32_t size)
+	{
+		ManagedBuffer& managedBuffer = _buffers.emplace_back();
+		managedBuffer.size = size;
+		managedBuffer.freeSpace = size;
+		managedBuffer.buffer = std::make_unique<std::uint8_t[]>(size);
+	}
+}

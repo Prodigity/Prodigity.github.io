@@ -1,0 +1,1216 @@
+﻿#include "MainMenu.h"
+#include "MenuResources.h"
+#include "../../ContentResolver.h"
+#include "../../PreferencesCache.h"
+#include "../../Input/ControlScheme.h"
+#include "../DiscordRpcClient.h"
+#include "BeginSection.h"
+#include "FirstRunSection.h"
+
+#include "../../../nCine/Application.h"
+#include "../../../nCine/Graphics/RenderQueue.h"
+#include "../../../nCine/Audio/AudioReaderMpt.h"
+#include "../../../nCine/Base/Random.h"
+#include "../../../nCine/Input/JoyMapping.h"
+
+#include <Containers/StringConcatenable.h>
+
+#if defined(DEATH_TARGET_ANDROID)
+#	include "../../../nCine/Backends/Android/AndroidApplication.h"
+#endif
+
+using namespace Jazz2::UI::Menu::Resources;
+
+namespace Jazz2::UI::Menu
+{
+	namespace
+	{
+		// The menu's animated background is the same procedural effect the level's "Sky" layer uses (see
+		// TileMap.cpp): a fragment shader on the full tier, and the band mesh of the shared warp block
+		// (Shaders/Include/TexturedBackgroundWarp.inc) on both fixed-function console backends. The
+		// flat-tilemap fallback in RenderTexturedBackgroundAsTilemap() is kept for any tier that ends up
+		// without the warp again.
+		constexpr bool SupportsTexturedBackground = true;
+	}
+
+	MainMenu::MainMenu(IRootController* root, bool afterIntro)
+		: _root(root), _transitionWhite(afterIntro ? 1.0f : 0.0f),
+			_logoTransition(0.0f), _texturedBackgroundPass(this), _texturedBackgroundPhase(0.0f),
+			_pressedKeys(ValueInit, (std::size_t)Keys::Count)
+	{
+		theApplication().GetGfxDevice().setWindowTitle("Jazz² Resurrection"_s);
+
+		_texturedBackgroundLayer.Visible = false;
+		_canvasBackground = std::make_unique<MenuBackgroundCanvas>(this);
+		_canvasClipped = std::make_unique<MenuClippedCanvas>(this);
+		_canvasOverlay = std::make_unique<MenuOverlayCanvas>(this);
+
+		auto& resolver = ContentResolver::Get();
+		{
+			// Scoped, because the DEATH_ASSERT below returns out of the constructor and would otherwise
+			// leave the load unfinished - see LoadingScope. The block keeps the window exactly where it
+			// was: the sections constructed after it request their own resources outside it.
+			ContentResolver::LoadingScope loadingScope(resolver);
+
+			// It will also replace palette for subsequent `RequestMetadata()`
+			PrepareTexturedBackground();
+
+			_metadata = resolver.RequestMetadata("UI/MainMenu"_s);
+			DEATH_ASSERT(_metadata != nullptr, "Cannot load required metadata", );
+
+			_smallFont = resolver.GetFont(FontType::Small);
+			_mediumFont = resolver.GetFont(FontType::Medium);
+
+			// Opened here, started a couple of frames in (see OnBeginFrame()): the stream is fed from the main
+			// thread once per frame, and the first frames still load the sections' deferred resources - a stream
+			// started now ran dry against that and came back with an audible gap after a second of playing
+			PlayMenuMusic();
+		}
+
+		// Mark Fire and Menu button as already pressed to avoid some issues
+		_pressedActions = (1 << (int32_t)PlayerAction::Fire) | (1 << ((int32_t)PlayerAction::Fire + 16)) |
+			(1 << (int32_t)PlayerAction::Menu) | (1 << ((int32_t)PlayerAction::Menu + 16));
+
+		SwitchToSection<BeginSection>();
+
+#if !defined(DEATH_TARGET_EMSCRIPTEN)
+		bool isPlayable = ((_root->GetFlags() & IRootController::Flags::IsPlayable) == IRootController::Flags::IsPlayable);
+		if (PreferencesCache::FirstRun && isPlayable) {
+			// Show intro section on the first run
+			SwitchToSection<FirstRunSection>();
+		}
+#endif
+
+		UpdateRichPresence();
+	}
+
+	MainMenu::~MainMenu()
+	{
+		_canvasBackground->setParent(nullptr);
+		_canvasClipped->setParent(nullptr);
+		_canvasOverlay->setParent(nullptr);
+	}
+
+	void MainMenu::Reset()
+	{
+		// Finish any in-flight transition first so it doesn't reference sections about to be removed
+		_transition.Skip();
+
+		bool shouldSwitch = false;
+		while (!_sections.empty()) {
+			if (_sections.size() == 1 && runtime_cast<BeginSection>(_sections.back().get())) {
+				if (shouldSwitch) {
+					auto& lastSection = _sections.back();
+					lastSection->OnShow(this);
+
+					if (_contentBounds != Recti::Empty) {
+						Recti clipRectangle = lastSection->GetClipRectangle(_contentBounds);
+						_upscalePass.SetClipRectangle(clipRectangle);
+					}
+				}
+				return;
+			}
+
+			_sections.pop_back();
+			shouldSwitch = true;
+		}
+		
+		SwitchToSection<BeginSection>();
+	}
+
+	Vector2i MainMenu::GetViewSize() const
+	{
+		return _upscalePass.GetViewSize();
+	}
+
+	void MainMenu::OnBeginFrame()
+	{
+		float timeMult = theApplication().GetTimeMult();
+
+		UpdatePressedActions();
+		UpdateDebris(timeMult);
+
+#if defined(WITH_AUDIO)
+		// Music opened by PlayMenuMusic() is started only after the first frames have loaded what they load
+		if (_musicStartDelay > 0 && --_musicStartDelay == 0 && _music != nullptr) {
+			_music->play();
+		} else if (_musicStartDelay == 0 && _music != nullptr && _music->isStopped()) {
+			// A looping stream that reports itself stopped was stopped by something other than the game:
+			// the only in-game paths either replace it or clear the pointer, and a pause does not stop it.
+			// The audio device releases every player when it decides the output has gone away (see
+			// AudioDeviceBase::checkForStalledSources() and ALAudioDevice::checkDeviceConnection()), which
+			// frees the sources for new sounds but leaves anything long-lived stopped for good - nothing
+			// else in the game ever starts the music a second time. Rescheduling the start handles that,
+			// and costs one retry a second rather than one a frame if the device is genuinely gone.
+			_musicStartDelay = MusicRestartDelay;
+		}
+
+		// Destroy stopped players
+		auto it = _playingSounds.begin();
+		while (it != _playingSounds.end()) {
+			if ((*it)->isStopped()) {
+				it = _playingSounds.eraseUnordered(it);
+				continue;
+			}
+			++it;
+		}
+#endif
+
+		_texturedBackgroundPos.X += timeMult * 1.2f;
+		_texturedBackgroundPos.Y += timeMult * -0.2f + timeMult * sinApprox(_texturedBackgroundPhase) * 0.6f;
+		_texturedBackgroundPhase += timeMult * 0.001f;
+
+		if (_transitionWhite > 0.0f) {
+			_transitionWhite -= 0.02f * timeMult;
+			if (_transitionWhite < 0.0f) {
+				_transitionWhite = 0.0f;
+			}
+		}
+		if (_logoTransition < 1.0f) {
+			_logoTransition += timeMult * 0.04f;
+			if (_logoTransition > 1.0f) {
+				_logoTransition = 1.0f;
+			}
+		}
+#if defined(NCINE_HAS_TOUCH_CONTROLS)
+		if (_touchButtonsTimer > 0.0f) {
+			_touchButtonsTimer -= timeMult;
+		}
+#endif
+
+		UpdateActiveSection(timeMult);
+	}
+
+	void MainMenu::OnInitializeViewport(std::int32_t width, std::int32_t height)
+	{
+		// The same rule as the level's, so the sizes the options quote here are the ones the level will use
+		Vector2i viewSize = Rendering::UpscaleRenderPass::CalculateViewSize(width, height, DefaultWidth, DefaultHeight);
+		std::int32_t w = viewSize.X;
+		std::int32_t h = viewSize.Y;
+
+		_upscalePass.Initialize(w, h, width, height);
+		UpdateContentBounds(Vector2i(w, h));
+
+		if (!_sections.empty()) {
+			auto& lastSection = _sections.back();
+			Recti clipRectangle = lastSection->GetClipRectangle(_contentBounds);
+			_upscalePass.SetClipRectangle(clipRectangle);
+		}
+
+		// Viewports must be registered in reverse order
+		_upscalePass.Register();
+
+		_canvasBackground->setParent(_upscalePass.GetNode());
+		_canvasClipped->setParent(_upscalePass.GetClippedNode());
+		_canvasOverlay->setParent(_upscalePass.GetOverlayNode());
+
+		if (SupportsTexturedBackground) {
+			// Skipped entirely when unsupported, which also saves the pass's render target
+			_texturedBackgroundPass.Initialize();
+		}
+	}
+
+	void MainMenu::OnKeyPressed(const KeyboardEvent& event)
+	{
+		_pressedKeys.set((std::size_t)event.sym);
+
+		if (!_sections.empty()) {
+			auto& lastSection = _sections.back();
+			lastSection->OnKeyPressed(event);
+		}
+	}
+
+	void MainMenu::OnKeyReleased(const KeyboardEvent& event)
+	{
+		_pressedKeys.reset((std::size_t)event.sym);
+
+		if (!_sections.empty()) {
+			auto& lastSection = _sections.back();
+			lastSection->OnKeyReleased(event);
+		}
+	}
+
+	void MainMenu::OnTextInput(const TextInputEvent& event)
+	{
+		if (!_sections.empty()) {
+			auto& lastSection = _sections.back();
+			lastSection->OnTextInput(event);
+		}
+	}
+
+#if defined(NCINE_HAS_TOUCH_CONTROLS)
+	void MainMenu::OnTouchEvent(const nCine::TouchEvent& event)
+	{
+		if (!_sections.empty()) {
+			_touchButtonsTimer = 1200.0f;
+
+			auto& lastSection = _sections.back();
+			lastSection->OnTouchEvent(event, _canvasBackground->ViewSize);
+		}
+	}
+#endif
+
+	bool MainMenu::MenuBackgroundCanvas::OnDraw(RenderQueue& renderQueue)
+	{
+		Canvas::OnDraw(renderQueue);
+
+		ViewSize = _owner->_upscalePass.GetViewSize();
+
+		_owner->_activeCanvas = ActiveCanvas::Background;
+
+		if (PreferencesCache::EnableReforgedMainMenu || !_owner->RenderLegacyBackground(renderQueue)) {
+			if (SupportsTexturedBackground) {
+				_owner->RenderTexturedBackground(renderQueue);
+			} else {
+				_owner->RenderTexturedBackgroundAsTilemap(renderQueue);
+			}
+		}
+
+		// Horizontally the title follows the content bounds, the same middle the sections lay themselves out
+		// on, so it stays above the menu whatever the safe area takes off the sides (see
+		// MenuContainerBase::UpdateContentBounds); its vertical place comes from `titleY` below
+		Vector2i center = Vector2i(_owner->_contentBounds.X + _owner->_contentBounds.W / 2, ViewSize.Y / 2);
+		std::int32_t charOffset = 0;
+		std::int32_t charOffsetShadow = 0;
+
+		float titleOffset = MenuLayout::GetTitleOffset(ViewSize);
+		float titleY = _owner->_contentBounds.Y - titleOffset;
+		float logoBaseScale = MenuLayout::Blend(0.85f, 1.0f, ViewSize);
+		float logoScale = logoBaseScale + (1.0f - _owner->_logoTransition) * 7.0f;
+		float logoTextScale = logoBaseScale + (1.0f - _owner->_logoTransition) * 2.0f;
+		float logoTranslateX = logoBaseScale + (1.0f - _owner->_logoTransition) * 1.2f;
+		float logoTranslateY = (1.0f - _owner->_logoTransition) * 120.0f;
+		float logoTextTranslate = (1.0f - _owner->_logoTransition) * 60.0f;
+
+#if defined(NCINE_HAS_TOUCH_CONTROLS)
+		if (_owner->_touchButtonsTimer > 0.0f && _owner->_sections.size() >= 2) {
+			float arrowScale = MenuLayout::Blend(0.7f, 1.0f, ViewSize);
+			_owner->DrawElement(MenuLineArrow, -1, static_cast<float>(center.X), titleY - titleOffset, ShadowLayer, Alignment::Center, Colorf::White, arrowScale, arrowScale);
+		}
+#endif
+
+		// Title
+		if constexpr (Font::ShadowsEnabled) {
+			_owner->DrawElement(MenuCarrot, -1, center.X - 76.0f * logoTranslateX, titleY - 6.0f + logoTranslateY + 2.0f, ShadowLayer + 200, Alignment::Center, Colorf(0.0f, 0.0f, 0.0f, 0.3f), 0.8f * logoScale, 0.8f * logoScale);
+		}
+		_owner->DrawElement(MenuCarrot, -1, center.X - 76.0f * logoTranslateX, titleY - 6.0f + logoTranslateY, MainLayer + 200, Alignment::Center, Colorf::White, 0.8f * logoScale, 0.8f * logoScale);
+
+		if constexpr (Font::ShadowsEnabled) {
+			_owner->_mediumFont->DrawString(this, "Jazz"_s, charOffsetShadow, center.X - 63.0f * logoTranslateX + logoTextTranslate, titleY + logoTranslateY + 2.0f, FontShadowLayer + 200,
+				Alignment::Left, Colorf(0.0f, 0.0f, 0.0f, 0.32f), 0.75f * logoTextScale, 1.65f, 3.0f, 3.0f, 0.0f, 0.92f);
+			_owner->_mediumFont->DrawString(this, "2"_s, charOffsetShadow, center.X - 19.0f * logoTranslateX + logoTextTranslate, titleY - 8.0f + logoTranslateY + 2.0f, FontShadowLayer + 200,
+				Alignment::Left, Colorf(0.0f, 0.0f, 0.0f, 0.32f), 0.5f * logoTextScale, 0.0f, 0.0f, 0.0f, 0.0f);
+			_owner->_mediumFont->DrawString(this, "Resurrection"_s, charOffsetShadow, center.X - 10.0f * logoTranslateX + logoTextTranslate, titleY + 4.0f + logoTranslateY + 2.5f, FontShadowLayer + 200,
+				Alignment::Left, Colorf(0.0f, 0.0f, 0.0f, 0.3f), 0.5f * logoTextScale, 0.4f, 1.2f, 1.2f, 0.46f, 0.8f);
+		}
+
+		_owner->_mediumFont->DrawString(this, "Jazz"_s, charOffset, center.X - 63.0f * logoTranslateX + logoTextTranslate, titleY + logoTranslateY, FontLayer + 200,
+			Alignment::Left, Colorf(0.54f, 0.44f, 0.34f, 0.5f), 0.75f * logoTextScale, 1.65f, 3.0f, 3.0f, 0.0f, 0.92f);
+		_owner->_mediumFont->DrawString(this, "2"_s, charOffset, center.X - 19.0f * logoTranslateX + logoTextTranslate, titleY - 8.0f + logoTranslateY, FontLayer + 200,
+			Alignment::Left, Colorf(0.54f, 0.44f, 0.34f, 0.5f), 0.5f * logoTextScale, 0.0f, 0.0f, 0.0f, 0.0f);
+		_owner->_mediumFont->DrawString(this, "Resurrection"_s, charOffset, center.X - 10.0f * logoTranslateX + logoTextTranslate, titleY + 4.0f + logoTranslateY, FontLayer + 200,
+			Alignment::Left, Colorf(0.6f, 0.42f, 0.42f, 0.5f), 0.5f * logoTextScale, 0.4f, 1.2f, 1.2f, 0.46f, 0.8f);
+
+		// The version and the copyright sit in the bottom corners of the background, behind whatever section
+		// is on top. That is fine while the view is tall enough to keep the section's own frame clear of
+		// them, but on a compact one (the handhelds' 272 rows - the same threshold the header and footer
+		// shrink at, see MenuContainerBase::UpdateContentBounds()) the frame reaches all the way down and
+		// they show through underneath it. They belong to the title screen rather than to any section, so
+		// there they are drawn only while the root section is the one on top.
+		bool showCorners = (ViewSize.Y >= 300 || _owner->_sections.size() <= 1);
+#if defined(DEATH_TARGET_ANDROID)
+		if (showCorners && !static_cast<AndroidApplication&>(theApplication()).IsScreenRound())
+#else
+		if (showCorners)
+#endif
+		{
+			// Version. These two are the only text in the menu placed against the view itself rather than
+			// against the content bounds, which already follow the safe area, so they take it off here
+			Rectf safeView = PreferencesCache::ApplySafeArea(Rectf(0.0f, 0.0f, (float)ViewSize.X, (float)ViewSize.Y), ViewSize);
+			Vector2f bottomRight = Vector2f(safeView.X + safeView.W, safeView.Y + safeView.H);
+			bottomRight.X -= 24.0f;
+			bottomRight.Y -= MenuLayout::Blend(4.0f, 10.0f, ViewSize);
+
+			auto newestVersion = _owner->_root->GetNewestVersion();
+			if (!newestVersion.empty() && newestVersion != NCINE_VERSION) {
+				String newerVersion = "v" NCINE_VERSION "  › \f[c:#9e7056]v" + newestVersion;
+				_owner->DrawStringShadow(newerVersion, charOffset, bottomRight.X, bottomRight.Y, IMenuContainer::FontLayer,
+					Alignment::BottomRight, Font::DefaultColor, 0.7f, 0.4f, 1.2f, 1.2f, 0.46f, 0.8f);
+			} else {
+				_owner->DrawStringShadow("v" NCINE_VERSION, charOffset, bottomRight.X, bottomRight.Y, IMenuContainer::FontLayer,
+					Alignment::BottomRight, Font::DefaultColor, 0.7f, 0.4f, 1.2f, 1.2f, 0.46f, 0.8f);
+			}
+
+			// Copyright
+			Vector2f bottomLeft = bottomRight;
+			bottomLeft.X = safeView.X + 24.0f;
+			_owner->DrawStringShadow("© 2016-" NCINE_BUILD_YEAR "  Dan R."_s, charOffset, bottomLeft.X, bottomLeft.Y, IMenuContainer::FontLayer,
+				Alignment::BottomLeft, Font::DefaultColor, 0.7f, 0.4f, 1.2f, 1.2f, 0.46f, 0.8f);
+
+#if defined(DEATH_TARGET_WINDOWS_RT)
+			// Show active external drive indicator on Xbox
+			StringView sourcePath = ContentResolver::Get().GetSourcePath();
+			if (!sourcePath.empty() && sourcePath.hasPrefix("\\\\?\\"_s) && sourcePath.exceptPrefix(5).hasPrefix(":\\Games\\"_s)) {
+				_owner->DrawStringShadow("·"_s, charOffset, bottomLeft.X + 116.0f, bottomLeft.Y, IMenuContainer::FontLayer,
+					Alignment::BottomLeft, Font::DefaultColor, 0.7f, 0.4f, 0.0f, 0.8f, 0.46f, 0.8f);
+				_owner->DrawElement(Storage, -1, bottomLeft.X + 146.0f, bottomLeft.Y - 3.0f, IMenuContainer::FontLayer, Alignment::BottomRight, Colorf(1.0f, 1.0f, 1.0f, std::max(_owner->_logoTransition - 0.6f, 0.0f) * 2.5f));
+				_owner->DrawStringShadow(sourcePath.slice(4, 7), charOffset, bottomLeft.X + 150.0f, bottomLeft.Y, IMenuContainer::FontLayer,
+					Alignment::BottomLeft, Font::DefaultColor, 0.7f, 0.4f, 1.2f, 1.2f, 0.46f, 0.8f);
+			}
+#endif
+		}
+
+		_owner->DrawSections(this, ActiveCanvas::Background);
+
+		return true;
+	}
+
+	bool MainMenu::MenuClippedCanvas::OnDraw(RenderQueue& renderQueue)
+	{
+		if (_owner->_sections.empty()) {
+			return false;
+		}
+
+		Canvas::OnDraw(renderQueue);
+
+		ViewSize = _owner->_upscalePass.GetViewSize();
+
+		_owner->_activeCanvas = ActiveCanvas::Clipped;
+
+		_owner->DrawSections(this, ActiveCanvas::Clipped);
+
+		return true;
+	}
+
+	bool MainMenu::MenuOverlayCanvas::OnDraw(RenderQueue& renderQueue)
+	{
+		Canvas::OnDraw(renderQueue);
+
+		ViewSize = _owner->_upscalePass.GetViewSize();
+
+		_owner->_activeCanvas = ActiveCanvas::Overlay;
+
+		_owner->DrawSections(this, ActiveCanvas::Overlay);
+
+		_owner->DrawDebris(renderQueue);
+
+		if (_owner->_transitionWhite > 0.0f) {
+			DrawSolid(Vector2f::Zero, 950, Vector2f(static_cast<float>(ViewSize.X), static_cast<float>(ViewSize.Y)), Colorf(1.0f, 1.0f, 1.0f, _owner->_transitionWhite));
+		}
+
+		return true;
+	}
+
+	void MainMenu::ChangeLevel(LevelInitialization&& levelInit)
+	{
+		_root->ChangeLevel(std::move(levelInit));
+	}
+
+	bool MainMenu::HasResumableState() const
+	{
+		return _root->HasResumableState();
+	}
+
+	void MainMenu::ResumeSavedState()
+	{
+		_root->ResumeSavedState();
+	}
+
+#if defined(WITH_MULTIPLAYER)
+	void MainMenu::ConnectToServer(StringView endpoint, std::uint16_t defaultPort)
+	{
+		_root->ConnectToServer(endpoint, defaultPort);
+	}
+
+	bool MainMenu::CreateServer(Jazz2::Multiplayer::ServerInitialization&& serverInit)
+	{
+		return _root->CreateServer(std::move(serverInit));
+	}
+#endif
+
+	void MainMenu::ApplyPreferencesChanges(ChangedPreferencesType type)
+	{
+		if ((type & ChangedPreferencesType::Graphics) == ChangedPreferencesType::Graphics) {
+			Viewport::GetChain().clear();
+			Vector2i res = theApplication().GetResolution();
+			OnInitializeViewport(res.X, res.Y);
+		}
+
+#if defined(WITH_AUDIO)
+		if ((type & ChangedPreferencesType::Audio) == ChangedPreferencesType::Audio) {
+			if (_music != nullptr) {
+				_music->setGain(PreferencesCache::MasterVolume * PreferencesCache::MusicVolume);
+			}
+		}
+#endif
+
+		if ((type & ChangedPreferencesType::Language) == ChangedPreferencesType::Language) {
+			// All sections have to be recreated to load new language
+			RecreateSections();
+		} else if ((type & ChangedPreferencesType::Layout) == ChangedPreferencesType::Layout) {
+			// A new view size keeps the stack and lets every section lay itself out again - at the next
+			// update, as the request comes from a widget of the section on top (see GraphicsOptionsSection).
+			// The bounds themselves are recomputed right away, because a changed safe area moves them
+			// without the view size having changed at all (see SafeAreaOptionsSection)
+			UpdateContentBounds(GetUpscalePass().GetViewSize());
+			_sectionsRelayoutPending = true;
+		}
+
+		if ((type & ChangedPreferencesType::ControlScheme) == ChangedPreferencesType::ControlScheme) {
+			// Mark all buttons as already pressed to avoid some issues
+			_pressedActions = 0xffff | (0xffff << 16);
+		}
+
+		if ((type & ChangedPreferencesType::MainMenu) == ChangedPreferencesType::MainMenu) {
+			PlayMenuMusic();
+		}
+	}
+
+	void MainMenu::DrawStringShadow(StringView text, std::int32_t& charOffset, float x, float y, std::uint16_t z, Alignment align, const Colorf& color, float scale,
+		float angleOffset, float varianceX, float varianceY, float speed, float charSpacing, float lineSpacing)
+	{
+		if (_logoTransition < 1.0f) {
+			float transitionText = (1.0f - _logoTransition) * 2.0f;
+			angleOffset += 0.5f * transitionText;
+			varianceX += 400.0f * transitionText;
+			varianceY += 400.0f * transitionText;
+			speed -= speed * 0.6f * transitionText;
+		}
+
+		Canvas* currentCanvas = GetActiveCanvas();
+		if constexpr (Font::ShadowsEnabled) {
+			std::int32_t charOffsetShadow = charOffset;
+			_smallFont->DrawString(currentCanvas, text, charOffsetShadow, x, y + 2.8f * scale, FontShadowLayer,
+				align, Colorf(0.0f, 0.0f, 0.0f, 0.29f), scale, angleOffset, varianceX, varianceY, speed, charSpacing, lineSpacing);
+		}
+		_smallFont->DrawString(currentCanvas, text, charOffset, x, y, z,
+			align, color, scale, angleOffset, varianceX, varianceY, speed, charSpacing, lineSpacing);
+	}
+
+	void MainMenu::RecreateSections()
+	{
+		_transition.Skip();
+		_sections.clear();
+		SwitchToSection<BeginSection>();
+	}
+
+	void MainMenu::PlayMenuMusic()
+	{
+		// The N64 plays music without a module decoder: its content carries the tracks converted for its audio device
+#if defined(WITH_AUDIO) && (defined(WITH_OPENMPT) || defined(WITH_XMP) || defined(WITH_N64AUDIO))
+		auto& resolver = ContentResolver::Get();
+
+		if (PreferencesCache::EnableReforgedMainMenu) {
+			_music = resolver.GetMusic(Random().NextBool() ? "bonus2.j2b"_s : "bonus3.j2b"_s);
+		} else {
+			_music = nullptr;
+		}
+
+		if (_music == nullptr) {
+			_music = resolver.GetMusic("menu.j2b"_s);
+		}
+
+		if (_music != nullptr) {
+			_music->setLooping(true);
+			_music->setGain(PreferencesCache::MasterVolume * PreferencesCache::MusicVolume);
+			_music->setSourceRelative(true);
+			// Started by OnBeginFrame() once the frames that follow have loaded their resources, so the stream
+			// is not starved right after it begins (see the constructor); two frames is imperceptible when the
+			// music is merely restarted later on
+			_musicStartDelay = 2;
+		}
+#endif
+	}
+
+	void MainMenu::UpdateRichPresence()
+	{
+#if (defined(DEATH_TARGET_WINDOWS) && !defined(DEATH_TARGET_WINDOWS_RT)) || defined(DEATH_TARGET_UNIX)
+		if (!PreferencesCache::EnableDiscordIntegration || !DiscordRpcClient::Get().IsSupported()) {
+			return;
+		}
+
+		DiscordRpcClient::RichPresence richPresence;
+		richPresence.State = "Resting in main menu"_s;
+		richPresence.LargeImage = "main-transparent"_s;
+		DiscordRpcClient::Get().SetRichPresence(richPresence);
+#endif
+	}
+
+	void MainMenu::UpdateDebris(float timeMult)
+	{
+		if (_preset == Preset::Xmas && PreferencesCache::EnableReforgedMainMenu) {
+			std::int32_t weatherIntensity = Random().Fast(0, (std::int32_t)(3 * timeMult) + 1);
+			for (std::int32_t i = 0; i < weatherIntensity; i++) {
+				Vector2i viewSize = _canvasOverlay->ViewSize;
+				Vector2f debrisPos = Vector2f(Random().FastFloat(viewSize.X * -0.3f, viewSize.X * 1.3f),
+					Random().NextFloat(viewSize.Y * -0.5f, viewSize.Y * 0.5f));
+
+				auto* res = _metadata->FindAnimation((AnimState)1); // Snow
+				if (res != nullptr) {
+					auto& resBase = res->Base;
+					Vector2i texSize = resBase->TextureDiffuse->GetSize();
+					float scale = Random().FastFloat(0.4f, 1.1f);
+					float speedX = Random().FastFloat(-1.6f, -1.2f) * scale;
+					float speedY = Random().FastFloat(3.0f, 4.0f) * scale;
+					float accel = Random().FastFloat(-0.008f, 0.008f) * scale;
+
+					std::int32_t curAnimFrame = res->FrameOffset + Random().Next(0, res->FrameCount);
+					Recti frameRect = resBase->GetFrameRect(curAnimFrame);
+
+					TileMap::DestructibleDebris debris = { };
+					debris.Pos = debrisPos;
+					debris.Depth = MainLayer - 100 + 200 * scale;
+					debris.Size = Vector2f((float)frameRect.W, (float)frameRect.H);
+					debris.Speed = Vector2f(speedX, speedY);
+					debris.Acceleration = Vector2f(accel, std::abs(accel));
+
+					debris.Scale = scale;
+					debris.ScaleSpeed = 0.0f;
+					debris.Angle = Random().FastFloat(0.0f, fTwoPi);
+					debris.AngleSpeed = speedX * 0.02f;
+					debris.Alpha = 1.0f;
+					debris.AlphaSpeed = 0.0f;
+
+					debris.Time = 160.0f;
+
+					debris.TexScaleX = (float(frameRect.W) / float(texSize.X));
+					debris.TexBiasX = (float(frameRect.X) / float(texSize.X));
+					debris.TexScaleY = (float(frameRect.H) / float(texSize.Y));
+					debris.TexBiasY = (float(frameRect.Y) / float(texSize.Y));
+
+					debris.DiffuseTexture = resBase->TextureDiffuse.get();
+					debris.PaletteOffset = ((resBase->Flags & GenericGraphicResourceFlags::Indexed) == GenericGraphicResourceFlags::Indexed ? res->PaletteOffset : -1);
+
+					_debrisList.push_back(debris);
+				}
+			}
+		}
+
+		std::int32_t size = (std::int32_t)_debrisList.size();
+		for (std::int32_t i = 0; i < size; i++) {
+			Tiles::TileMap::DestructibleDebris& debris = _debrisList[i];
+
+			if (debris.Scale <= 0.0f || debris.Alpha <= 0.0f) {
+				std::swap(debris, _debrisList[size - 1]);
+				_debrisList.pop_back();
+				i--;
+				size--;
+				continue;
+			}
+
+			debris.Time -= timeMult;
+			if (debris.Time <= 0.0f) {
+				debris.AlphaSpeed = -std::min(0.02f, debris.Alpha);
+			}
+
+			debris.Pos.X += debris.Speed.X * timeMult + 0.5f * debris.Acceleration.X * timeMult * timeMult;
+			debris.Pos.Y += debris.Speed.Y * timeMult + 0.5f * debris.Acceleration.Y * timeMult * timeMult;
+
+			if (debris.Acceleration.X != 0.0f) {
+				debris.Speed.X = std::min(debris.Speed.X + debris.Acceleration.X * timeMult, 10.0f);
+			}
+			if (debris.Acceleration.Y != 0.0f) {
+				debris.Speed.Y = std::min(debris.Speed.Y + debris.Acceleration.Y * timeMult, 10.0f);
+			}
+
+			debris.Scale += debris.ScaleSpeed * timeMult;
+			debris.Angle += debris.AngleSpeed * timeMult;
+			debris.Alpha += debris.AlphaSpeed * timeMult;
+		}
+	}
+
+	void MainMenu::DrawDebris(RenderQueue& renderQueue)
+	{
+		for (auto& debris : _debrisList) {
+			auto command = _canvasOverlay->RentRenderCommand();
+			command->SetType(RenderCommand::Type::Particle);
+			// Menu debris draws a (now indexed) UI sprite - recolor it through the palette shader at draw time
+			ContentResolver::Get().ConfigureSpriteShader(*command, debris.PaletteOffset >= 0);
+
+			command->GetMaterial().SetBlendingFactors(BlendingFactor::SrcAlpha, BlendingFactor::OneMinusSrcAlpha);
+
+			auto instanceBlock = command->GetInstanceBlock();
+			instanceBlock->GetUniform(Material::TexRectUniformName)->SetFloatValue(debris.TexScaleX, debris.TexBiasX, debris.TexScaleY, debris.TexBiasY);
+			instanceBlock->GetUniform(Material::SpriteSizeUniformName)->SetFloatValue(debris.Size.X, debris.Size.Y);
+			instanceBlock->GetUniform(Material::ColorUniformName)->SetFloatVector(Colorf(1.0f, 1.0f, 1.0f, debris.Alpha).Data());
+
+			Matrix4x4f worldMatrix = Matrix4x4f::Translation(debris.Pos.X, debris.Pos.Y, 0.0f);
+			worldMatrix.RotateZ(debris.Angle);
+			worldMatrix.Scale(debris.Scale, debris.Scale, 1.0f);
+			worldMatrix.Translate(debris.Size.X * -0.5f, debris.Size.Y * -0.5f, 0.0f);
+			command->SetTransformation(worldMatrix);
+			command->SetLayer(debris.Depth);
+			ContentResolver::Get().BindSpritePalette(*command, *debris.DiffuseTexture, debris.PaletteOffset >= 0, (std::uint16_t)(debris.PaletteOffset >= 0 ? debris.PaletteOffset : 0));
+
+			renderQueue.AddCommand(command);
+		}
+	}
+
+	void MainMenu::PrepareTexturedBackground()
+	{
+		// The seasonal preset is chosen from the wall clock, so it must first be established that there IS
+		// one. A console with no real-time clock - the Nintendo 64 has none of its own, only a few cartridges
+		// carry one - answers time() with -1, and localtime() renders that as December 1969: the one month
+		// that puts the menu into its Christmas preset, complete with the snowfall that spawns every frame.
+		// That is not a wrong picture on such a machine, it is a permanent one, so an implausible year is
+		// treated as "season unknown" and the ordinary preset is used. localtime() is allowed to fail
+		// outright as well, which is the same answer.
+		std::int32_t month = -1;
+		time_t t = time(nullptr);
+		if (t != (time_t)-1) {
+#if defined(DEATH_TARGET_WINDOWS)
+			struct tm local;
+			if (localtime_s(&local, &t) == 0 && local.tm_year + 1900 >= 2000) {
+				month = local.tm_mon;
+			}
+#else
+			struct tm* local = localtime(&t);
+			if (local != nullptr && local->tm_year + 1900 >= 2000) {
+				month = local->tm_mon;
+			}
+#endif
+		}
+		bool hasXmas = ((month == 11 || month == 0) && TryLoadBackgroundPreset(Preset::Xmas));
+		if (!hasXmas &&
+			!TryLoadBackgroundPreset(Preset::Default) &&
+			!TryLoadBackgroundPreset(Preset::Carrotus) &&
+			!TryLoadBackgroundPreset(Preset::SharewareDemo)) {
+			// Cannot load any available preset
+			TryLoadBackgroundPreset(Preset::None);
+			return;
+		}
+
+		constexpr std::int32_t Width = 8;
+		constexpr std::int32_t Height = 8;
+
+		constexpr std::int32_t StartIndexDefault = 360;
+		constexpr std::int32_t StartIndexXmas = 420;
+		constexpr std::int32_t StartIndexDemo = 240;
+		constexpr std::int32_t AdditionalIndexDemo = 451;
+		constexpr std::int32_t SplitRowDemo = 6;
+
+		TileMapLayer& newLayer = _texturedBackgroundLayer;
+		auto& layout = newLayer.Layout;
+		layout.Allocate(std::size_t(Width * Height), false);
+
+		std::int32_t n = 0;
+		if (_preset == Preset::SharewareDemo) {
+			// Shareware Demo tileset is not contiguous for some reason
+			for (std::int32_t i = StartIndexDemo; i < StartIndexDemo + SplitRowDemo * 10; i += 10) {
+				for (std::int32_t j = 0; j < 8; j++) {
+					LayerTile& tile = layout[n++];
+					tile.TileID = i + j;
+				}
+			}
+			for (std::int32_t i = AdditionalIndexDemo; i < AdditionalIndexDemo + (Height - SplitRowDemo) * 10; i += 10) {
+				for (std::int32_t j = 0; j < 8; j++) {
+					LayerTile& tile = layout[n++];
+					tile.TileID = i + j;
+				}
+			}
+		} else {
+			std::int32_t startIndex = (_preset == Preset::Xmas ? StartIndexXmas : StartIndexDefault);
+			for (std::int32_t i = startIndex; i < startIndex + Height * 10; i += 10) {
+				for (std::int32_t j = 0; j < 8; j++) {
+					LayerTile& tile = layout[n++];
+					tile.TileID = i + j;
+				}
+			}
+		}
+
+		newLayer.Visible = true;
+		newLayer.LayoutSize = Vector2i(Width, Height);
+	}
+
+	bool MainMenu::TryLoadBackgroundPreset(Preset preset)
+	{
+		auto& resolver = ContentResolver::Get();
+
+		switch (preset) {
+			case Preset::Default: _tileSet = resolver.RequestTileSet("easter99"_s, 0, true); break;
+			case Preset::Carrotus: _tileSet = resolver.RequestTileSet("carrot1"_s, 0, true); break;
+			case Preset::SharewareDemo: _tileSet = resolver.RequestTileSet("diam2"_s, 0, true); break;
+			case Preset::Xmas: _tileSet = resolver.RequestTileSet("xmas2"_s, 0, true); break;
+			default: _tileSet = nullptr; resolver.ApplyDefaultPalette(); _preset = Preset::None; return true;
+		}
+
+		if (_tileSet == nullptr) {
+			return false;
+		}
+
+		_preset = preset;
+		return true;
+	}
+
+	void MainMenu::RenderTexturedBackgroundAsTilemap(RenderQueue& renderQueue)
+	{
+		// Flat stand-in for the procedural background on the backends without a programmable stage: the 8x8
+		// tile layout is drawn straight to the screen, repeated to cover the viewport and scrolled by the
+		// same offset the shader would have sampled with, instead of being baked into a render target and
+		// warped per pixel. The tiles are drawn at twice their size, which keeps the pattern close to the
+		// scale the warped version shows and keeps the quad count down.
+		if (_tileSet == nullptr) {
+			return;
+		}
+
+		TileMapLayer& layer = _texturedBackgroundLayer;
+		Vector2i layoutSize = layer.LayoutSize;
+		if (layoutSize.X <= 0 || layoutSize.Y <= 0 || layer.Layout.empty()) {
+			return;
+		}
+
+		constexpr float TileScale = 2.0f;
+		constexpr float TileSize = TileSet::DefaultTileSize * TileScale;
+		Vector2f viewSize = _canvasBackground->ViewSize.As<float>();
+		float blockW = layoutSize.X * TileSize;
+		float blockH = layoutSize.Y * TileSize;
+
+		// Wrap the scroll offset into (-block, 0], so the first block always starts just off screen
+		float startX = fmodf(_texturedBackgroundPos.X * TileScale, blockW);
+		if (startX > 0.0f) {
+			startX -= blockW;
+		}
+		float startY = fmodf(_texturedBackgroundPos.Y * TileScale, blockH);
+		if (startY > 0.0f) {
+			startY -= blockH;
+		}
+
+		for (float blockY = startY; blockY < viewSize.Y; blockY += blockH) {
+			for (float blockX = startX; blockX < viewSize.X; blockX += blockW) {
+				for (std::int32_t y = 0; y < layoutSize.Y; y++) {
+					float posY = blockY + y * TileSize;
+					if (posY + TileSize <= 0.0f || posY >= viewSize.Y) {
+						continue;
+					}
+					for (std::int32_t x = 0; x < layoutSize.X; x++) {
+						float posX = blockX + x * TileSize;
+						if (posX + TileSize <= 0.0f || posX >= viewSize.X) {
+							continue;
+						}
+
+						std::int32_t tileId = layer.Layout[y * layoutSize.X + x].TileID;
+						Texture* tileTexture = _tileSet->ResolveTextureDiffuse(tileId);
+						if DEATH_UNLIKELY(tileTexture == nullptr) {
+							continue;
+						}
+
+						auto command = _canvasBackground->RentRenderCommand();
+						ContentResolver::Get().ConfigureSpriteShader(*command, _tileSet->IsIndexed);
+
+						Vector2i texSize = tileTexture->GetSize();
+						float texScaleX = TileSet::DefaultTileSize / float(texSize.X);
+						float texBiasX = ((tileId % _tileSet->TilesPerRow) * float(TileSet::PaddedTileSize) + TileSet::TilePadding) / float(texSize.X);
+						float texScaleY = TileSet::DefaultTileSize / float(texSize.Y);
+						float texBiasY = ((tileId / _tileSet->TilesPerRow) * float(TileSet::PaddedTileSize) + TileSet::TilePadding) / float(texSize.Y);
+
+						auto instanceBlock = command->GetInstanceBlock();
+						instanceBlock->GetUniform(Material::TexRectUniformName)->SetFloatValue(texScaleX, texBiasX, texScaleY, texBiasY);
+						instanceBlock->GetUniform(Material::SpriteSizeUniformName)->SetFloatValue(TileSize, TileSize);
+						instanceBlock->GetUniform(Material::ColorUniformName)->SetFloatVector(Colorf::White.Data());
+
+						command->SetTransformation(Matrix4x4f::Translation(posX, posY, 0.0f));
+						command->SetLayer(0);
+						ContentResolver::Get().BindSpritePalette(*command, *tileTexture, _tileSet->IsIndexed, 0);
+
+						renderQueue.AddCommand(command);
+					}
+				}
+			}
+		}
+	}
+
+	void MainMenu::RenderTexturedBackground(RenderQueue& renderQueue)
+	{
+		auto target = _texturedBackgroundPass._target.get();
+		if (target == nullptr) {
+			return;
+		}
+
+		Vector4f horizonColor;
+		switch (_preset) {
+			case Preset::Default: horizonColor = Vector4f(0.098f, 0.35f, 1.0f, 0.0f); break;
+			default: horizonColor = Vector4f(0.0f, 0.0f, 0.06f, 1.0f); break;
+		}
+
+		Vector2i viewSize = _canvasBackground->ViewSize;
+		auto command = &_texturedBackgroundPass._outputRenderCommand;
+
+		auto instanceBlock = command->GetInstanceBlock();
+		instanceBlock->GetUniform(Material::TexRectUniformName)->SetFloatValue(1.0f, 0.0f, 1.0f, 0.0f);
+		instanceBlock->GetUniform(Material::SpriteSizeUniformName)->SetFloatValue(static_cast<float>(viewSize.X), static_cast<float>(viewSize.Y));
+		instanceBlock->GetUniform(Material::ColorUniformName)->SetFloatVector(Colorf(1.0f, 1.0f, 1.0f, 1.0f).Data());
+
+		command->GetMaterial().Uniform("uViewSize")->SetFloatValue(static_cast<float>(viewSize.X), static_cast<float>(viewSize.Y));
+		command->GetMaterial().Uniform("uShift")->SetFloatVector(_texturedBackgroundPos.Data());
+		command->GetMaterial().Uniform("uHorizonColor")->SetFloatVector(horizonColor.Data());
+
+		command->SetTransformation(Matrix4x4f::Translation(0.0f, 0.0f, 0.0f));
+		command->GetMaterial().SetTexture(*target);
+
+		renderQueue.AddCommand(command);
+	}
+
+	bool MainMenu::RenderLegacyBackground(RenderQueue& renderQueue)
+	{
+#if defined(WITH_RHI_RDP)
+		/*
+			The form this background takes on the Nintendo 64. The original below repeats each of its
+			three tiles 96 times across one rotated quad far bigger than the screen; the RDP addresses a
+			primitive's texels in 10.5 fixed point (+-1024 texels) through a 4 KB TMEM, so that quad can
+			neither be held in one primitive nor wrap the 128x128 tile (16 KB of CI8 against the 2 KB a
+			paletted texture may use), and it came out as a flat wash of edge colour.
+
+			Same motion, different geometry. The 16 and 32 tiles fit TMEM whole, so each is ONE quad,
+			rotated by the layer's angle and just big enough to cover the view (its diagonal), that
+			repeats the tile in hardware (the backend masks the coordinates of a repeating texture that
+			is resident whole); the layer's rotation about its own drifting pivot becomes a texture-space
+			offset on that quad. The 128 tile is drawn once per period, each period a quad rotated by the
+			layer's angle on the rotated lattice, through the backend's blitter (a rotated rectangle that
+			cannot be resident goes there) - twenty-odd quads for what the view shows.
+		*/
+		auto* res16 = _metadata->FindAnimation(Menu16);
+		auto* res32 = _metadata->FindAnimation(Menu32);
+		auto* res128 = _metadata->FindAnimation(Menu128);
+		if (res16 == nullptr || res32 == nullptr || res128 == nullptr) {
+			return false;
+		}
+
+		const float animTime = _canvasBackground->AnimTime;
+		const Vector2f viewSize = _canvasBackground->ViewSize.As<float>();
+		const Vector2f center = viewSize * 0.5f;
+
+		// One view-covering quad rotated by `angle` about the view's centre, whose texture space is the
+		// layer's: the layer is rotated by the same angle about `pivot`, with a tile corner there.
+		// Rotating about the pivot equals rotating about the centre plus a shift, and a shift of a
+		// periodic pattern is a texture offset: for the quad's local point q (from its centre),
+		// texel = (q + R^-1(centre - pivot)) / period.
+		auto drawRepeating = [this, viewSize, center](GenericGraphicResource* base, float scale, float angle, Vector2f pivot, std::uint16_t layer) {
+			base->TextureDiffuse->SetMinFiltering(SamplerFilter::Nearest);
+			base->TextureDiffuse->SetMagFiltering(SamplerFilter::Nearest);
+			base->TextureDiffuse->SetWrap(SamplerWrapping::Repeat);
+			const Vector2f period = base->FrameDimensions.As<float>() * scale;
+			const float side = sqrtApprox(viewSize.X * viewSize.X + viewSize.Y * viewSize.Y) + 2.0f;
+			float sn, c;
+			sincosApprox(angle, sn, c);
+			const Vector2f d = center - pivot;
+			// R^-1 d for R = RotateZ(angle) = [c -s; s c]
+			const Vector2f shift(d.X * c + d.Y * sn, -d.X * sn + d.Y * c);
+			// Whole periods of the offset are dropped, which keeps the coordinates within the +-1024
+			// texels a primitive may address
+			float offU = (shift.X - side * 0.5f) / period.X, offV = (shift.Y - side * 0.5f) / period.Y;
+			offU -= floorf(offU);
+			offV -= floorf(offV);
+			const Vector4f texCoords(side / period.X, offU, side / period.Y, offV);
+			const bool indexed = ((base->Flags & GenericGraphicResourceFlags::Indexed) == GenericGraphicResourceFlags::Indexed);
+			_canvasBackground->DrawTexture(*base->TextureDiffuse, center - Vector2f(side, side) * 0.5f, layer, Vector2f(side, side), texCoords,
+				Colorf::White, false, angle, indexed ? 0 : -1);
+		};
+
+		// 16
+		{
+			const float scale = 0.6f + 0.04f * sinApprox(animTime * 0.2f);
+			drawRepeating(res16->Base, scale, animTime * -0.2f, center, 100);
+		}
+
+		// 32
+		{
+			const float scale = 0.6f + 0.04f * sinApprox(animTime * 0.2f);
+			Vector2f pivot = center;
+			pivot.X += 96.0f * sinApprox(animTime * 0.37f);
+			pivot.Y += 96.0f * cosApprox(animTime * 0.31f);
+			drawRepeating(res32->Base, scale, animTime * 0.4f, pivot, 110);
+		}
+
+		// 128: one rotated quad per period on the rotated lattice; too big to be resident whole, so the
+		// backend blits each
+		{
+			GenericGraphicResource* base = res128->Base;
+			base->TextureDiffuse->SetMinFiltering(SamplerFilter::Nearest);
+			base->TextureDiffuse->SetMagFiltering(SamplerFilter::Nearest);
+			base->TextureDiffuse->SetWrap(SamplerWrapping::ClampToEdge);
+
+			// A narrower zoom than the original 0.6 +- 0.2, because here the layer's cost IS its period:
+			// the tile cannot be resident, so every quad of it is blitted in eight TMEM-sized chunks at
+			// roughly 450 us, and the smaller the tile the more quads the view holds. The original range
+			// swung the count between 12 and 41 - a menu frame between 36 and 51 ms, visibly uneven -
+			// where this one holds it at 14 to 17, i.e. a steady 40 ms.
+			const float scale = 0.75f + 0.05f * sinApprox(animTime * 0.4f);
+			const float angle = animTime * 0.3f;
+			const Vector2f period = base->FrameDimensions.As<float>() * scale;
+			Vector2f pivot = center;
+			pivot.X += 64.0f * sinApprox(animTime * 0.25f);
+			pivot.Y += 64.0f * cosApprox(animTime * 0.32f);
+			float sn, c;
+			sincosApprox(angle, sn, c);
+			// The view's corners in lattice units (R^-1 about the pivot, over the period) bound the
+			// periods that can show
+			float minI = 1.0e30f, maxI = -1.0e30f, minJ = 1.0e30f, maxJ = -1.0e30f;
+			for (std::int32_t k = 0; k < 4; k++) {
+				const Vector2f d = Vector2f((k & 1) ? viewSize.X : 0.0f, (k & 2) ? viewSize.Y : 0.0f) - pivot;
+				const float i = (d.X * c + d.Y * sn) / period.X, j = (-d.X * sn + d.Y * c) / period.Y;
+				minI = std::min(minI, i); maxI = std::max(maxI, i);
+				minJ = std::min(minJ, j); maxJ = std::max(maxJ, j);
+			}
+			const bool indexed = ((base->Flags & GenericGraphicResourceFlags::Indexed) == GenericGraphicResourceFlags::Indexed);
+			const Vector4f texCoords(1.0f, 0.0f, 1.0f, 0.0f);
+			const float radius = period.X * 0.7072f;
+			for (std::int32_t j = std::int32_t(floorf(minJ)); j < std::int32_t(ceilf(maxJ)); j++) {
+				for (std::int32_t i = std::int32_t(floorf(minI)); i < std::int32_t(ceilf(maxI)); i++) {
+					// The period's centre on screen: pivot + R((i + 0.5, j + 0.5) * period)
+					const float lx = (float(i) + 0.5f) * period.X, ly = (float(j) + 0.5f) * period.Y;
+					const Vector2f quadCenter(pivot.X + lx * c - ly * sn, pivot.Y + lx * sn + ly * c);
+					if (quadCenter.X + radius < 0.0f || quadCenter.X - radius > viewSize.X ||
+						quadCenter.Y + radius < 0.0f || quadCenter.Y - radius > viewSize.Y) {
+						continue;
+					}
+					_canvasBackground->DrawTexture(*base->TextureDiffuse, quadCenter - period * 0.5f, 120, period, texCoords, Colorf::White,
+						false, angle, indexed ? 0 : -1);
+				}
+			}
+		}
+
+		float titleX = (float)(_contentBounds.X + _contentBounds.W / 2);
+		float titleY = _contentBounds.Y - 30;
+		DrawElement(MenuGlow, 0, titleX, titleY, 130, Alignment::Center, Colorf(1.0f, 1.0f, 1.0f, 0.14f),
+			16.0f, 10.0f, true, true);
+
+		return true;
+#else
+		auto* res16 = _metadata->FindAnimation(Menu16);
+		auto* res32 = _metadata->FindAnimation(Menu32);
+		auto* res128 = _metadata->FindAnimation(Menu128);
+		if (res16 == nullptr || res32 == nullptr || res128 == nullptr) {
+			return false;
+		}
+
+		float animTime = _canvasBackground->AnimTime;
+		Vector2f center = (_canvasBackground->ViewSize / 2).As<float>();
+
+		// 16
+		{
+			GenericGraphicResource* base = res16->Base;
+			base->TextureDiffuse->SetMinFiltering(SamplerFilter::Nearest);
+			base->TextureDiffuse->SetMagFiltering(SamplerFilter::Nearest);
+			base->TextureDiffuse->SetWrap(SamplerWrapping::Repeat);
+
+			constexpr float repeats = 96.0f;
+			float scale = (0.6f + 0.04f * sinApprox(animTime * 0.2f)) * repeats;
+			Vector2f size = base->FrameDimensions.As<float>() * scale;
+
+			auto command = _canvasBackground->RentRenderCommand();
+			command->SetType(RenderCommand::Type::TileMap);
+			bool indexed = ((base->Flags & GenericGraphicResourceFlags::Indexed) == GenericGraphicResourceFlags::Indexed);
+			ContentResolver::Get().ConfigureSpriteShader(*command, indexed);
+
+			command->GetMaterial().SetBlendingFactors(BlendingFactor::SrcAlpha, BlendingFactor::OneMinusSrcAlpha);
+
+			auto instanceBlock = command->GetInstanceBlock();
+			instanceBlock->GetUniform(Material::TexRectUniformName)->SetFloatValue(repeats, 0.0f, repeats, 0.0f);
+			instanceBlock->GetUniform(Material::SpriteSizeUniformName)->SetFloatVector(size.Data());
+			instanceBlock->GetUniform(Material::ColorUniformName)->SetFloatVector(Colorf::White.Data());
+
+			Matrix4x4f worldMatrix = Matrix4x4f::Translation(center.X, center.Y, 0.0f);
+			worldMatrix.RotateZ(animTime * -0.2f);
+			worldMatrix.Translate(size.X * -0.5f, size.Y * -0.5f, 0.0f);
+			command->SetTransformation(worldMatrix);
+			command->SetLayer(100);
+			ContentResolver::Get().BindSpritePalette(*command, *base->TextureDiffuse.get(), indexed, 0);
+
+			renderQueue.AddCommand(command);
+		}
+		
+		// 32
+		{
+			GenericGraphicResource* base = res32->Base;
+			base->TextureDiffuse->SetMinFiltering(SamplerFilter::Nearest);
+			base->TextureDiffuse->SetMagFiltering(SamplerFilter::Nearest);
+			base->TextureDiffuse->SetWrap(SamplerWrapping::Repeat);
+
+			constexpr float repeats = 56.0f;
+			float scale = (0.6f + 0.04f * sinApprox(animTime * 0.2f)) * repeats;
+			Vector2f size = base->FrameDimensions.As<float>() * scale;
+
+			Vector2f centerBg = center;
+			centerBg.X += 96.0f * sinApprox(animTime * 0.37f);
+			centerBg.Y += 96.0f * cosApprox(animTime * 0.31f);
+
+			auto command = _canvasBackground->RentRenderCommand();
+			command->SetType(RenderCommand::Type::TileMap);
+			bool indexed = ((base->Flags & GenericGraphicResourceFlags::Indexed) == GenericGraphicResourceFlags::Indexed);
+			ContentResolver::Get().ConfigureSpriteShader(*command, indexed);
+
+			command->GetMaterial().SetBlendingFactors(BlendingFactor::SrcAlpha, BlendingFactor::OneMinusSrcAlpha);
+
+			auto instanceBlock = command->GetInstanceBlock();
+			instanceBlock->GetUniform(Material::TexRectUniformName)->SetFloatValue(repeats, 0.0f, repeats, 0.0f);
+			instanceBlock->GetUniform(Material::SpriteSizeUniformName)->SetFloatVector(size.Data());
+			instanceBlock->GetUniform(Material::ColorUniformName)->SetFloatVector(Colorf::White.Data());
+
+			Matrix4x4f worldMatrix = Matrix4x4f::Translation(centerBg.X, centerBg.Y, 0.0f);
+			worldMatrix.RotateZ(animTime * 0.4f);
+			worldMatrix.Translate(size.X * -0.5f, size.Y * -0.5f, 0.0f);
+			command->SetTransformation(worldMatrix);
+			command->SetLayer(110);
+			ContentResolver::Get().BindSpritePalette(*command, *base->TextureDiffuse.get(), indexed, 0);
+
+			renderQueue.AddCommand(command);
+		}
+		
+		// 128
+		{
+			GenericGraphicResource* base = res128->Base;
+			base->TextureDiffuse->SetMinFiltering(SamplerFilter::Nearest);
+			base->TextureDiffuse->SetMagFiltering(SamplerFilter::Nearest);
+			base->TextureDiffuse->SetWrap(SamplerWrapping::Repeat);
+
+			constexpr float repeats = 20.0f;
+			float scale = (0.6f + 0.2f * sinApprox(animTime * 0.4f)) * repeats;
+			Vector2f size = base->FrameDimensions.As<float>() * scale;
+
+			Vector2f centerBg = center;
+			centerBg.X += 64.0f * sinApprox(animTime * 0.25f);
+			centerBg.Y += 64.0f * cosApprox(animTime * 0.32f);
+
+			auto command = _canvasBackground->RentRenderCommand();
+			command->SetType(RenderCommand::Type::TileMap);
+			bool indexed = ((base->Flags & GenericGraphicResourceFlags::Indexed) == GenericGraphicResourceFlags::Indexed);
+			ContentResolver::Get().ConfigureSpriteShader(*command, indexed);
+
+			command->GetMaterial().SetBlendingFactors(BlendingFactor::SrcAlpha, BlendingFactor::OneMinusSrcAlpha);
+
+			auto instanceBlock = command->GetInstanceBlock();
+			instanceBlock->GetUniform(Material::TexRectUniformName)->SetFloatValue(repeats, 0.0f, repeats, 0.0f);
+			instanceBlock->GetUniform(Material::SpriteSizeUniformName)->SetFloatVector(size.Data());
+			instanceBlock->GetUniform(Material::ColorUniformName)->SetFloatVector(Colorf::White.Data());
+
+			Matrix4x4f worldMatrix = Matrix4x4f::Translation(centerBg.X, centerBg.Y, 0.0f);
+			worldMatrix.RotateZ(animTime * 0.3f);
+			worldMatrix.Translate(size.X * -0.5f, size.Y * -0.5f, 0.0f);
+			command->SetTransformation(worldMatrix);
+			command->SetLayer(120);
+			ContentResolver::Get().BindSpritePalette(*command, *base->TextureDiffuse.get(), indexed, 0);
+
+			renderQueue.AddCommand(command);
+		}
+
+		// The glow sits under the title, so it follows it onto the content bounds' middle; the background art
+		// around it keeps the view's own
+		float titleX = (float)(_contentBounds.X + _contentBounds.W / 2);
+		float titleY = _contentBounds.Y - 30;
+		DrawElement(MenuGlow, 0, titleX, titleY, 130, Alignment::Center, Colorf(1.0f, 1.0f, 1.0f, 0.14f),
+			16.0f, 10.0f, true, true);
+
+		return true;
+#endif
+	}
+
+	void MainMenu::TexturedBackgroundPass::Initialize()
+	{
+		bool notInitialized = (_view == nullptr);
+
+		if (notInitialized) {
+			Vector2i layoutSize = _owner->_texturedBackgroundLayer.LayoutSize;
+			std::int32_t width = layoutSize.X * TileSet::DefaultTileSize;
+			std::int32_t height = layoutSize.Y * TileSet::DefaultTileSize;
+
+			_camera = std::make_unique<Camera>();
+			// Y up, as in TileMap::TexturedBackgroundPass - the textured background shaders read the texture with V
+			// running up the layer
+			_camera->SetOrthoProjection(0, static_cast<float>(width), static_cast<float>(height), 0);
+			_camera->SetView(0, 0, 0, 1);
+			_target = std::make_unique<Texture>(nullptr, Texture::Format::RGB8, width, height);
+			_view = std::make_unique<Viewport>(_target.get(), Viewport::DepthStencilFormat::None);
+			_view->SetRootNode(this);
+			_view->SetCamera(_camera.get());
+			//_view->SetClearMode(Viewport::ClearMode::Never);
+			_target->SetMagFiltering(SamplerFilter::Linear);
+			_target->SetWrap(SamplerWrapping::Repeat);
+
+			// Prepare render commands
+			std::int32_t renderCommandCount = (width * height) / (TileSet::DefaultTileSize * TileSet::DefaultTileSize);
+			_renderCommands.reserve(renderCommandCount);
+			for (std::int32_t i = 0; i < renderCommandCount; i++) {
+				std::unique_ptr<RenderCommand>& command = _renderCommands.emplace_back(std::make_unique<RenderCommand>(RenderCommand::Type::TileMap));
+				command->GetMaterial().SetShaderProgramType(Material::ShaderProgramType::Sprite);
+				command->GetMaterial().ReserveUniformsDataMemory();
+				command->GetGeometry().SetDrawParameters(PrimitiveType::TriangleStrip, 0, 4);
+
+				auto* textureUniform = command->GetMaterial().Uniform(Material::TextureUniformName);
+				if (textureUniform && textureUniform->GetIntValue(0) != 0) {
+					textureUniform->SetIntValue(0); // GL_TEXTURE0
+				}
+			}
+		}
+
+		// Prepare output render command
+		bool shaderChanged = _outputRenderCommand.GetMaterial().SetShader(ContentResolver::Get().GetShader(PreferencesCache::BackgroundDithering ? PrecompiledShader::TexturedBackgroundDither : PrecompiledShader::TexturedBackground));
+		if (shaderChanged) {
+			_outputRenderCommand.GetMaterial().ReserveUniformsDataMemory();
+			_outputRenderCommand.GetGeometry().SetDrawParameters(PrimitiveType::TriangleStrip, 0, 4);
+
+			auto* textureUniform = _outputRenderCommand.GetMaterial().Uniform(Material::TextureUniformName);
+			if (textureUniform && textureUniform->GetIntValue(0) != 0) {
+				textureUniform->SetIntValue(0); // GL_TEXTURE0
+			}
+		}
+
+		Viewport::GetChain().push_back(_view.get());
+	}
+
+	bool MainMenu::TexturedBackgroundPass::OnDraw(RenderQueue& renderQueue)
+	{
+		TileMapLayer& layer = _owner->_texturedBackgroundLayer;
+		Vector2i layoutSize = layer.LayoutSize;
+
+		std::int32_t renderCommandIndex = 0;
+		bool isAnimated = false;
+
+		for (std::int32_t y = 0; y < layoutSize.Y; y++) {
+			for (std::int32_t x = 0; x < layoutSize.X; x++) {
+				LayerTile& tile = layer.Layout[y * layer.LayoutSize.X + x];
+
+				// Rebase into the containing texture chunk (a no-op single-texture lookup normally)
+				std::int32_t tileId = tile.TileID;
+				Texture* tileTexture = _owner->_tileSet->ResolveTextureDiffuse(tileId);
+				if DEATH_UNLIKELY(tileTexture == nullptr) {
+					continue;
+				}
+
+				auto command = _renderCommands[renderCommandIndex++].get();
+				// The menu tileset is indexed too - bake it into the background render target through the palette shader
+				ContentResolver::Get().ConfigureSpriteShader(*command, _owner->_tileSet->IsIndexed);
+
+				Vector2i texSize = tileTexture->GetSize();
+				float texScaleX = TileSet::DefaultTileSize / float(texSize.X);
+				float texBiasX = ((tileId % _owner->_tileSet->TilesPerRow) * float(TileSet::PaddedTileSize) + TileSet::TilePadding) / float(texSize.X);
+				float texScaleY = TileSet::DefaultTileSize / float(texSize.Y);
+				float texBiasY = ((tileId / _owner->_tileSet->TilesPerRow) * float(TileSet::PaddedTileSize) + TileSet::TilePadding) / float(texSize.Y);
+
+				auto instanceBlock = command->GetInstanceBlock();
+				instanceBlock->GetUniform(Material::TexRectUniformName)->SetFloatValue(texScaleX, texBiasX, texScaleY, texBiasY);
+				instanceBlock->GetUniform(Material::SpriteSizeUniformName)->SetFloatValue(TileSet::DefaultTileSize, TileSet::DefaultTileSize);
+				instanceBlock->GetUniform(Material::ColorUniformName)->SetFloatVector(Colorf::White.Data());
+
+				command->SetTransformation(Matrix4x4f::Translation(x * TileSet::DefaultTileSize, y * TileSet::DefaultTileSize, 0.0f));
+				ContentResolver::Get().BindSpritePalette(*command, *tileTexture, _owner->_tileSet->IsIndexed, 0);
+
+				renderQueue.AddCommand(command);
+			}
+		}
+
+		if (!isAnimated && _alreadyRendered) {
+			// If it's not animated, it can be rendered only once
+			auto& chain = Viewport::GetChain();
+			for (std::int32_t i = chain.size() - 1; i >= 0; i--) {
+				auto& item = chain[i];
+				if (item == _view.get()) {
+					chain.erase(&item);
+					break;
+				}
+			}
+		}
+
+		_alreadyRendered = true;
+		return true;
+	}
+}

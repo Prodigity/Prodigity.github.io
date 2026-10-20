@@ -1,0 +1,594 @@
+# Runs the ShaderCompiler test suite:
+#  1. every tests/*.shader --check dump must match tests/expected/<Name>.check.txt byte-for-byte,
+#  2. every tests/errors/*.shader must FAIL with the expected "<line>: error:" + message fragment,
+#  3. emitted-header shape assertions (flat verbatim entry-body splice - no scope braces, no
+#     re-indentation, no custom-mode COLOR init - COLOR as the fragment output, the unnamed
+#     base variant (no "_Base" symbol infix, empty ProgramVariant name), compile-time
+#     stage-conditional resolution, precision directive, three-token precision passthrough,
+#     unused-function elimination, unused-varying trimming (dead-store removal + the demotion
+#     fallback with all its disqualifiers), unused-uniform/block elimination,
+#     constant folding, the "attribute" keyword, the canvas-mode implicit TEXTURE declaration
+#     and the canvas-mode dead COLOR-init elimination with all its disqualifiers).
+# Exit code 0 = all passed.
+
+$ErrorActionPreference = 'Stop'
+
+$testsDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$tool = Join-Path (Split-Path -Parent $testsDir) 'x64\Release\ShaderCompiler.exe'
+if (-not (Test-Path $tool)) {
+    Write-Host "error: ShaderCompiler.exe not found at '$tool' - build Sources/Utilities/ShaderCompiler first"
+    exit 1
+}
+
+$failures = 0
+$passed = 0
+
+function Assert($condition, $message) {
+    if ($condition) {
+        $script:passed++
+    } else {
+        $script:failures++
+        Write-Host "FAIL: $message"
+    }
+}
+
+# --- 1. reflection dumps -------------------------------------------------------------------------
+
+foreach ($shader in Get-ChildItem (Join-Path $testsDir '*.shader')) {
+    $expectedPath = Join-Path $testsDir "expected\$($shader.BaseName).check.txt"
+    $actual = (& $tool $shader.FullName --check | Out-String) -replace "`r`n", "`n"
+    $ok = ($LASTEXITCODE -eq 0) -and (Test-Path $expectedPath) -and
+        ($actual -eq (([System.IO.File]::ReadAllText($expectedPath)) -replace "`r`n", "`n"))
+    Assert $ok "$($shader.BaseName): --check dump mismatch (exit=$LASTEXITCODE)"
+    if ($ok) { Write-Host "ok: $($shader.BaseName)" }
+}
+
+# --- 2. expected errors --------------------------------------------------------------------------
+
+$errorCases = @{
+    'FragColorInBody' = @(8, 'fragColor')
+    'PrecisionInvalid' = @(2, 'unsupported precision')
+    'VertexEarlyReturn' = @(9, 'not allowed in vertex()')
+    'StageDefine' = @(6, 'cannot be defined or undefined')
+    'LowPowerVertexElse' = @(6, 'may only contain varying declarations')
+}
+
+foreach ($shader in Get-ChildItem (Join-Path $testsDir 'errors\*.shader')) {
+    $case = $errorCases[$shader.BaseName]
+    if ($null -eq $case) { Write-Host "FAIL: no expectation registered for errors\$($shader.Name)"; $failures++; continue }
+    # PowerShell 5.1 wraps native stderr lines in ErrorRecords when redirected; relax the
+    # error preference so the expected diagnostic doesn't terminate the runner
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $stderr = (& $tool $shader.FullName --check 2>&1 | Out-String -Width 1024)
+    $ErrorActionPreference = $previousPreference
+    $stderr = $stderr -replace "\s+", " "
+    $ok = ($LASTEXITCODE -ne 0) -and ($stderr.Contains(":$($case[0]): error:")) -and ($stderr.Contains($case[1]))
+    Assert $ok "errors\$($shader.BaseName): expected failure at line $($case[0]) mentioning '$($case[1])' (exit=$LASTEXITCODE)"
+    if ($ok) { Write-Host "ok: errors\$($shader.BaseName)" }
+}
+
+# --- 3. emitted-header shape assertions ----------------------------------------------------------
+
+$tempDir = Join-Path $env:TEMP "ShaderCompilerTests"
+New-Item -ItemType Directory -Force $tempDir | Out-Null
+
+function Get-Source($headerText, $symbol) {
+    $m = [regex]::Match($headerText, "(?s)inline constexpr char $symbol\[\] =\s*R`"__SHDR__\((.*?)\)__SHDR__`";")
+    if (-not $m.Success) { return $null }
+    return $m.Groups[1].Value
+}
+function Emit($name) {
+    $out = Join-Path $tempDir "$name.h"
+    & $tool (Join-Path $testsDir "$name.shader") -o $out | Out-Null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return ([System.IO.File]::ReadAllText($out)) -replace "`r`n", "`n"
+}
+
+# EarlyReturn: the custom-mode body becomes main() VERBATIM (no scope braces, no extra tab,
+# no "COLOR = vec4(1.0);" init - COLOR is undefined until written), COLOR is the fragment
+# output variable itself, and the early return inside fragment() is legal; the base variant
+# is unnamed - no "_Base" symbol infix, and the ProgramVariant initializer's name is ""
+$h = Emit 'EarlyReturn'
+$fs = Get-Source $h 'EarlyReturn_Fs'
+Assert ($null -ne $fs) 'EarlyReturn: FS source missing'
+Assert ($fs.Contains("out vec4 COLOR;")) 'EarlyReturn: FS does not declare COLOR as the output'
+Assert ($fs.Contains("void main() {`n	if (vTexCoords.x < 0.5) {`n		COLOR = vec4(0.0);`n		return;`n	}`n	COLOR = texture(uTexture, vTexCoords);`n}")) 'EarlyReturn: flat verbatim main() shape (no scope block, no epilogue)'
+Assert (-not $fs.Contains('COLOR = vec4(1.0);')) 'EarlyReturn: custom-mode COLOR init still emitted'
+Assert (-not $fs.Contains('void fragment(')) 'EarlyReturn: fragment() wrapper still emitted'
+Assert (-not $h.Contains('fragColor')) 'EarlyReturn: fragColor appears in the emitted header'
+Assert (-not $h.Contains('VERTEX_STAGE') -and -not $h.Contains('FRAGMENT_STAGE')) 'EarlyReturn: stage macros leaked into the emitted header'
+Assert (-not $h.Contains('_Base')) 'EarlyReturn: "_Base" symbol infix still emitted for the unnamed base variant'
+Assert ($h.Contains("{ `"`", `"`",`n#if defined(WITH_RHI_GL) && !defined(RHI_GL_PROFILE_ES2)`n			EarlyReturn_Vs, EarlyReturn_Fs,")) 'EarlyReturn: base ProgramVariant initializer does not carry the empty name (with the GL-gated stage sources)'
+
+# PrecisionHighp: directive selects the GL_ES prologue, three-token statement passes through
+$h = Emit 'PrecisionHighp'
+$fs = Get-Source $h 'PrecisionHighp_Fs'
+$vs = Get-Source $h 'PrecisionHighp_Vs'
+# A "highp" fragment prologue falls back to mediump where the ES implementation has no high
+# precision in the fragment stage, so the prologue is the GL_FRAGMENT_PRECISION_HIGH pair
+Assert ($fs.Contains("#ifdef GL_ES`n#	ifdef GL_FRAGMENT_PRECISION_HIGH`nprecision highp float;`n#	else`nprecision mediump float;`n#	endif`n#endif")) 'PrecisionHighp: FS prologue is not the highp/mediump GL_FRAGMENT_PRECISION_HIGH pair'
+Assert (([regex]::Matches($fs, [regex]::Escape('precision highp float;'))).Count -eq 2) 'PrecisionHighp: three-token passthrough missing from FS globals'
+Assert ($vs.Contains("precision highp float;")) 'PrecisionHighp: three-token passthrough missing from VS globals'
+
+# DeadFunctions: FS-only helpers vanish from the VS (transitively), VS-only helper vanishes from
+# the FS, unused helper vanishes from both, used helpers survive; stage-guarded declarations are
+# resolved at compile time (attribute only in VS, sampler only in FS, no stage macros anywhere)
+$h = Emit 'DeadFunctions'
+$vs = Get-Source $h 'DeadFunctions_Vs'
+$fs = Get-Source $h 'DeadFunctions_Fs'
+Assert ($vs.Contains('vec2 vsHelper(vec2 p)')) 'DeadFunctions: vsHelper missing from VS'
+Assert (-not $vs.Contains('fsHelper')) 'DeadFunctions: fsHelper not eliminated from VS'
+Assert (-not $vs.Contains('fsInner')) 'DeadFunctions: fsInner not eliminated from VS (transitive)'
+Assert (-not $vs.Contains('unusedHelper')) 'DeadFunctions: unusedHelper not eliminated from VS'
+Assert ($fs.Contains('float fsHelper(float v)')) 'DeadFunctions: fsHelper missing from FS'
+Assert ($fs.Contains('float fsInner(float v)')) 'DeadFunctions: fsInner missing from FS'
+Assert (-not $fs.Contains('unusedHelper')) 'DeadFunctions: unusedHelper not eliminated from FS'
+Assert (-not $fs.Contains('vsHelper')) 'DeadFunctions: vsHelper not eliminated from FS'
+Assert ($vs.Contains('in vec2 aPosition;')) 'DeadFunctions: VS lost its stage-guarded attribute'
+Assert (-not $fs.Contains('aPosition')) 'DeadFunctions: VS-guarded attribute leaked into FS'
+Assert ($fs.Contains('uniform sampler2D uTexture;')) 'DeadFunctions: FS lost its stage-guarded sampler'
+Assert (-not $vs.Contains('uniform sampler2D')) 'DeadFunctions: FS-guarded sampler leaked into VS'
+Assert (-not $h.Contains('VERTEX_STAGE') -and -not $h.Contains('FRAGMENT_STAGE')) 'DeadFunctions: stage macros leaked into the emitted header'
+
+# CanvasVertex: canvas vertex() body spliced VERBATIM (source indentation, no scope block)
+# between the template prologue locals and the epilogue; the FS defaults COLOR (the output
+# variable) to the instance color, with the body following directly; the named WAVE variant
+# keeps its "_WAVE" symbol infix while the base variant carries none
+$h = Emit 'CanvasVertex'
+$vs = Get-Source $h 'CanvasVertex_Vs'
+$fs = Get-Source $h 'CanvasVertex_Fs'
+Assert (-not $vs.Contains('void vertex(')) 'CanvasVertex: vertex() wrapper still emitted'
+Assert ($vs.Contains("	highp float PALETTE_OFFSET = palOffset;`n`n#ifdef WAVE`n	VERTEX += vec2(0.0, sin(UV.x * 6.28318) * uAmplitude);`n#endif`n	vOrigin = VERTEX;`n`n	gl_Position = ")) 'CanvasVertex: verbatim vertex body between prologue and epilogue'
+Assert ($fs.Contains('out vec4 COLOR;')) 'CanvasVertex: FS does not declare COLOR as the output'
+Assert ($fs.Contains("void main() {`n	COLOR = vColor;`n	vec4 c = texture(uTexture, vTexCoords);")) 'CanvasVertex: FS default is not the instance color (or the body is not verbatim after it)'
+Assert (-not $h.Contains('fragColor')) 'CanvasVertex: fragColor appears in the emitted header'
+Assert ($null -ne (Get-Source $h 'CanvasVertex_WAVE_Vs') -and $null -ne (Get-Source $h 'CanvasVertex_WAVE_Fs')) 'CanvasVertex: named WAVE variant lost its symbol infix'
+Assert ($h.Contains("{ `"WAVE`", `"WAVE`",`n#if defined(WITH_RHI_GL) && !defined(RHI_GL_PROFILE_ES2)`n			CanvasVertex_WAVE_Vs, CanvasVertex_WAVE_Fs,")) 'CanvasVertex: named WAVE ProgramVariant initializer changed'
+Assert (-not $h.Contains('_Base')) 'CanvasVertex: "_Base" symbol infix still emitted for the unnamed base variant'
+# Unused-varying trimming: the template vPaletteOffset is never read here — its FS "in" is
+# removed and, because its only VS occurrence is the pure epilogue store, the VS declaration
+# AND the store are removed outright (dead-store removal, no demotion); the read varying
+# vOrigin keeps its flat/highp qualifiers in both stages
+Assert (-not $fs.Contains('vPaletteOffset')) 'CanvasVertex: unused template vPaletteOffset not trimmed from FS'
+Assert (-not $vs.Contains('vPaletteOffset')) 'CanvasVertex: template vPaletteOffset declaration/store not fully removed from VS'
+Assert ($vs.Contains("	vColor = COLOR;`n}")) 'CanvasVertex: epilogue shape after the vPaletteOffset store removal changed'
+Assert ($vs.Contains('flat out highp vec2 vOrigin;')) 'CanvasVertex: read varying vOrigin lost its VS qualifiers'
+Assert ($fs.Contains('flat in highp vec2 vOrigin;')) 'CanvasVertex: read varying vOrigin lost its FS declaration'
+
+# StageGuards: compile-time resolution of #ifdef/#ifndef VERTEX_STAGE|FRAGMENT_STAGE (+#else) and
+# of the "#if" expression spelling, nested in both directions; unknown conditionals (#ifdef TINT)
+# pass through textually, and an expression mixing a stage macro with an unknown one keeps its
+# conditional and loses only the stage macro
+$h = Emit 'StageGuards'
+$vs = Get-Source $h 'StageGuards_Vs'
+$fs = Get-Source $h 'StageGuards_Fs'
+Assert ($null -ne $vs -and $null -ne $fs) 'StageGuards: sources missing'
+Assert ($vs.Contains("in vec2 aPosition;`nin vec2 aTexCoords;")) 'StageGuards: VS lost its attributes'
+Assert ($vs.Contains('uniform vec2 uVertexOnly;')) 'StageGuards: VS lost the #ifndef FRAGMENT_STAGE branch'
+Assert (-not $vs.Contains('uniform sampler2D uTexture;')) 'StageGuards: #else branch leaked into VS'
+Assert ($vs.Contains("#ifdef TINT`nuniform vec2 uTintShift;`n#endif")) 'StageGuards: unknown conditional inside a VS stage guard not preserved'
+Assert ($vs.Contains("#ifdef TINT`nuniform float uTintStrength;`n#endif")) 'StageGuards: stage guard inside #ifdef TINT not resolved in VS'
+Assert (-not $vs.Contains('uTintColor')) 'StageGuards: FS-only declaration inside #ifdef TINT leaked into VS'
+Assert ($fs.Contains('uniform sampler2D uTexture;')) 'StageGuards: FS lost the #else branch'
+Assert (-not $fs.Contains('uVertexOnly')) 'StageGuards: #ifndef FRAGMENT_STAGE branch leaked into FS'
+Assert ($fs.Contains("#ifdef TINT`nuniform vec4 uTintColor;`nuniform float uTintStrength;`n#endif")) 'StageGuards: stage guard inside #ifdef TINT not resolved in FS'
+Assert (-not $fs.Contains('uTintShift')) 'StageGuards: VS-only block leaked into FS'
+Assert ($vs.Contains('uniform vec2 uVertexExpr;') -and -not $vs.Contains('#if VERTEX_STAGE')) 'StageGuards: "#if VERTEX_STAGE && !FRAGMENT_STAGE" not resolved in the VS'
+Assert (-not $fs.Contains('uVertexExpr')) 'StageGuards: "#if VERTEX_STAGE && !FRAGMENT_STAGE" block leaked into the FS'
+Assert ($fs.Contains("#ifdef TINT`nuniform vec3 uTintExpr;`n#endif")) 'StageGuards: "#if FRAGMENT_STAGE && TINT" not folded and lowered down to "#ifdef TINT" in the FS'
+Assert (-not $vs.Contains('uTintExpr')) 'StageGuards: "#if FRAGMENT_STAGE && TINT" block leaked into the VS'
+Assert (-not $fs.Contains('aPosition') -and -not $fs.Contains('aTexCoords')) 'StageGuards: attributes leaked into FS'
+Assert (-not $h.Contains('VERTEX_STAGE') -and -not $h.Contains('FRAGMENT_STAGE')) 'StageGuards: stage macros leaked into the emitted header'
+
+# VaryingTrim: unread user varyings are removed from the FS; in the VS every occurrence of
+# each unread name is a provably-pure dead store (standalone statement, pure RHS), so the
+# declarations AND the stores are removed outright (dead-store removal — the 3.7-B demotion
+# is only the fallback, exercised by VaryingDemote below). Covers the plain store, the
+# flat/highp declaration, the stage-guarded VS-only "out" with no FS "in" at all, and
+# swizzled targets with whitelisted constructor/builtin calls (commas inside call argument
+# lists are allowed); read varyings survive untouched
+$h = Emit 'VaryingTrim'
+$vs = Get-Source $h 'VaryingTrim_Vs'
+$fs = Get-Source $h 'VaryingTrim_Fs'
+Assert ($null -ne $vs -and $null -ne $fs) 'VaryingTrim: sources missing'
+Assert ($vs.Contains('out vec2 vUsed;')) 'VaryingTrim: read varying vUsed lost its VS out'
+Assert ($fs.Contains('in vec2 vUsed;')) 'VaryingTrim: read varying vUsed lost its FS in'
+Assert ($vs.Contains('	vUsed = aTexCoords;')) 'VaryingTrim: the read varying lost its VS store'
+Assert (-not $vs.Contains('vUnused') -and -not $fs.Contains('vUnused')) 'VaryingTrim: vUnused declaration/store not fully removed'
+Assert (-not $vs.Contains('vFlat') -and -not $fs.Contains('vFlat')) 'VaryingTrim: vFlat declaration/store not fully removed (flat/highp handling)'
+Assert (-not $vs.Contains('flat ')) 'VaryingTrim: a flat qualifier survived'
+Assert (-not $vs.Contains('vGuardedOnly')) 'VaryingTrim: stage-guarded VS-only out (or its store) not fully removed'
+Assert (-not $vs.Contains('vSwizzled')) 'VaryingTrim: swizzled-target stores with whitelisted calls not removed'
+Assert ($vs.Contains("void main()`n{`n	vUsed = aTexCoords;`n	gl_Position = uProjectionMatrix * vec4(aPosition, 0.0, 1.0);`n}")) 'VaryingTrim: VS main() shape after dead-store removal changed'
+
+# VaryingDemote: the demotion FALLBACK — each disqualifier keeps the 3.7-B behavior for the
+# whole name (declaration demoted to a plain global, ALL stores kept — no partial removal):
+# a user-function call in the RHS (vCallRhs), a store as an unbraced "else" body (vElseBody),
+# a name READ elsewhere in the VS (vReadBack), and a nested assignment in the RHS (vNested,
+# whose "(t = 2.0)" side effect must survive). The read varying vUsed is untouched
+$h = Emit 'VaryingDemote'
+$vs = Get-Source $h 'VaryingDemote_Vs'
+$fs = Get-Source $h 'VaryingDemote_Fs'
+Assert ($null -ne $vs -and $null -ne $fs) 'VaryingDemote: sources missing'
+Assert ($vs.Contains('out vec2 vUsed;')) 'VaryingDemote: read varying vUsed lost its VS out'
+Assert ($fs.Contains('in vec2 vUsed;')) 'VaryingDemote: read varying vUsed lost its FS in'
+Assert ($vs.Contains("`nfloat vCallRhs;")) 'VaryingDemote: user-call RHS did not fall back to demotion'
+Assert ($vs.Contains('	vCallRhs = shade(aPosition.x);')) 'VaryingDemote: user-call store was removed'
+Assert ($vs.Contains("`nfloat vElseBody;")) 'VaryingDemote: unbraced-else store did not fall back to demotion'
+Assert ($vs.Contains('	else vElseBody = aPosition.y;')) 'VaryingDemote: unbraced-else store was removed'
+Assert ($vs.Contains("`nfloat vReadBack;")) 'VaryingDemote: VS-read name did not fall back to demotion'
+Assert ($vs.Contains('	vReadBack = aPosition.x;')) 'VaryingDemote: store of a VS-read name was removed'
+Assert ($vs.Contains("`nfloat vNested;")) 'VaryingDemote: nested-assignment RHS did not fall back to demotion'
+Assert ($vs.Contains('	vNested = (t = 2.0);')) 'VaryingDemote: nested-assignment store was removed (side effect lost)'
+Assert (-not $fs.Contains('vCallRhs') -and -not $fs.Contains('vElseBody') -and -not $fs.Contains('vReadBack') -and -not $fs.Contains('vNested')) 'VaryingDemote: unread FS ins not removed'
+Assert (-not $vs.Contains('out float')) 'VaryingDemote: a demoted declaration kept its out qualifier'
+
+# ConstFold: literal-only subexpressions collapse with exact GLSL semantics — int/float never
+# mix, int division truncates, overflow skips, floats fold only when "%.9g" round-trips and is
+# not longer than the original, ".0" is appended, constructor arguments fold individually, and
+# global-scope declarations never fold (reflection safety)
+$h = Emit 'ConstFold'
+$vs = Get-Source $h 'ConstFold_Vs'
+$fs = Get-Source $h 'ConstFold_Fs'
+Assert ($null -ne $vs -and $null -ne $fs) 'ConstFold: sources missing'
+Assert ($fs.Contains('float a = 7.0;')) 'ConstFold: float chain 2.0 * 3.0 + 1.0 not folded'
+Assert ($fs.Contains('int b = 3;')) 'ConstFold: int division 10 / 3 not folded (truncation)'
+Assert ($fs.Contains('int c = -8;')) 'ConstFold: 7 % 3 - 9 not folded'
+Assert ($fs.Contains('float d = 1 / 255.0;')) 'ConstFold: mixed int/float expression was folded'
+Assert ($fs.Contains('float e = a * 2.0 + 1.0;')) 'ConstFold: identifier-containing expression was folded'
+Assert ($fs.Contains('int f = 2000000000 + 2000000000;')) 'ConstFold: int overflow was folded'
+Assert ($fs.Contains('vec2 g = vec2(3.0, 3.0);')) 'ConstFold: constructor argument not folded'
+Assert ($fs.Contains('float h = 0.25;')) 'ConstFold: 1.0 / 4.0 not folded (%.9g formatting)'
+Assert ($fs.Contains('float i2 = 6.0;')) 'ConstFold: ".0" not appended to a whole-number float'
+Assert ($fs.Contains('float j = 1.0 / 3.0;')) 'ConstFold: non-round-trippable float was folded'
+Assert ($fs.Contains('float k = 1.0 / 8192.0;')) 'ConstFold: longer-than-original fold was applied'
+Assert ($fs.Contains('uint m = 2u + 3u;')) 'ConstFold: unsigned literals were folded'
+Assert ($fs.Contains(', 0.0, 0.5, 1.0);')) 'ConstFold: 1.0 - 0.5 not folded inside constructor arguments'
+Assert ($fs.Contains('const float kGlobal = 1.0 + 2.0;')) 'ConstFold: global-scope declaration was folded (reflection hazard)'
+Assert ($vs.Contains('aPosition * 1.0')) 'ConstFold: parenthesized (2.0 * 0.5) not folded in VS'
+
+# Attribute: the "attribute" keyword emits a vertex-stage-only "in" global; a leading
+# layout(...) qualifier stays in front of the "in" keyword; nothing is emitted in the FS
+$h = Emit 'Attribute'
+$vs = Get-Source $h 'Attribute_Vs'
+$fs = Get-Source $h 'Attribute_Fs'
+Assert ($null -ne $vs -and $null -ne $fs) 'Attribute: sources missing'
+Assert ($vs.Contains("in vec2 aPosition;")) 'Attribute: VS lost the plain attribute'
+Assert ($vs.Contains("layout(location = 3) in vec4 aColor;")) 'Attribute: VS lost the layout-qualified attribute (layout must precede "in")'
+Assert (-not $fs.Contains('aPosition') -and -not $fs.Contains('aColor')) 'Attribute: attributes leaked into FS'
+
+# ImplicitTexture: a canvas document referencing TEXTURE without declaring uTexture gets
+# "uniform sampler2D uTexture;" auto-declared in the FS globals (texture unit 0 is asserted
+# by the check dump); the template VS carries no user globals, so no sampler appears there
+$h = Emit 'ImplicitTexture'
+$vs = Get-Source $h 'ImplicitTexture_Vs'
+$fs = Get-Source $h 'ImplicitTexture_Fs'
+$bfs = Get-Source $h 'BatchedImplicitTexture_Fs'
+Assert ($null -ne $vs -and $null -ne $fs -and $null -ne $bfs) 'ImplicitTexture: sources missing'
+Assert (([regex]::Matches($fs, [regex]::Escape('uniform sampler2D uTexture;'))).Count -eq 1) 'ImplicitTexture: FS must auto-declare uTexture exactly once'
+Assert (([regex]::Matches($bfs, [regex]::Escape('uniform sampler2D uTexture;'))).Count -eq 1) 'ImplicitTexture: batched FS must auto-declare uTexture exactly once'
+Assert (-not $vs.Contains('uniform sampler2D')) 'ImplicitTexture: sampler leaked into the template VS'
+Assert ($fs.Contains('texture(uTexture, vTexCoords + uPixelOffset)')) 'ImplicitTexture: TEXTURE/UV not substituted in the body'
+# The body is "COLOR = texture(...) * COLOR;" - the right-hand side reads the default back,
+# so the dead-init elimination must NOT fire here
+Assert ($fs.Contains("void main() {`n	COLOR = vColor;")) 'ImplicitTexture: COLOR init dropped although the assignment RHS reads COLOR'
+
+# CanvasTinted: an explicit uTexture declaration wins over the implicit one - the FS carries
+# exactly one declaration, nothing is auto-added
+$h = Emit 'CanvasTinted'
+$fs = Get-Source $h 'Tinted_Fs'
+Assert (([regex]::Matches($fs, [regex]::Escape('uniform sampler2D uTexture;'))).Count -eq 1) 'CanvasTinted: explicit uTexture declaration must win (exactly one declaration)'
+
+# UniformTrim: unused-uniform/block elimination (loose uniforms, dead defines, the standalone
+# "#ifndef X/#define X/#endif" fallback trio and the reflection-preservation rule):
+#  - the FS-only sampler + the multi-name "uniform vec2 uPair, uOther;" drop from the VS
+#    (uPair is read by the FS, so the FS keeps the WHOLE multi-name declaration - conservative)
+#  - the VS-only matrices, InstanceBlock, uLights and its LIGHT_COUNT fallback trio drop from
+#    the FS (the trio dies as a unit once uLights is gone - no empty guard survives)
+#  - uUnusedBoth is referenced in NEITHER stage and must stay in BOTH (reflection preservation;
+#    the check dump above already asserted it still reflects)
+#  - the dead function-like DEAD_SCALE define drops from both stages, the live LIVE_BIAS define
+#    stays in the FS (and drops from the VS, where nothing references it)
+$h = Emit 'UniformTrim'
+$vs = Get-Source $h 'UniformTrim_Vs'
+$fs = Get-Source $h 'UniformTrim_Fs'
+Assert ($null -ne $vs -and $null -ne $fs) 'UniformTrim: sources missing'
+Assert ($vs.Contains('uniform mat4 uProjectionMatrix;')) 'UniformTrim: VS lost uProjectionMatrix'
+Assert ($vs.Contains('layout (std140) uniform InstanceBlock')) 'UniformTrim: VS lost InstanceBlock'
+Assert ($vs.Contains("#ifndef LIGHT_COUNT`n	#define LIGHT_COUNT 2`n#endif")) 'UniformTrim: VS lost the LIGHT_COUNT fallback trio (uLights is alive there)'
+Assert ($vs.Contains('uniform vec4 uLights[LIGHT_COUNT];')) 'UniformTrim: VS lost uLights'
+Assert (-not $vs.Contains('uniform sampler2D')) 'UniformTrim: FS-only sampler not eliminated from VS'
+Assert (-not $vs.Contains('uPair')) 'UniformTrim: FS-only multi-name declaration not eliminated from VS'
+Assert (-not $vs.Contains('DEAD_SCALE') -and -not $vs.Contains('LIVE_BIAS')) 'UniformTrim: dead defines not eliminated from VS'
+Assert (-not $fs.Contains('uProjectionMatrix') -and -not $fs.Contains('uViewMatrix')) 'UniformTrim: VS-only matrices not eliminated from FS'
+Assert (-not $fs.Contains('InstanceBlock') -and -not $fs.Contains('modelMatrix')) 'UniformTrim: VS-only block not eliminated from FS'
+Assert (-not $fs.Contains('uLights') -and -not $fs.Contains('LIGHT_COUNT')) 'UniformTrim: uLights + its fallback trio not eliminated from FS'
+Assert ($fs.Contains('uniform sampler2D uTexture;')) 'UniformTrim: FS lost its sampler'
+Assert ($fs.Contains('uniform vec2 uPair, uOther;')) 'UniformTrim: FS lost the multi-name declaration (conservative keep when ANY name is read)'
+Assert ($vs.Contains('uniform float uUnusedBoth;')) 'UniformTrim: uUnusedBoth eliminated from VS (must stay - unused in BOTH stages)'
+Assert ($fs.Contains('uniform float uUnusedBoth;')) 'UniformTrim: uUnusedBoth eliminated from FS (must stay - unused in BOTH stages)'
+Assert (-not $fs.Contains('DEAD_SCALE')) 'UniformTrim: dead function-like define not eliminated from FS'
+Assert ($fs.Contains('#define LIVE_BIAS(x) ((x) + 0.125)')) 'UniformTrim: live function-like define eliminated from FS'
+
+# UniformTrimBatched: the batched-sprite shape (shared globals, no stage guards) regains the
+# minimal per-stage declaration sets automatically - the FS drops the "#define i" chain, then
+# InstancesBlock (with the in-block BATCH_SIZE fallback trio), then "struct Instance" and the
+# matrices; the VS keeps all of them (and its BATCH_SIZE trio) and drops only the FS sampler
+$h = Emit 'UniformTrimBatched'
+$vs = Get-Source $h 'UniformTrimBatched_Vs'
+$fs = Get-Source $h 'UniformTrimBatched_Fs'
+Assert ($null -ne $vs -and $null -ne $fs) 'UniformTrimBatched: sources missing'
+Assert ($vs.Contains('struct Instance')) 'UniformTrimBatched: VS lost struct Instance'
+Assert ($vs.Contains('layout (std140) uniform InstancesBlock')) 'UniformTrimBatched: VS lost InstancesBlock'
+Assert ($vs.Contains("#ifndef BATCH_SIZE`n	#define BATCH_SIZE (682) // 64 Kb / 96 b`n#endif")) 'UniformTrimBatched: VS lost the BATCH_SIZE fallback trio (its block survives there)'
+Assert ($vs.Contains('#define i block.instances[gl_VertexID / 6]')) 'UniformTrimBatched: VS lost the "#define i" accessor'
+Assert (-not $vs.Contains('uniform sampler2D')) 'UniformTrimBatched: FS-only sampler not eliminated from VS'
+Assert (-not $fs.Contains('#define i')) 'UniformTrimBatched: dead "#define i" not eliminated from FS'
+Assert (-not $fs.Contains('InstancesBlock') -and -not $fs.Contains('instances')) 'UniformTrimBatched: VS-only InstancesBlock not eliminated from FS'
+Assert (-not $fs.Contains('BATCH_SIZE')) 'UniformTrimBatched: in-block BATCH_SIZE fallback trio survived the FS block removal'
+Assert (-not $fs.Contains('struct Instance') -and -not $fs.Contains('modelMatrix')) 'UniformTrimBatched: dead struct Instance not eliminated from FS'
+Assert (-not $fs.Contains('uProjectionMatrix') -and -not $fs.Contains('uViewMatrix')) 'UniformTrimBatched: VS-only matrices not eliminated from FS'
+Assert ($fs.Contains('uniform sampler2D uTexture;')) 'UniformTrimBatched: FS lost its sampler'
+
+# CanvasInit*: dead canvas COLOR-init elimination. The "COLOR = vColor;" default is dropped
+# IFF the body's FIRST whole-identifier COLOR occurrence is an unconditional (preprocessor
+# depth 0), top-level (brace depth 0) FULL plain assignment whose right-hand side does not
+# read COLOR back, with no "return" before it. CanvasInitDead qualifies (init absent, body
+# follows main() directly; the unread vColor varying is then trimmed too); every disqualifier
+# keeps the init: read-before-write, partial write ("COLOR.a ="), compound op ("COLOR *="),
+# first write inside #ifdef, first write inside an if block, "return" before the first write,
+# comparison "COLOR ==" as the first occurrence
+$h = Emit 'CanvasInitDead'
+$fs = Get-Source $h 'CanvasInitDead_Fs'
+Assert ($null -ne $fs) 'CanvasInitDead: FS source missing'
+Assert (-not $fs.Contains('COLOR = vColor;')) 'CanvasInitDead: dead COLOR init still emitted'
+Assert ($fs.Contains("void main() {`n	vec4 c = texture(uTexture, vTexCoords);")) 'CanvasInitDead: body does not follow main() directly'
+Assert (-not $fs.Contains('vColor')) 'CanvasInitDead: unread vColor varying not trimmed after the init removal'
+
+foreach ($name in @('CanvasInitReadFirst', 'CanvasInitPartialWrite', 'CanvasInitCompound', 'CanvasInitIfdef', 'CanvasInitBraced', 'CanvasInitReturn', 'CanvasInitCompare')) {
+    $h = Emit $name
+    $fs = Get-Source $h "${name}_Fs"
+    Assert ($null -ne $fs -and $fs.Contains("void main() {`n	COLOR = vColor;")) "${name}: disqualified body lost the COLOR init"
+}
+
+# TexturePassthrough: custom mode never substitutes TEXTURE and never auto-declares -
+# TEXTURE stays an ordinary user identifier (here a sampler, unit from the texture_unit hint)
+$h = Emit 'TexturePassthrough'
+$fs = Get-Source $h 'TexturePassthrough_Fs'
+Assert ($fs.Contains('uniform sampler2D TEXTURE;')) 'TexturePassthrough: user TEXTURE sampler declaration missing from FS'
+Assert ($fs.Contains('texture(TEXTURE, vTexCoords)')) 'TexturePassthrough: TEXTURE was substituted in custom mode'
+Assert (-not $h.Contains('uTexture')) 'TexturePassthrough: uTexture auto-declaration leaked into custom mode'
+
+# --- 4. ESSL 100 (OpenGL ES 2.0) target -----------------------------------------------------------
+# The --essl100-check transform dump: attribute/varying split per stage, texture->texture2D,
+# the "out vec4 COLOR;" -> gl_FragColor retarget (incl. early "return;"), the unconditional
+# precision prologue, layout()/flat stripping, and the lowering of gl_VertexID (-> the
+# aQuadCorner / aInstanceIndex attributes) and std140 UBOs (-> loose uniforms / a uniform array)
+# (fixtures live in tests/essl100/, outside the section-1 golden-dump scan).
+
+function Essl100($path) {
+    (& $tool $path --essl100-check | Out-String -Width 4096) -replace "`r`n", "`n"
+}
+function Get-Essl100Stage($dump, $stage) {
+    # Extracts one stage section of a single-variant program dump ('vertex' or 'fragment')
+    if ($stage -eq 'vertex') {
+        return [regex]::Match($dump, "(?s)--- vertex \(essl100\) ---\n(.*?)\n--- fragment").Groups[1].Value
+    }
+    return [regex]::Match($dump, "(?s)--- fragment \(essl100\) ---\n(.*)").Groups[1].Value
+}
+
+# Textured: non-batched textured shader - the attribute/varying split per stage, the layout()
+# qualifier stripped to a plain attribute, texture()->texture2D(), the gl_FragColor epilogue and
+# the unconditional mediump precision prologue
+$d = Essl100 (Join-Path $testsDir 'essl100\Textured.shader')
+$vs = Get-Essl100Stage $d 'vertex'
+$fs = Get-Essl100Stage $d 'fragment'
+Assert ($vs.Contains('attribute vec2 aPosition;')) 'Essl100 Textured: VS "in" not turned into "attribute"'
+Assert ($vs.Contains('attribute vec2 aTexCoords;') -and -not $vs.Contains('layout')) 'Essl100 Textured: layout-qualified attribute not stripped to a plain attribute'
+Assert ($vs.Contains('varying vec2 vTexCoords;')) 'Essl100 Textured: VS "out" not turned into "varying"'
+Assert ($vs.Contains('uniform mat4 uProjectionMatrix;')) 'Essl100 Textured: VS uniform changed'
+Assert ($fs.Contains('precision mediump float;') -and -not $fs.Contains('#ifdef GL_ES')) 'Essl100 Textured: FS precision prologue not made unconditional'
+Assert ($fs.Contains('varying vec2 vTexCoords;')) 'Essl100 Textured: FS "in" not turned into "varying"'
+Assert (-not $fs.Contains('out vec4 COLOR;')) 'Essl100 Textured: FS "out vec4 COLOR;" not removed'
+Assert ($fs.Contains('vec4 COLOR;')) 'Essl100 Textured: FS local COLOR not declared in main()'
+Assert ($fs.Contains('texture2D(uTexture, vTexCoords)')) 'Essl100 Textured: texture() not rewritten to texture2D()'
+Assert ($fs.Contains('gl_FragColor = COLOR;')) 'Essl100 Textured: gl_FragColor epilogue missing'
+
+# VaryingEarlyReturn: the highp precision directive, a highp varying preserved through both stages,
+# the early "return;" retargeted, and textureLod()->texture2DLod()
+$d = Essl100 (Join-Path $testsDir 'essl100\VaryingEarlyReturn.shader')
+$vs = Get-Essl100Stage $d 'vertex'
+$fs = Get-Essl100Stage $d 'fragment'
+Assert ($vs.Contains('attribute vec2 aPosition;')) 'Essl100 Varying: VS attribute missing'
+Assert ($vs.Contains('varying highp vec2 vTexCoords;')) 'Essl100 Varying: VS highp varying not preserved'
+Assert ($fs.Contains('precision highp float;')) 'Essl100 Varying: highp precision directive not honored'
+Assert ($fs.Contains('varying highp vec2 vTexCoords;')) 'Essl100 Varying: FS highp varying not preserved'
+Assert ($fs.Contains('gl_FragColor = COLOR; return;')) 'Essl100 Varying: early "return;" not retargeted to gl_FragColor'
+Assert ($fs.Contains('texture2DLod(uTexture, vTexCoords, 0.0)')) 'Essl100 Varying: textureLod() not rewritten to texture2DLod()'
+Assert ((([regex]::Matches($fs, [regex]::Escape('gl_FragColor = COLOR;'))).Count) -ge 2) 'Essl100 Varying: expected both the early-return and the final gl_FragColor writes'
+
+# BatchedSprites: a std140-UBO + gl_VertexID batched program now fully lowers to ES2 — the
+# std140 block becomes a uniform struct-array indexed by the aInstanceIndex attribute, and the
+# gl_VertexID corner synthesis becomes the aQuadCorner attribute; the fragment stage transforms too
+$d = Essl100 (Join-Path $testsDir 'BatchedSprites.shader')
+$vs = Get-Essl100Stage $d 'vertex'
+$fs = Get-Essl100Stage $d 'fragment'
+Assert ($vs.Contains('attribute vec2 aQuadCorner;') -and $vs.Contains('attribute float aInstanceIndex;')) 'Essl100 BatchedSprites: VS corner/instance attributes missing'
+Assert ($vs.Contains('uniform Instance instances[BATCH_SIZE];') -and $vs.Contains('#define i instances[int(aInstanceIndex)]')) 'Essl100 BatchedSprites: std140 block not lowered to a uniform array'
+Assert (-not $vs.Contains('layout (std140)') -and -not $vs.Contains('gl_VertexID')) 'Essl100 BatchedSprites: VS still carries an ES2-unsupported construct'
+Assert ($fs.Contains('texture2D(uTexture, vTexCoords)')) 'Essl100 BatchedSprites: FS texture() not rewritten'
+Assert ($fs.Contains('gl_FragColor = COLOR;') -and -not $fs.Contains('out vec4 COLOR;')) 'Essl100 BatchedSprites: FS COLOR not retargeted to gl_FragColor'
+
+# TexturePassthrough: a gl_VertexID-only (no UBO) program now lowers its VS corner synthesis to the
+# aQuadCorner attribute; the fragment stage transforms regardless
+$d = Essl100 (Join-Path $testsDir 'TexturePassthrough.shader')
+$vs = Get-Essl100Stage $d 'vertex'
+$fs = Get-Essl100Stage $d 'fragment'
+Assert ($vs.Contains('attribute vec2 aQuadCorner;') -and -not $vs.Contains('gl_VertexID')) 'Essl100 TexturePassthrough: VS gl_VertexID not lowered to the corner attribute'
+Assert ($fs.Contains('texture2D(TEXTURE, vTexCoords)') -and $fs.Contains('gl_FragColor = COLOR;')) 'Essl100 TexturePassthrough: FS not transformed'
+
+# --- software (GlslToCpp) emission: primary-texel fast path -------------------------------------
+# The transpiler emits swTexturePrimary(in, N) for the exact `texture(uTexture, vTexCoords)` pattern
+# (the software rasterizer's gather has already fetched that texel into in.rgba); every other sample
+# (an offset UV, a computed UV, or a sampler that is not the device's primary "uTexture") must keep
+# the generic swTexture(in, N, uv) re-sample.
+$swOut = Join-Path $tempDir 'SwGenerated.h'
+& $tool --emit-sw-generated $swOut (Join-Path $testsDir 'Sprite.shader') (Join-Path $testsDir 'TexturePassthrough.shader') | Out-Null
+$swText = [System.IO.File]::ReadAllText($swOut)
+Assert ($swText.Contains('swTexturePrimary(in, 0)')) 'SwEmission: texture(uTexture, vTexCoords) not lowered to the primary-texel fast path'
+Assert (-not $swText.Contains('swTexture(in, 0, vec2(in.u, in.v))')) 'SwEmission: the primary sample still re-samples through swTexture()'
+Assert ($swText.Contains('swTexture(in, 2, vec2(in.u, in.v))')) 'SwEmission: a non-primary sampler (TEXTURE, unit 2) must keep the generic swTexture()'
+Assert (($swText.IndexOf('swTexturePrimary') -eq $swText.LastIndexOf('swTexturePrimary'))) 'SwEmission: swTexturePrimary emitted for a sampler other than uTexture'
+
+# --- software-only varyings: a global-scope SOFTWARE_RENDERER conditional around varying
+# declarations selects per-backend declarations (spelled "#if !SOFTWARE_RENDERER" here, "#ifndef
+# SOFTWARE_RENDERER" in the bodies - both spellings must be recognized). The GL/ES2/HLSL/SPIR-V
+# emissions must carry only the non-software branch (and never the macro itself); the SW transpile
+# must see the software branch and lower the per-instance-constant varying through
+# ComputeVaryings/the uniforms struct.
+$h = Emit 'SwVarying'
+$vs = Get-Source $h 'SwVarying_Vs'
+$fs = Get-Source $h 'SwVarying_Fs'
+Assert ($null -ne $vs -and $null -ne $fs) 'SwVarying: sources missing'
+Assert ($vs.Contains('out vec2 vPos;') -and $vs.Contains('vPos = aPosition * vec2(2.0) - vec2(1.0);')) 'SwVarying: GL VS lost the non-software varying/store'
+Assert ($fs.Contains('in vec2 vPos;') -and $fs.Contains('vec2 pos = vPos;')) 'SwVarying: GL FS lost the non-software varying/read'
+Assert (-not $h.Contains('vRect')) 'SwVarying: software-only varying leaked into the emitted header'
+Assert (-not $h.Contains('SOFTWARE_RENDERER')) 'SwVarying: SOFTWARE_RENDERER macro leaked into the emitted header'
+$swOut2 = Join-Path $tempDir 'SwGeneratedVarying.h'
+& $tool --emit-sw-generated $swOut2 (Join-Path $testsDir 'SwVarying.shader') | Out-Null
+$swText2 = [System.IO.File]::ReadAllText($swOut2)
+Assert ($swText2.Contains('io->vRect = (*reinterpret_cast<const vec4*>(instanceBlock + 80));')) 'SwVarying: SW ComputeVaryings does not fill the constant varying from the instance block'
+Assert ($swText2.Contains('unis->vRect.xy()')) 'SwVarying: SW fragment does not read the constant varying from the uniforms struct'
+Assert (-not $swText2.Contains('vPos')) 'SwVarying: non-software branch leaked into the SW transpile'
+
+# --- low-power varyings: the same global-scope conditional spelled with LOW_POWER_GPU ("#if" form here)
+# tags the varyings of a cheaper path that moves work from the fragment stage to the vertex stage. Only the
+# ESSL 100 (and Cg) emission may carry them, and a uniform that only the low-power branch of the vertex
+# stage reads (uTime) must not be declared in the vertex stage of any other emission - there it would be
+# an extra member of the HLSL cbuffer / MSL argument struct - nor in the low-power fragment stage, which no
+# longer reads it, while the fragment stage of every other emission keeps it
+$h = Emit 'LowPowerVarying'
+$vs = Get-Source $h 'LowPowerVarying_Vs'
+$fs = Get-Source $h 'LowPowerVarying_Fs'
+$vs100 = Get-Source $h 'LowPowerVarying_Vs100'
+$fs100 = Get-Source $h 'LowPowerVarying_Fs100'
+Assert ($null -ne $vs -and $null -ne $fs -and $null -ne $vs100 -and $null -ne $fs100) 'LowPowerVarying: sources missing'
+Assert (-not $vs.Contains('vPhase') -and -not $fs.Contains('vPhase')) 'LowPowerVarying: low-power varying leaked into the GL stages'
+Assert (-not $vs.Contains('uTime')) 'LowPowerVarying: uniform read only by the low-power branch still declared in the GL VS'
+Assert ($fs.Contains('uniform float uTime;') -and $fs.Contains('sin((vTexCoords.y * 3.0 + uTime) * 6.2831853)')) 'LowPowerVarying: GL FS lost the default branch'
+Assert ($vs100.Contains('varying vec2 vPhase;') -and $vs100.Contains('vPhase = vec2(vTexCoords.y * 3.0 + uTime, 0.0);')) 'LowPowerVarying: ES2 VS lost the low-power varying/store'
+Assert ($fs100.Contains('varying vec2 vPhase;') -and $fs100.Contains('sinCycles(vPhase.x)')) 'LowPowerVarying: ES2 FS lost the low-power varying/read'
+Assert (-not $fs100.Contains('uTime')) 'LowPowerVarying: uniform the low-power FS no longer reads still declared there'
+Assert (-not $h.Contains('LOW_POWER_GPU')) 'LowPowerVarying: LOW_POWER_GPU macro leaked into the emitted header'
+
+# --- low-power canvas vertex(): the vertex() entry of a canvas_item shader inside a global-scope LOW_POWER_GPU
+# conditional. Only the ESSL 100 (and Cg) emission may run it; every other emission keeps the default vertex
+# template - the exact text the shader would get with no vertex() at all - so their backends see no change.
+# On the other side of the conditional the entry is an error (errors\LowPowerVertexElse.shader).
+$h = Emit 'LowPowerCanvasVertex'
+$vs = Get-Source $h 'LowPowerCanvasVertex_Vs'
+$fs = Get-Source $h 'LowPowerCanvasVertex_Fs'
+$vs100 = Get-Source $h 'LowPowerCanvasVertex_Vs100'
+$fs100 = Get-Source $h 'LowPowerCanvasVertex_Fs100'
+Assert ($null -ne $vs -and $null -ne $fs -and $null -ne $vs100 -and $null -ne $fs100) 'LowPowerCanvasVertex: sources missing'
+Assert ($vs.Contains('vec4 position = vec4(aPosition.x * spriteSize.x, aPosition.y * spriteSize.y, 0.0, 1.0);') -and -not $vs.Contains('VERTEX')) 'LowPowerCanvasVertex: GL VS is not the default template'
+Assert (-not $vs.Contains('vShifted') -and -not $vs.Contains('uOffset')) 'LowPowerCanvasVertex: low-power vertex() leaked into the GL VS'
+Assert ($fs.Contains('texture(uTexture, vTexCoords + uOffset)') -and -not $fs.Contains('vShifted')) 'LowPowerCanvasVertex: GL FS lost the default branch'
+Assert ($vs100.Contains('vShifted = UV + uOffset;') -and $vs100.Contains('vTexCoords = UV;')) 'LowPowerCanvasVertex: ES2 VS lost the vertex() body or its epilogue'
+Assert ($fs100.Contains('texture2D(uTexture, vShifted)') -and -not $fs100.Contains('uOffset')) 'LowPowerCanvasVertex: ES2 FS lost the low-power read'
+Assert (-not $h.Contains('LOW_POWER_GPU')) 'LowPowerCanvasVertex: LOW_POWER_GPU macro leaked into the emitted header'
+
+# --- BackendConditionals: "#if"/"#elif" expressions over SOFTWARE_RENDERER/NO_DYNAMIC_BRANCHING.
+# An expression naming only those is RESOLVED (its directive lines disappear with the losing
+# branch); one that also names a macro the pass does not own keeps its conditional and loses only
+# the backend macros, so neither name can reach a compiler that would read it as undefined.
+$h = Emit 'BackendConditionals'
+$fs = Get-Source $h 'BackendConditionals_Fs'
+$fsDither = Get-Source $h 'BackendConditionals_DITHER_Fs'
+Assert ($null -ne $fs -and $null -ne $fsDither) 'BackendConditionals: sources missing'
+Assert ($fs.Contains("	if (uTint.w > 0.0) {")) 'BackendConditionals: "#if !SOFTWARE_RENDERER && !NO_DYNAMIC_BRANCHING" body missing from the GL FS'
+Assert (-not $fs.Contains('#if !')) 'BackendConditionals: the resolved conditional left its directive lines behind'
+Assert ($fs.Contains("#ifdef DITHER`n	c.rgb += vec3(0.01);`n#endif")) 'BackendConditionals: "#if DITHER && !SOFTWARE_RENDERER" not folded and lowered down to "#ifdef DITHER"'
+Assert ($fs.Contains("#if defined(DITHER) && defined(MISSING_FLAG)`n	c.rgb += vec3(0.02);`n#endif")) 'BackendConditionals: a two-flag expression must keep its shape with each flag wrapped in defined(...)'
+Assert (-not $fs.Contains('#if DITHER') -and -not $fs.Contains('&& MISSING_FLAG')) 'BackendConditionals: a bare flag left in an emitted #if - GLSL ES rejects an undefined macro there'
+Assert ($fs.Contains('c.rgb = c.rgb * c.rgb;') -and -not $fs.Contains('clamp')) 'BackendConditionals: "#if defined(SOFTWARE_RENDERER)" did not resolve to its #else side'
+Assert (-not $h.Contains('SOFTWARE_RENDERER') -and -not $h.Contains('NO_DYNAMIC_BRANCHING')) 'BackendConditionals: a backend macro leaked into the emitted header'
+$swOut3 = Join-Path $tempDir 'SwGeneratedBackend.h'
+& $tool --emit-sw-generated $swOut3 (Join-Path $testsDir 'BackendConditionals.shader') | Out-Null
+$swText3 = [System.IO.File]::ReadAllText($swOut3)
+Assert ($swText3.Contains('clamp')) 'BackendConditionals: the SW transpile did not take the "#if defined(SOFTWARE_RENDERER)" side'
+Assert (-not $swText3.Contains('0.01')) 'BackendConditionals: "#if DITHER && !SOFTWARE_RENDERER" survived into the SW transpile'
+Assert (-not $swText3.Contains('SOFTWARE_RENDERER')) 'BackendConditionals: a backend macro leaked into the SW transpile'
+
+# --- MultiOutput: multiple fragment outputs (MRT) across the offline targets ----------------------
+# The render-target contract: fragment "out" declarations map to render targets in DECLARATION ORDER
+# of the emitted stage source (user-declared extras precede the tool-appended COLOR). The GL source
+# carries both declarations verbatim; the Vulkan GLSL assigns layout(location = 0..N); the HLSL maps
+# the same order to SV_Target0..N through a PsOutput struct (a single output keeps the plain
+# "PSMain(...) : SV_Target" shape - asserted all over section 3 above). ES2 (only gl_FragColor) and
+# the software rasterizer (single color target) cannot express MRT and must DECLINE with a clear
+# diagnostic instead of silently mangling the extra output.
+$h = Emit 'MultiOutput'
+$fs = Get-Source $h 'MultiOutput_Fs'
+Assert ($null -ne $fs) 'MultiOutput: FS source missing'
+Assert ($fs.Contains('out vec4 NORMAL;') -and $fs.Contains('out vec4 COLOR;')) 'MultiOutput: GL FS must carry both out declarations'
+Assert ($fs.IndexOf('out vec4 NORMAL;') -lt $fs.IndexOf('out vec4 COLOR;')) 'MultiOutput: user-declared out must precede the tool-appended COLOR'
+
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$vk = (& $tool (Join-Path $testsDir 'MultiOutput.shader') --vulkan 2>&1 | Out-String -Width 4096) -replace "`r`n", "`n"
+$hl = (& $tool (Join-Path $testsDir 'MultiOutput.shader') --hlsl 2>&1 | Out-String -Width 4096) -replace "`r`n", "`n"
+$es = (& $tool (Join-Path $testsDir 'MultiOutput.shader') --essl100-check 2>&1 | Out-String -Width 4096) -replace "`r`n", "`n"
+$ErrorActionPreference = $previousPreference
+Assert ($vk.Contains('layout(location = 0) out vec4 NORMAL;')) 'MultiOutput: Vulkan GLSL did not assign location 0 to the first declared output'
+Assert ($vk.Contains('layout(location = 1) out vec4 COLOR;')) 'MultiOutput: Vulkan GLSL did not assign location 1 to the second declared output (COLOR)'
+Assert ($hl.Contains('float4 NORMAL : SV_Target0;') -and $hl.Contains('float4 COLOR : SV_Target1;')) 'MultiOutput: HLSL did not map the outputs to SV_Target0/SV_Target1 in declaration order'
+Assert ($hl.Contains('PsOutput PSMain(PsInput _input)') -and $hl.Contains('return _output;')) 'MultiOutput: HLSL multi-output entry does not return the PsOutput struct'
+Assert (-not $hl.Contains(': SV_Target`n')) 'MultiOutput: the single-output SV_Target return shape leaked into the multi-output entry'
+Assert ($es.Contains('multiple fragment outputs')) 'MultiOutput: ESSL100 did not decline the multi-output fragment stage'
+Assert (-not $es.Contains('NORMAL =')) 'MultiOutput: ESSL100 emitted a mangled fragment stage instead of declining'
+
+$swOut3 = Join-Path $tempDir 'SwGeneratedMultiOut.h'
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$swMsg = (& $tool --emit-sw-generated $swOut3 (Join-Path $testsDir 'MultiOutput.shader') 2>&1 | Out-String -Width 4096)
+$ErrorActionPreference = $previousPreference
+$swText3 = [System.IO.File]::ReadAllText($swOut3)
+Assert ($swMsg.Contains("declined: MultiOutput") -and $swMsg.Contains("fragment output 'NORMAL' is unsupported")) 'MultiOutput: SW transpile did not decline with the MRT diagnostic'
+Assert (-not $swText3.Contains('MultiOutput_Fragment')) 'MultiOutput: a fragment function for the declined shader leaked into the SW header'
+
+# --- fixed_function: a pipeline binding WITH passes, uniform_float, and the SamplesTexture analysis --
+
+$ffOut = Join-Path $tempDir 'PvrPipelinePasses.h'
+& $tool --emit-fixed-function pvr $ffOut (Join-Path $testsDir 'fixedfunction\PipelinePasses.shader') | Out-Null
+Assert ($LASTEXITCODE -eq 0) 'PipelinePasses: --emit-fixed-function pvr failed'
+$ff = [System.IO.File]::ReadAllText($ffOut)
+# The whole point: ONE entry carrying both the stage and a function, which used to be mutually exclusive
+Assert ($ff -match '\{ "PipelinePasses", "",[^\n]*FixedFunctionIntrinsic::LightingCombine, &PipelinePasses_Effect \}') `
+    'PipelinePasses: the table row does not carry both the LightingCombine stage and the effect function'
+Assert ($ff.Contains('UniformFloat(ctx, "uLevel")')) 'PipelinePasses: uniform_float() did not lower to the UniformFloat bridge'
+Assert ($ff.Contains('ctx.SubmitStripShaded(p, 4)')) 'PipelinePasses: the shaded strip was not emitted'
+# An effect that only submits shaded strips never samples, so the dispatch must not require a texture
+# for it - the program declares uTexture purely for the fragment stage the console tiers never run
+$ffRow = ([regex]'\{ "PipelinePasses", "",[^\n]*').Match($ff).Value
+Assert (-not $ffRow.Contains('SamplesTexture')) 'PipelinePasses: a shaded-strip-only effect must not claim SamplesTexture'
+Assert ($ffRow.Contains('NeedsStripBuilder') -and $ffRow.Contains('NeedsQuadAxes') -and $ffRow.Contains('NeedsUniforms')) `
+    'PipelinePasses: the strip-builder / quad-axes / uniform requirements were not recorded'
+
+$previousPreference = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+$ffErr = (& $tool --emit-fixed-function pvr (Join-Path $tempDir 'PvrNotFirst.h') (Join-Path $testsDir 'fixedfunction\PipelineNotFirst.shader') 2>&1 | Out-String -Width 4096)
+$ffErrExit = $LASTEXITCODE
+$ErrorActionPreference = $previousPreference
+Assert ($ffErrExit -ne 0) 'PipelineNotFirst: a pipeline binding after a pass should be rejected'
+Assert ($ffErr.Contains('must be the first statement')) "PipelineNotFirst: unexpected diagnostic: $ffErr"
+
+Write-Host ''
+if ($failures -eq 0) {
+    Write-Host "All tests passed ($passed assertions)."
+    exit 0
+} else {
+    Write-Host "$failures FAILURE(S), $passed passed."
+    exit 1
+}

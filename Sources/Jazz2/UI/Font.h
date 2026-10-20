@@ -1,0 +1,135 @@
+﻿#pragma once
+
+#include "Canvas.h"
+#include "FontFormat.h"
+#include "../../nCine/Primitives/Colorf.h"
+#include "../../nCine/Primitives/Rect.h"
+#include "../../nCine/Base/HashMap.h"
+#include "../../nCine/Graphics/Texture.h"
+
+#include <IO/Stream.h>
+
+using namespace nCine;
+
+namespace Jazz2::UI
+{
+	/**
+		@brief Bitmap font renderer
+		
+		The renderer loads a bitmap font from a custom file format with full Unicode support and renders it to a canvas.
+		It can also measure the size of a string without rendering it.
+
+		@section Jazz2-UI-Font-format Text formatting
+
+		The renderer supports inline text formatting using the @cpp "\f[…]" @ce notation. Unknown attributes are ignored.
+		Following attributes are supported:
+		-   @cpp "\f[c:#RRGGBB]" @ce --- Sets the font color that can be specified in a hex value in RGB format
+		    - The game usually renders text using a colorization shader that uses a different color space to be able
+			  to change the text color more precisely, so the specified color must be adjusted accordingly
+		-   @cpp "\f[/c]" @ce --- Resets the font color
+		-   @cpp "\f[w:XX]" @ce --- Sets the character spacing as a percentage, recommended range is 80% to 120%
+		-   @cpp "\f[/w]" @ce --- Resets the character spacing
+
+	*/
+	class Font
+	{
+	public:
+		/** @{ @name Constants */
+
+		/** @brief Default (yellow) font color */
+		static constexpr Colorf DefaultColor = Colorf(333.0f, 333.0f, 333.0f, 1.0f);
+		/** @brief Default (yellow) font color with 60% transparency */
+		static constexpr Colorf TransparentDefaultColor = Colorf(333.0f, 333.0f, 333.0f, 0.6f);
+		/** @brief Random (rainbow) font color */
+		static constexpr Colorf RandomColor = Colorf(444.0f, 444.0f, 444.0f, 0.5f);
+		/** @brief Random (rainbow) font color with 60% transparency */
+		static constexpr Colorf TransparentRandomColor = Colorf(444.0f, 444.0f, 444.0f, 0.36f);
+		/**
+			@brief Whether text is drawn with a shadow under it
+
+			A shadowed string goes out twice - a faint black copy offset below it first, then the text
+			itself - so the shadow costs as much as the text does. The Nintendo 64 leaves it out: every glyph
+			there is a render command of its own and a textured rectangle with its own TMEM upload, and the
+			shadows were close to half of a text-heavy menu frame (measured in ares: 118 to 74 ms on the
+			first-run screen, 38 to 28 ms on the main menu). Every shadow draw is guarded by this, so where
+			it is off none of that work is done at all.
+		*/
+#if defined(DEATH_TARGET_N64)
+		static constexpr bool ShadowsEnabled = false;
+#else
+		static constexpr bool ShadowsEnabled = true;
+#endif
+
+		/** @} */
+
+		/**
+		 * @brief Creates a new instance by loading a bitmap font from the specified path
+		 *
+		 * @param s        Stream the bitmap font is read from, which can also be a file inside a `.pak`
+		 * @param path     Path the stream was opened from, used in messages and as the texture name
+		 * @param palette  Palette used to colorize the font
+		 */
+		Font(const std::unique_ptr<Death::IO::Stream>& s, StringView path, const std::uint32_t* palette);
+
+		/** @brief Returns font size in pixels */
+		std::int32_t GetSizeInPixels() const;
+		/** @brief Returns font ascent in pixels */
+		std::int32_t GetAscentInPixels() const;
+		/** @brief Returns size of a single character */
+		Vector2f MeasureChar(char32_t c) const;
+		/** @brief Returns size of a string */
+		Vector2f MeasureString(StringView text, float scale = 1.0f, float charSpacing = 1.0f, float lineSpacing = 1.0f);
+		/** @brief Returns size of a string and its cumulative widths */
+		Vector2f MeasureStringEx(StringView text, float scale, float charSpacing, float maxWidth, std::int32_t* charFit, float* charFitWidths);
+		/** @brief Draws a string */
+		void DrawString(Canvas* canvas, StringView text, std::int32_t& charOffset, float x, float y, std::uint16_t z, Alignment align, Colorf color, float scale = 1.0f, float angleOffset = 0.0f, float varianceX = 4.0f, float varianceY = 4.0f, float speed = 0.4f, float charSpacing = 1.0f, float lineSpacing = 1.0f);
+
+		/** @brief Strips formatting from the specified text */
+		static String StripFormatting(StringView text);
+
+		/**
+		 * @brief Sets how the glyphs are filtered when drawn larger than they are
+		 *
+		 * Linear by default. Nearest keeps text drawn at a whole multiple of its size crisp, which the level editor
+		 * wants for its interface. A font is loaded again when the palette changes, with the default filter.
+		 */
+		void SetMagnificationFilter(SamplerFilter filter);
+
+		/**
+		 * @brief Whether the atlas holds palette indices instead of baked colors
+		 *
+		 * A backend that samples a paletted texture keeps the atlas as the indices it was authored with and
+		 * resolves the colors from the live palette texture at draw time; everywhere else the palette is
+		 * baked into the atlas when the font is loaded. Only a baked atlas goes stale when the palette
+		 * changes, which is what @ref ContentResolver decides from - reloading an indexed font would cost
+		 * a whole atlas and change nothing about how it draws.
+		 */
+		inline bool IsPaletteIndexed() const {
+			return _paletteIndexed;
+		}
+
+	private:
+		static constexpr Colorf RandomColors[] = {
+			Colorf(0.4f, 0.55f, 0.85f, 0.5f),
+			Colorf(0.7f, 0.45f, 0.42f, 0.5f),
+			Colorf(0.58f, 0.48f, 0.38f, 0.5f),
+			Colorf(0.25f, 0.45f, 0.3f, 0.5f),
+			Colorf(0.7f, 0.42f, 0.7f, 0.5f),
+			Colorf(0.44f, 0.44f, 0.8f, 0.5f),
+			Colorf(0.54f, 0.54f, 0.54f, 0.5f),
+			Colorf(0.62f, 0.44f, 0.34f, 0.5f),
+			Colorf(0.56f, 0.50f, 0.42f, 0.5f),
+		};
+
+		FontFormat::Glyph _asciiChars[128];
+		HashMap<std::uint32_t, FontFormat::Glyph> _unicodeChars;
+		/** @brief How far one line of text sits below the previous one */
+		std::int32_t _lineHeight;
+		std::int32_t _baseSpacing;
+		std::unique_ptr<Texture> _texture;
+		bool _paletteIndexed;
+
+		/** @brief Returns the glyph of the specified character, or the placeholder if the font doesn't have it */
+		const FontFormat::Glyph& GetGlyph(char32_t c) const;
+	};
+}

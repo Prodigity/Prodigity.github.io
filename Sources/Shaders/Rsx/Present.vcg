@@ -1,0 +1,20 @@
+// Built-in present shader of the RSX backend (vertex stage).
+//
+// Draws the intermediate screen surface as a full-screen quad into the display buffer. Both are top-down,
+// like every surface the RHI renders (see RhiFwd.h), and the quad's vertex data (see
+// RsxDevice::CreateBuiltinResources) maps the surface's top row onto the display's, so this stage is a
+// plain pass-through.
+//
+// Not generated from a .shader file: it has no GLSL counterpart because no other backend needs it.
+void main
+(
+	float2 aPosition : POSITION,
+	float2 aTexCoords : TEXCOORD0,
+
+	out float4 ePosition : POSITION,
+	out float2 vTexCoords : TEXCOORD0
+)
+{
+	ePosition = float4(aPosition.x, aPosition.y, 0.0f, 1.0f);
+	vTexCoords = aTexCoords;
+}

@@ -1,0 +1,672 @@
+#include "RemapControlsSection.h"
+#include "MenuResources.h"
+#include "../Font.h"
+#include "../../PreferencesCache.h"
+
+#include "../../../nCine/Application.h"
+#include "../../../nCine/I18n.h"
+#include "../../../nCine/Base/FrameTimer.h"
+#include "../../../nCine/Input/JoyMapping.h"
+
+#include <algorithm>
+#include <cstring>
+
+using namespace Jazz2::UI::Menu::Resources;
+
+namespace Jazz2::UI::Menu
+{
+	// Row height matching the original section (ItemHeight = 40)
+	static constexpr float RowHeight = 40 * 5 / 8;	// 25
+
+	// Scale of an action name, from its width at the default scale of 0.8 - long names are drawn smaller
+	static float GetNameScale(float width)
+	{
+		return (width > 120.0f ? (width > 150.0f ? 0.68f : 0.72f) : 0.8f);
+	}
+
+	RemapControlsSection::RemapControlsSection(std::int32_t playerIndex)
+		: _layout{}, _widestName(0.0f), _selectedColumn(0), _playerIndex(playerIndex), _timeout(0.0f), _hintAnimation(0.0f),
+			_animation(0.0f), _isDirty(false), _waitForInput(false), _waitForInputPrev(false), _list(nullptr)
+	{
+	}
+
+	RemapControlsSection::~RemapControlsSection()
+	{
+		if (_isDirty) {
+			_isDirty = false;
+			PreferencesCache::Save();
+		}
+	}
+
+	void RemapControlsSection::OnShow(IMenuContainer* root)
+	{
+		MenuSection::OnShow(root);
+
+		if (_content != nullptr) {
+			return;
+		}
+
+		struct ActionDef { PlayerAction Type; String Name; };
+		SmallVector<ActionDef, 0> defs;
+		// TRANSLATORS: Menu item in Options > Controls > Remap Controls section
+		defs.push_back({ PlayerAction::Left, _("Left") });
+		// TRANSLATORS: Menu item in Options > Controls > Remap Controls section
+		defs.push_back({ PlayerAction::Right, _("Right") });
+		// TRANSLATORS: Menu item in Options > Controls > Remap Controls section
+		defs.push_back({ PlayerAction::Up, _("Up") });
+		// TRANSLATORS: Menu item in Options > Controls > Remap Controls section
+		defs.push_back({ PlayerAction::Down, _("Down") });
+		// TRANSLATORS: Menu item in Options > Controls > Remap Controls section
+		defs.push_back({ PlayerAction::Buttstomp, _("Buttstomp") });
+		// TRANSLATORS: Menu item in Options > Controls > Remap Controls section
+		defs.push_back({ PlayerAction::Fire, _("Fire") });
+		// TRANSLATORS: Menu item in Options > Controls > Remap Controls section
+		defs.push_back({ PlayerAction::Jump, _("Jump") });
+		// TRANSLATORS: Menu item in Options > Controls > Remap Controls section
+		defs.push_back({ PlayerAction::Run, _("Run") });
+		// TRANSLATORS: Menu item in Options > Controls > Remap Controls section
+		defs.push_back({ PlayerAction::ChangeWeapon, _("Change Weapon") });
+		// TRANSLATORS: Menu item in Options > Controls > Remap Controls section
+		defs.push_back({ PlayerAction::Menu, _("Back") });
+		// TRANSLATORS: Menu item in Options > Controls > Remap Controls section
+		defs.push_back({ PlayerAction::Console, _("Toggle Console") });
+		for (std::int32_t i = 0; i <= (std::int32_t)PlayerAction::SwitchToThunderbolt - (std::int32_t)PlayerAction::SwitchToBlaster; i++) {
+			// TRANSLATORS: Menu item in Options > Controls > Remap Controls section
+			defs.push_back({ (PlayerAction)((std::int32_t)PlayerAction::SwitchToBlaster + i), _f("Weapon {}", i + 1) });
+		}
+
+		auto list = std::make_unique<ScrollView>();
+		for (const auto& def : defs) {
+			std::int32_t row = (std::int32_t)_actions.size();
+			_actions.push_back(def.Type);
+
+			float nameWidth = root->MeasureString(def.Name, 0.8f).X;
+			_widestName = std::max(_widestName, nameWidth * GetNameScale(nameWidth) / 0.8f);
+
+			PlayerAction type = def.Type;
+			String name = def.Name;
+
+			auto* item = list->Add<CanvasWidget>(RowHeight);
+			item->OnDrawContent = [this, type, name](IMenuContainer* r, Canvas* canvas, const Rectf& bounds, std::int32_t& charOffset, bool selected, float animation) {
+				DrawRow(r, canvas, bounds, charOffset, selected, type, name);
+			};
+			item->OnActivate = [this, row]() {
+				if (row == (std::int32_t)PlayerAction::Menu && _selectedColumn == 0) {
+					return;
+				}
+				StartCapture();
+			};
+			item->OnSelectedChanged = [this, row]() {
+				ClampColumn(row);
+				_animation = 0.0f;
+			};
+			item->OnTouch = [this, row](Vector2i touchPos) {
+				HandleTap(row, touchPos);
+			};
+		}
+		_list = list.get();
+
+		SetContent(std::move(list));
+	}
+
+	void RemapControlsSection::OnUpdate(float timeMult)
+	{
+		bool waitingForInput = _waitForInput;
+
+		if (_animation < 1.0f) {
+			_animation = std::min(_animation + timeMult * 0.016f, 1.0f);
+		}
+		if (_hintAnimation < 1.0f) {
+			_hintAnimation = std::min(_hintAnimation + timeMult * 0.1f, 1.0f);
+		}
+
+		if (waitingForInput) {
+			std::int32_t row = GetSelectedRow();
+			PlayerAction action = (row >= 0 && row < (std::int32_t)_actions.size() ? _actions[row] : PlayerAction::Count);
+
+			if (_timeout <= 0.0f) {
+				_root->PlaySfx("MenuSelect"_s, 0.5f);
+				_waitForInput = false;
+				_waitForInputPrev = true;
+				return;
+			}
+
+			_timeout -= timeMult;
+
+			auto& input = theApplication().GetInputManager();
+			MappingTarget newTarget;
+			const JoyMappedState* joyStates[ControlScheme::MaxConnectedGamepads];
+			std::int32_t joyStatesCount = 0;
+			for (std::uint32_t i = 0; i < JoyMapping::MaxNumJoysticks && joyStatesCount < std::int32_t(arraySize(joyStates)) && waitingForInput; i++) {
+				if (input.isJoyMapped(i)) {
+					joyStates[joyStatesCount] = &input.joyMappedState(i);
+					auto& prevState = _joyStatesLast[joyStatesCount];
+					auto& currentState = *joyStates[joyStatesCount];
+
+					for (std::int32_t j = 0; j < JoyMappedState::NumButtons && waitingForInput; j++) {
+						bool wasPressed = prevState.isButtonPressed((ButtonName)j);
+						bool isPressed = currentState.isButtonPressed((ButtonName)j);
+						if (isPressed != wasPressed && isPressed) {
+							newTarget = ControlScheme::CreateTarget(joyStatesCount, (ButtonName)j);
+							PlayerAction collidingAction;
+							std::int32_t collidingAssignment;
+							if (!HasCollision(action, newTarget, collidingAction, collidingAssignment)) {
+								waitingForInput = false;
+							} else if (collidingAction == action && collidingAssignment == _selectedColumn) {
+								// Button has collision, but it's the same as it's already assigned
+								_root->PlaySfx("MenuSelect"_s, 0.5f);
+								_waitForInput = false;
+								_waitForInputPrev = true;
+								return;
+							}
+						}
+					}
+
+					for (std::int32_t j = 0; j < JoyMappedState::NumAxes && waitingForInput; j++) {
+						float prevValue = prevState.axisValue((AxisName)j);
+						float currentValue = currentState.axisValue((AxisName)j);
+						bool wasPressed = std::abs(prevValue) > 0.5f;
+						bool isPressed = std::abs(currentValue) > 0.5f;
+						if (isPressed != wasPressed && isPressed) {
+							newTarget = ControlScheme::CreateTarget(joyStatesCount, (AxisName)j, currentValue < 0.0f);
+							PlayerAction collidingAction;
+							std::int32_t collidingAssignment;
+							if (!HasCollision(action, newTarget, collidingAction, collidingAssignment)) {
+								waitingForInput = false;
+							} else if (collidingAction == action && collidingAssignment == _selectedColumn) {
+								// Axis has collision, but it's the same as it's already assigned
+								_root->PlaySfx("MenuSelect"_s, 0.5f);
+								_waitForInput = false;
+								_waitForInputPrev = true;
+								return;
+							}
+						}
+					}
+
+					prevState = currentState;
+					joyStatesCount++;
+				}
+			}
+
+			if (!waitingForInput) {
+				auto& mapping = ControlScheme::GetMappings(_playerIndex)[(std::int32_t)action];
+				if (_selectedColumn < mapping.Targets.size()) {
+					mapping.Targets[_selectedColumn] = newTarget;
+				} else {
+					mapping.Targets.push_back(newTarget);
+				}
+
+				_isDirty = true;
+				_waitForInput = false;
+				_waitForInputPrev = true;
+				_root->PlaySfx("MenuSelect"_s, 0.5f);
+				_root->ApplyPreferencesChanges(ChangedPreferencesType::ControlScheme);
+			}
+			return;
+		}
+
+		_waitForInputPrev = false;
+
+		// The widget tree handles Up/Down (row + scroll), Fire (start capture) and Menu (back)
+		WidgetSection::OnUpdate(timeMult);
+
+		// Column navigation and assignment removal are bespoke (skip if a capture just started)
+		if (!_waitForInput) {
+			std::int32_t row = GetSelectedRow();
+			if (row < 0) {
+				return;
+			}
+			auto mapping = ControlScheme::GetMappings(_playerIndex);
+			if (_root->ActionHit(PlayerAction::ChangeWeapon)) {
+				if (!(row == (std::int32_t)PlayerAction::Menu && _selectedColumn == 0)) {
+					if (_selectedColumn < mapping[row].Targets.size()) {
+						mapping[row].Targets.erase(_selectedColumn);
+						_isDirty = true;
+						_root->PlaySfx("MenuSelect"_s, 0.5f);
+						_root->ApplyPreferencesChanges(ChangedPreferencesType::ControlScheme);
+					}
+				}
+			} else if (_root->ActionHit(PlayerAction::Left)) {
+				_root->PlaySfx("MenuSelect"_s, 0.5f);
+				_animation = 0.0f;
+				if (_selectedColumn > 0) {
+					_selectedColumn--;
+				} else {
+					_selectedColumn = std::min((std::int32_t)mapping[row].Targets.size(), MaxTargetCount - 1);
+				}
+			} else if (_root->ActionHit(PlayerAction::Right)) {
+				_root->PlaySfx("MenuSelect"_s, 0.5f);
+				_animation = 0.0f;
+				std::int32_t lastColumn = std::min((std::int32_t)mapping[row].Targets.size(), MaxTargetCount - 1);
+				if (_selectedColumn < lastColumn) {
+					_selectedColumn++;
+				} else {
+					_selectedColumn = 0;
+				}
+			}
+		}
+	}
+
+	void RemapControlsSection::OnDraw(Canvas* canvas)
+	{
+		Vector2i viewSize = canvas->ViewSize;
+		Recti contentBounds = _root->GetContentBounds();
+		float centerX = contentBounds.X + contentBounds.W * 0.5f;
+		float topLine = contentBounds.Y + 31.0f;
+		float bottomLine = contentBounds.Y + contentBounds.H - 42.0f;
+
+		_root->DrawMenuFrame(centerX, topLine, bottomLine);
+
+		std::int32_t charOffset = 0;
+#if defined(WITH_MULTIPLAYER)
+		constexpr std::int32_t MaxSupportedPlayers = ControlScheme::MaxSupportedPlayers;
+#else
+		constexpr std::int32_t MaxSupportedPlayers = 1;
+#endif
+		if (MaxSupportedPlayers > 1) {
+			_root->DrawStringShadow(_f("Remap Controls for Player {}", _playerIndex + 1), charOffset, centerX, topLine - 21.0f, IMenuContainer::FontLayer,
+				Alignment::Center, Colorf(0.46f, 0.46f, 0.46f, 0.5f), 0.9f, 0.7f, 1.1f, 1.1f, 0.4f, 0.9f);
+		} else {
+			_root->DrawStringShadow(_("Remap Controls"), charOffset, centerX, topLine - 21.0f, IMenuContainer::FontLayer,
+				Alignment::Center, Colorf(0.46f, 0.46f, 0.46f, 0.5f), 0.9f, 0.7f, 1.1f, 1.1f, 0.4f, 0.9f);
+		}
+
+		float hintY = contentBounds.Y + contentBounds.H;
+		if (viewSize.Y < 300) {
+			hintY -= 9.0f;
+		}
+
+		// A long translation of a hint doesn't fit on a narrow view (the Nintendo 64 has 320 pixels), so it's kept inside
+		// the content bounds, and drawn smaller if it can't fit at all
+		constexpr float HintMargin = 6.0f;
+		float hintLeft = contentBounds.X + HintMargin;
+		float hintRight = contentBounds.X + contentBounds.W - HintMargin;
+
+		if (_waitForInput) {
+			Colorf textColor = Font::DefaultColor;
+			textColor.SetAlpha(_hintAnimation);
+			// TRANSLATORS: Bottom hint in Options > Controls > Remap Controls section
+			StringView text = _("Press any key or button to assign");
+			float textScale = std::min(0.7f, 0.7f * (hintRight - hintLeft) / _root->MeasureString(text, 0.7f, 0.9f).X);
+			_root->DrawStringShadow(text, charOffset, centerX, hintY - 18.0f * Easing::OutCubic(_hintAnimation), IMenuContainer::FontLayer,
+				Alignment::Center, textColor, textScale, 0.4f, 0.0f, 0.0f, 0.0f, 0.9f);
+		} else {
+			std::int32_t row = GetSelectedRow();
+			if (row >= 0) {
+				auto& mapping = ControlScheme::GetMappings(_playerIndex)[(std::int32_t)_actions[row]];
+				if ((_selectedColumn < mapping.Targets.size() || _selectedColumn == MaxTargetCount - 1) && !(_actions[row] == PlayerAction::Menu && _selectedColumn == 0)) {
+					char stringBuffer[64];
+					std::size_t length = formatInto(stringBuffer, "\f[c:#d0705d]{}\f[/c] │", _("Change Weapon"));
+					// TRANSLATORS: Bottom hint in Options > Controls > Remap Controls section, prefixed with key/button to press
+					StringView removeText = _("to remove assignment");
+
+					// The button's label sits between the two parts, 15 and 8 pixels away from them
+					float textScale = 0.7f;
+					float leftWidth = _root->MeasureString({ stringBuffer, length }, textScale, 0.9f).X;
+					float rightWidth = _root->MeasureString(removeText, textScale, 0.9f).X;
+					float fit = (hintRight - hintLeft) / (leftWidth + 23.0f + rightWidth);
+					if (fit < 1.0f) {
+						textScale *= fit;
+						leftWidth *= fit;
+						rightWidth *= fit;
+					}
+					float labelX = std::min(std::max(centerX, hintLeft + 15.0f + leftWidth), hintRight - 8.0f - rightWidth);
+
+					_root->DrawStringShadow({ stringBuffer, length }, charOffset, labelX - 15.0f, hintY - 18.0f, IMenuContainer::FontLayer,
+						Alignment::Right, Font::DefaultColor, textScale, 0.4f, 0.0f, 0.0f, 0.0f, 0.9f);
+
+					// A pad without the button has no label for it (AnimState::Default would draw the menu logo)
+					AnimState buttonName = GetResourceForButtonName(ControlScheme::ChangeWeaponMenuButton);
+					if (buttonName != AnimState::Default) {
+						_root->DrawElement(buttonName, 0, labelX - 2.0f, hintY - 18.0f + 2.0f,
+							IMenuContainer::ShadowLayer, Alignment::Center, Colorf(0.0f, 0.0f, 0.0f, 0.16f), 0.8f, 0.8f);
+						_root->DrawElement(buttonName, 0, labelX - 2.0f, hintY - 18.0f,
+							IMenuContainer::MainLayer, Alignment::Center, Colorf::White, 0.8f, 0.8f);
+					}
+
+					_root->DrawStringShadow(removeText, charOffset, labelX + 8.0f, hintY - 18.0f, IMenuContainer::FontLayer,
+						Alignment::Left, Font::DefaultColor, textScale, 0.4f, 0.0f, 0.0f, 0.0f, 0.9f);
+				}
+			}
+		}
+	}
+
+	void RemapControlsSection::OnKeyPressed(const nCine::KeyboardEvent& event)
+	{
+		if (!_waitForInput) {
+			return;
+		}
+
+		std::int32_t row = GetSelectedRow();
+		if (row < 0) {
+			return;
+		}
+		PlayerAction action = _actions[row];
+
+		if (event.sym == Keys::Escape) {
+			_root->PlaySfx("MenuSelect"_s, 0.5f);
+			_waitForInput = false;
+			_waitForInputPrev = true;
+			return;
+		}
+
+		bool waitingForInput = true;
+		MappingTarget newTarget = ControlScheme::CreateTarget(event.sym);
+		PlayerAction collidingAction;
+		std::int32_t collidingAssignment;
+		if (!HasCollision(action, newTarget, collidingAction, collidingAssignment)) {
+			waitingForInput = false;
+		} else if (collidingAction == action && collidingAssignment == _selectedColumn) {
+			// Key has collision, but it's the same as it's already assigned
+			_root->PlaySfx("MenuSelect"_s, 0.5f);
+			_waitForInput = false;
+			_waitForInputPrev = true;
+			return;
+		}
+
+		if (!waitingForInput) {
+			auto& mapping = ControlScheme::GetMappings(_playerIndex)[(std::int32_t)action];
+			if (_selectedColumn < mapping.Targets.size()) {
+				mapping.Targets[_selectedColumn] = newTarget;
+			} else {
+				mapping.Targets.push_back(newTarget);
+			}
+
+			_isDirty = true;
+			_waitForInput = false;
+			_waitForInputPrev = true;
+			_root->PlaySfx("MenuSelect"_s, 0.5f);
+			_root->ApplyPreferencesChanges(ChangedPreferencesType::ControlScheme);
+		}
+	}
+
+	NavigationFlags RemapControlsSection::GetNavigationFlags() const
+	{
+		// Suppress navigation while capturing an input so key/button presses are read raw instead of moving the cursor
+		return (_waitForInput ? NavigationFlags::None : NavigationFlags::AllowAll);
+	}
+
+	void RemapControlsSection::OnBackPressed()
+	{
+		if (_waitForInput) {
+			_root->PlaySfx("MenuSelect"_s, 0.5f);
+			_waitForInput = false;
+			_waitForInputPrev = true;
+			return;
+		}
+
+		WidgetSection::OnBackPressed();
+	}
+
+	std::int32_t RemapControlsSection::GetSelectedRow() const
+	{
+		return (_list != nullptr ? _list->GetSelectedIndex() : -1);
+	}
+
+	void RemapControlsSection::ClampColumn(std::int32_t row)
+	{
+		if (row < 0 || row >= (std::int32_t)_actions.size()) {
+			return;
+		}
+		auto& mapping = ControlScheme::GetMappings(_playerIndex)[(std::int32_t)_actions[row]];
+		_selectedColumn = std::min({ _selectedColumn, (std::int32_t)mapping.Targets.size(), MaxTargetCount - 1 });
+	}
+
+	const RemapControlsSection::RowLayout& RemapControlsSection::GetRowLayout(float viewWidth)
+	{
+		if (_layout.ViewWidth == viewWidth) {
+			return _layout;
+		}
+
+		constexpr float Margin = 10.0f;
+		constexpr float Gap = 6.0f;
+		constexpr float MinColumnWidth = 28.0f;
+
+		// Spread over the view in proportion, as long as the longest name ends before the first column does
+		float centerX = viewWidth * 0.5f;
+		float nameX = centerX * 0.3f;
+		float columnWidth = centerX * 0.2f;
+		float firstColumnX = centerX * 0.81f;
+
+		// A narrow view doesn't have the room (the Nintendo 64 has 320 pixels), so the names move towards the edge
+		// first, and if that's not enough, the columns get narrower and move right, but never past the other edge
+		float columnsStart = firstColumnX - columnWidth * 0.5f;
+		if (nameX + _widestName + Gap > columnsStart) {
+			nameX = std::max(Margin, columnsStart - Gap - _widestName);
+			float namesEnd = nameX + _widestName + Gap;
+			if (namesEnd > columnsStart) {
+				float columnsEnd = viewWidth - Margin;
+				columnWidth = std::min(columnWidth, std::max((columnsEnd - namesEnd) / MaxTargetCount, MinColumnWidth));
+				firstColumnX = columnsEnd - (MaxTargetCount - 0.5f) * columnWidth;
+			}
+		}
+
+		_layout.ViewWidth = viewWidth;
+		_layout.NameX = nameX;
+		// Whatever still doesn't fit in front of the first column is drawn smaller
+		_layout.NameWidth = firstColumnX - columnWidth * 0.5f - Gap - nameX;
+		_layout.FirstColumnX = firstColumnX;
+		_layout.ColumnWidth = columnWidth;
+		return _layout;
+	}
+
+	void RemapControlsSection::StartCapture()
+	{
+		_animation = 0.0f;
+		_hintAnimation = 0.0f;
+		_timeout = 20.0f * FrameTimer::FramesPerSecond;
+		_waitForInput = true;
+
+		RefreshPreviousState();
+	}
+
+	void RemapControlsSection::DrawRow(IMenuContainer* root, Canvas* canvas, const Rectf& bounds, std::int32_t& charOffset, bool isSelected, PlayerAction type, StringView name)
+	{
+		float centerX = canvas->ViewSize.X * 0.5f;
+		float itemY = bounds.Y + bounds.H * 0.5f;
+		char stringBuffer[16];
+		const RowLayout& layout = GetRowLayout((float)canvas->ViewSize.X);
+
+		const auto& mapping = ControlScheme::GetMappings(_playerIndex)[(std::int32_t)type];
+
+		if (isSelected) {
+			root->DrawElement(MenuGlow, 0, centerX, itemY, IMenuContainer::MainLayer - 200, Alignment::Center,
+				Colorf(1.0f, 1.0f, 1.0f, 0.1f), 26.0f, 5.0f, true, true);
+		}
+
+		Vector2f displayNameSize = root->MeasureString(name, 0.8f);
+		float nameScale = GetNameScale(displayNameSize.X);
+		if (displayNameSize.X * nameScale / 0.8f > layout.NameWidth) {
+			nameScale = std::max(0.8f * layout.NameWidth / displayNameSize.X, 0.5f);
+		}
+		root->DrawStringShadow(name, charOffset, layout.NameX, itemY, IMenuContainer::MainLayer - 100, Alignment::Left,
+			isSelected && _waitForInput ? Colorf(0.62f, 0.44f, 0.34f, 0.5f) : (isSelected ? Colorf(0.48f, 0.48f, 0.48f, 0.5f) : Font::DefaultColor),
+			nameScale);
+
+		std::int32_t targetCount = (std::int32_t)mapping.Targets.size();
+		for (std::int32_t j = 0; j < targetCount; j++) {
+			StringView value;
+			float columnX = layout.FirstColumnX + j * layout.ColumnWidth;
+
+			std::uint32_t data = mapping.Targets[j].Data;
+			if (data & ControlScheme::GamepadMask) {
+				std::uint32_t joyIdx = (data & ControlScheme::GamepadIndexMask) >> 16;
+
+				if (isSelected && _selectedColumn == j) {
+					// Narrower on narrow columns, where the brackets would run into the neighbouring bindings
+					value = (layout.ColumnWidth < 36.0f ? "<  >"_s : "<    >"_s);
+				}
+
+				if (data & ControlScheme::GamepadAnalogMask) {
+					AxisName axis = (AxisName)(data & ControlScheme::ButtonMask);
+					bool isNegative = (data & ControlScheme::GamepadNegativeMask) != 0;
+					StringView axisName;
+					// A label of the direction itself (the C buttons of the Nintendo 64) needs no sign next to it
+					AnimState axisAnim = GetResourceForAxisDirection(axis, isNegative);
+					bool showDirection = (axisAnim == AnimState::Default);
+					if (showDirection) {
+						axisAnim = GetResourceForAxisName(axis, axisName);
+					}
+					if (axisAnim != AnimState::Default) {
+						root->DrawElement(axisAnim, 0, columnX + 2.0f, itemY + 2.0f, IMenuContainer::ShadowLayer, Alignment::Center, Colorf(0.0f, 0.0f, 0.0f, 0.16f));
+						root->DrawElement(axisAnim, 0, columnX + 2.0f, itemY, IMenuContainer::MainLayer, Alignment::Center, Colorf::White);
+
+						for (std::int32_t i = 0; i < joyIdx + 1; i++) {
+							stringBuffer[i] = '1';
+						}
+						stringBuffer[joyIdx + 1] = '\0';
+
+						root->DrawStringShadow(stringBuffer, charOffset, columnX + 4.0f, itemY - 5.0f, IMenuContainer::FontLayer,
+							Alignment::Left, Font::DefaultColor, 0.75f, 0.0f, 0.0f, 0.0f, 0.4f, 0.6f);
+
+						if (showDirection) {
+							stringBuffer[0] = (isNegative ? '-' : '+');
+							stringBuffer[1] = ' ';
+							if (!axisName.empty()) {
+								std::memcpy(stringBuffer + 2, axisName.data(), axisName.size());
+							}
+							stringBuffer[axisName.size() + 2] = '\0';
+
+							root->DrawStringShadow(stringBuffer, charOffset, columnX - 10.0f, itemY + 6.0f, IMenuContainer::FontLayer,
+								Alignment::Left, Font::DefaultColor, 0.75f, 0.0f, 0.0f, 0.0f, 0.4f, 0.9f);
+						}
+					}
+				} else {
+					AnimState buttonName = GetResourceForButtonName((ButtonName)(data & ControlScheme::ButtonMask));
+					if (buttonName != AnimState::Default) {
+						root->DrawElement(buttonName, 0, columnX + 2.0f, itemY + 2.0f, IMenuContainer::ShadowLayer, Alignment::Center, Colorf(0.0f, 0.0f, 0.0f, 0.16f));
+						root->DrawElement(buttonName, 0, columnX + 2.0f, itemY, IMenuContainer::MainLayer, Alignment::Center, Colorf::White);
+
+						for (std::int32_t i = 0; i < joyIdx + 1; i++) {
+							stringBuffer[i] = '1';
+						}
+						stringBuffer[joyIdx + 1] = '\0';
+
+						root->DrawStringShadow(stringBuffer, charOffset, columnX + 4.0f, itemY - 5.0f, IMenuContainer::FontLayer,
+							Alignment::Left, Font::DefaultColor, 0.75f, 0.0f, 0.0f, 0.0f, 0.4f, 0.6f);
+					}
+				}
+			} else {
+				Keys key = (Keys)(data & ControlScheme::ButtonMask);
+				value = theApplication().GetInputManager().getKeyName(key);
+			}
+
+			if (!value.empty()) {
+				if (isSelected && _selectedColumn == j) {
+					float size = 0.5f + Easing::OutElastic(_animation) * 0.5f;
+
+					Colorf color;
+					if (_waitForInput) {
+						color = Colorf(0.62f, 0.44f, 0.34f, 0.5f);
+					} else {
+						color = (type == PlayerAction::Menu && _selectedColumn == 0 ? Font::TransparentRandomColor : Font::RandomColor);
+					}
+
+					root->DrawStringShadow(value, charOffset, columnX, itemY, IMenuContainer::MainLayer - 10,
+						Alignment::Center, color, size, 0.7f, 1.1f, 1.1f, 0.4f, 0.9f);
+				} else {
+					root->DrawStringShadow(value, charOffset, columnX, itemY, IMenuContainer::MainLayer - 20,
+						Alignment::Center, Font::DefaultColor, 0.8f);
+				}
+			}
+		}
+
+		if (isSelected && _selectedColumn == targetCount) {
+			float size = 0.5f + Easing::OutElastic(_animation) * 0.5f;
+			root->DrawStringShadow("+"_s, charOffset, (layout.FirstColumnX + targetCount * layout.ColumnWidth) + 2.0f, itemY, IMenuContainer::MainLayer - 10,
+				Alignment::Center, _waitForInput ? Colorf(0.62f, 0.44f, 0.34f, 0.5f) : Colorf(0.44f, 0.62f, 0.34f, 0.5f), size, 0.7f, 1.1f, 1.1f, 0.4f, 0.9f);
+		} else {
+			root->DrawStringShadow("+"_s, charOffset, (layout.FirstColumnX + targetCount * layout.ColumnWidth) + 2.0f, itemY, IMenuContainer::MainLayer - 20,
+				Alignment::Center, Colorf(0.42f, 0.42f, 0.42f, 0.42f), 0.8f);
+		}
+	}
+
+	void RemapControlsSection::HandleTap(std::int32_t newIndex, Vector2i touchPos)
+	{
+		if (newIndex < 0 || newIndex >= (std::int32_t)_actions.size()) {
+			return;
+		}
+		auto& mapping = ControlScheme::GetMappings(_playerIndex)[(std::int32_t)_actions[newIndex]];
+
+		Vector2i viewSize = _root->GetViewSize();
+		const RowLayout& layout = GetRowLayout((float)viewSize.X);
+		float firstColumnX = layout.FirstColumnX - layout.ColumnWidth * 0.5f;
+		float columnWidth = layout.ColumnWidth;
+
+		float x = touchPos.X - firstColumnX;
+		if (x >= 0.0f && x < columnWidth * MaxTargetCount) {
+			std::int32_t newColumn = (std::int32_t)(x / columnWidth);
+			if (newColumn <= mapping.Targets.size()) {
+				if (GetSelectedRow() == newIndex && _selectedColumn == newColumn) {
+					if (_waitForInput) {
+						// If we are already waiting for input, delete the target instead
+						_waitForInput = false;
+						_waitForInputPrev = true;
+
+						if (newIndex == (std::int32_t)PlayerAction::Menu && _selectedColumn == 0) {
+							return;
+						}
+
+						if (_selectedColumn < mapping.Targets.size()) {
+							mapping.Targets.erase(_selectedColumn);
+
+							_isDirty = true;
+							_root->PlaySfx("MenuSelect"_s, 0.5f);
+							_root->ApplyPreferencesChanges(ChangedPreferencesType::ControlScheme);
+						}
+					} else {
+						if (newIndex == (std::int32_t)PlayerAction::Menu && newColumn == 0) {
+							return;
+						}
+						_root->PlaySfx("MenuSelect"_s, 0.5f);
+						StartCapture();
+					}
+				} else {
+					_root->PlaySfx("MenuSelect"_s, 0.5f);
+					_waitForInput = false;
+					_waitForInputPrev = true;
+					_animation = 0.0f;
+					_list->SetSelectedIndex(newIndex, false);
+					_selectedColumn = newColumn;
+				}
+			}
+		}
+	}
+
+	void RemapControlsSection::RefreshPreviousState()
+	{
+		auto& input = theApplication().GetInputManager();
+
+		const JoyMappedState* joyStates[ControlScheme::MaxConnectedGamepads];
+		std::int32_t joyStatesCount = 0;
+		for (std::int32_t i = 0; i < JoyMapping::MaxNumJoysticks && joyStatesCount < std::int32_t(arraySize(joyStates)); i++) {
+			if (input.isJoyMapped(i)) {
+				_joyStatesLast[joyStatesCount++] = input.joyMappedState(i);
+			}
+		}
+	}
+
+	bool RemapControlsSection::HasCollision(PlayerAction action, MappingTarget target, PlayerAction& collidingAction, std::int32_t& collidingAssignment)
+	{
+		for (std::int32_t i = 0; i < (std::int32_t)PlayerAction::Count; i++) {
+			PlayerAction ia = (PlayerAction)i;
+
+			if ((action == PlayerAction::Down && ia == PlayerAction::Buttstomp) ||
+				(action == PlayerAction::Buttstomp && ia == PlayerAction::Down)) {
+				continue;
+			}
+
+			auto& mapping = ControlScheme::GetMappings(_playerIndex)[i];
+			std::int32_t targetCount = (std::int32_t)mapping.Targets.size();
+			for (std::int32_t j = 0; j < targetCount; j++) {
+				if (mapping.Targets[j].Data == target.Data) {
+					collidingAction = ia;
+					collidingAssignment = j;
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+}

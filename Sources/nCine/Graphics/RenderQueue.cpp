@@ -1,0 +1,246 @@
+#include "RenderQueue.h"
+#include "RenderBatcher.h"
+#include "RenderResources.h"
+#include "RenderStatistics.h"
+#include "RHI/Rhi.h"
+#include "../Application.h"
+#include "../Base/Algorithms.h"
+#include "../Base/FrameStatistics.h"
+#include "../tracy_opengl.h"
+
+namespace nCine
+{
+	RenderQueue::RenderQueue()
+	{
+		_opaqueQueue.reserve(16);
+		_opaqueBatchedQueue.reserve(16);
+		_transparentQueue.reserve(16);
+		_transparentBatchedQueue.reserve(16);
+	}
+
+	bool RenderQueue::IsEmpty() const
+	{
+		return (_opaqueQueue.empty() && _transparentQueue.empty());
+	}
+
+	void RenderQueue::AddCommand(RenderCommand* command)
+	{
+		// Calculating the material sorting key before adding the command to the queue
+		command->CalculateMaterialSortKey();
+
+		if (!command->GetMaterial().IsBlendingEnabled()) {
+			_opaqueQueue.push_back(command);
+		} else {
+			_transparentQueue.push_back(command);
+		}
+	}
+
+	namespace
+	{
+		bool descendingOrder(const RenderCommand* a, const RenderCommand* b)
+		{
+			return (a->GetMaterialSortKey() != b->GetMaterialSortKey())
+				? a->GetMaterialSortKey() > b->GetMaterialSortKey()
+				: a->GetIdSortKey() > b->GetIdSortKey();
+		}
+
+		bool ascendingOrder(const RenderCommand* a, const RenderCommand* b)
+		{
+			return (a->GetMaterialSortKey() != b->GetMaterialSortKey())
+				? a->GetMaterialSortKey() < b->GetMaterialSortKey()
+				: a->GetIdSortKey() < b->GetIdSortKey();
+		}
+
+#if defined(DEATH_DEBUG) && defined(NCINE_PROFILING)
+		const char* commandTypeString(const RenderCommand& command)
+		{
+			switch (command.GetType()) {
+				case RenderCommand::Type::Unspecified: return "unspecified";
+				case RenderCommand::Type::Sprite: return "sprite";
+				case RenderCommand::Type::MeshSprite: return "mesh sprite";
+				case RenderCommand::Type::TileMap: return "tile map";
+				case RenderCommand::Type::Particle: return "particle";
+				case RenderCommand::Type::Lighting: return "lighting";
+				case RenderCommand::Type::Text: return "text";
+#	if defined(WITH_IMGUI)
+				case RenderCommand::Type::ImGui: return "imgui";
+#	endif
+				default: return "unknown";
+			}
+		}
+#endif
+	}
+
+	void RenderQueue::SortAndCommit(std::uint32_t splitLayer)
+	{
+#if defined(DEATH_DEBUG)
+		static char debugString[128];
+#endif
+		const bool batchingEnabled = theApplication().GetRenderingSettings().batchingEnabled;
+
+		// Sorting the queues with the relevant orders
+		sort(_opaqueQueue.begin(), _opaqueQueue.end(), descendingOrder);
+		sort(_transparentQueue.begin(), _transparentQueue.end(), ascendingOrder);
+
+		SmallVectorImpl<RenderCommand*>* opaques = batchingEnabled ? &_opaqueBatchedQueue : &_opaqueQueue;
+		SmallVectorImpl<RenderCommand*>* transparents = batchingEnabled ? &_transparentBatchedQueue : &_transparentQueue;
+
+		if (batchingEnabled) {
+			ZoneScopedNC("Batching", 0x81A861);
+			// Always create batches after sorting
+			RenderResources::GetRenderBatcher().CreateBatches(_opaqueQueue, _opaqueBatchedQueue, splitLayer);
+			RenderResources::GetRenderBatcher().CreateBatches(_transparentQueue, _transparentBatchedQueue, splitLayer);
+		}
+
+		// Avoid GPU stalls by uploading to VBOs, IBOs and UBOs before drawing
+		if (!opaques->empty()) {
+			ZoneScopedNC("Commit opaques", 0x81A861);
+#if defined(DEATH_DEBUG)
+			std::size_t length = formatInto(debugString, "Commit {} opaque command(s) for viewport 0x{:x}", opaques->size(), std::uintptr_t(RenderResources::GetCurrentViewport()));
+			RHI::Debug::ScopedGroup scoped({ debugString, length });
+#endif
+			for (RenderCommand* opaqueRenderCommand : *opaques) {
+				opaqueRenderCommand->CommitAll();
+			}
+		}
+
+		if (!transparents->empty()) {
+			ZoneScopedNC("Commit transparents", 0x81A861);
+#if defined(DEATH_DEBUG)
+			std::size_t length = formatInto(debugString, "Commit {} transparent command(s) for viewport 0x{:x}", transparents->size(), std::uintptr_t(RenderResources::GetCurrentViewport()));
+			RHI::Debug::ScopedGroup scoped({ debugString, length });
+#endif
+			for (RenderCommand* transparentRenderCommand : *transparents) {
+				transparentRenderCommand->CommitAll();
+			}
+		}
+	}
+
+	void RenderQueue::Draw(std::uint32_t minLayer, std::uint32_t endLayer)
+	{
+#if defined(DEATH_DEBUG) && defined(NCINE_PROFILING)
+		static char debugString[128];
+#endif
+		const bool batchingEnabled = theApplication().GetRenderingSettings().batchingEnabled;
+		SmallVectorImpl<RenderCommand*>* opaques = batchingEnabled ? &_opaqueBatchedQueue : &_opaqueQueue;
+		SmallVectorImpl<RenderCommand*>* transparents = batchingEnabled ? &_transparentBatchedQueue : &_transparentQueue;
+
+		// Every command left after batching is one draw call, while the unbatched queues still hold what was
+		// submitted - the two together say how well the batching does. Tested here rather than left to the call,
+		// so a frame that collects nothing does not pay for a call per render queue. A queue drawn in parts is
+		// counted once, with its first part.
+		if (minLayer == 0 && FrameStatistics::IsEnabled()) {
+			FrameStatistics::AddDrawCalls(std::uint32_t(opaques->size() + transparents->size()),
+				std::uint32_t(_opaqueQueue.size() + _transparentQueue.size()));
+		}
+
+#if defined(DEATH_DEBUG) && defined(NCINE_PROFILING)
+		std::uint32_t commandIndex = 0;
+#endif
+		// The camera is constant within a single queue draw, so its uniforms only need to be
+		// committed when the shader program changes from one command to the next
+		const RHI::ShaderProgram* lastCommittedShader = nullptr;
+
+		// Rendering opaque nodes front to back
+		for (RenderCommand* opaqueRenderCommand : *opaques) {
+			if (opaqueRenderCommand->GetLayer() < minLayer || opaqueRenderCommand->GetLayer() >= endLayer) {
+				continue;
+			}
+			TracyGpuZone("Opaque");
+#if defined(DEATH_DEBUG) && defined(NCINE_PROFILING)
+			const std::int32_t numInstances = opaqueRenderCommand->GetInstanceCount();
+			const std::int32_t batchSize = opaqueRenderCommand->GetBatchSize();
+			const std::uint16_t layer = opaqueRenderCommand->GetLayer();
+			const std::uint16_t visitOrder = opaqueRenderCommand->GetVisitOrder();
+
+			std::size_t length;
+			if (numInstances > 0) {
+				length = formatInto(debugString, "Opaque {} ({} {} on layer {}, visit order {}, sort key 0x{:x})",
+								    commandIndex, numInstances, commandTypeString(*opaqueRenderCommand), layer, visitOrder, opaqueRenderCommand->GetMaterialSortKey());
+			} else if (batchSize > 0) {
+				length = formatInto(debugString, "Opaque {} ({} {} on layer {}, visit order {}, sort key 0x{:x})",
+								    commandIndex, batchSize, commandTypeString(*opaqueRenderCommand), layer, visitOrder, opaqueRenderCommand->GetMaterialSortKey());
+			} else {
+				length = formatInto(debugString, "Opaque {} ({} {} layer {}, visit order {}, sort key 0x{:x})",
+								    commandIndex, commandTypeString(*opaqueRenderCommand), layer, visitOrder, opaqueRenderCommand->GetMaterialSortKey());
+			}
+			RHI::Debug::ScopedGroup scoped({ debugString, length });
+			commandIndex++;
+#endif
+
+#if defined(NCINE_PROFILING)
+			RenderStatistics::GatherStatistics(*opaqueRenderCommand);
+#endif
+			const RHI::ShaderProgram* shaderProgram = opaqueRenderCommand->GetMaterial().GetShaderProgram();
+			if (shaderProgram != lastCommittedShader) {
+				opaqueRenderCommand->CommitCameraTransformation();
+				lastCommittedShader = shaderProgram;
+			}
+			opaqueRenderCommand->Issue();
+		}
+
+		RHI::Device::SetBlendingEnabled(true);
+		RHI::Device::SetDepthMaskEnabled(false);
+		// Rendering transparent nodes back to front
+		for (RenderCommand* transparentRenderCommand : *transparents) {
+			if (transparentRenderCommand->GetLayer() < minLayer || transparentRenderCommand->GetLayer() >= endLayer) {
+				continue;
+			}
+			TracyGpuZone("Transparent");
+#if defined(DEATH_DEBUG) && defined(NCINE_PROFILING)
+			const std::int32_t numInstances = transparentRenderCommand->GetInstanceCount();
+			const std::int32_t batchSize = transparentRenderCommand->GetBatchSize();
+			const std::uint16_t layer = transparentRenderCommand->GetLayer();
+			const std::uint16_t visitOrder = transparentRenderCommand->GetVisitOrder();
+
+			std::size_t length;
+			if (numInstances > 0) {
+				length = formatInto(debugString, "Transparent {} ({} {} on layer {}, visit order {}, sort key 0x{:x})",
+								    commandIndex, numInstances, commandTypeString(*transparentRenderCommand), layer, visitOrder, transparentRenderCommand->GetMaterialSortKey());
+			} else if (batchSize > 0) {
+				length = formatInto(debugString, "Transparent {} ({} {} on layer {}, visit order {}, sort key 0x{:x})",
+								    commandIndex, batchSize, commandTypeString(*transparentRenderCommand), layer, visitOrder, transparentRenderCommand->GetMaterialSortKey());
+			} else {
+				length = formatInto(debugString, "Transparent {} ({} on layer {}, visit order {}, sort key 0x{:x})",
+								    commandIndex, commandTypeString(*transparentRenderCommand), layer, visitOrder, transparentRenderCommand->GetMaterialSortKey());
+			}
+			RHI::Debug::ScopedGroup scoped({ debugString, length });
+			commandIndex++;
+#endif
+
+#if defined(NCINE_PROFILING)
+			RenderStatistics::GatherStatistics(*transparentRenderCommand);
+#endif
+			RHI::Device::SetBlendingFactors(transparentRenderCommand->GetMaterial().GetSrcBlendingFactor(), transparentRenderCommand->GetMaterial().GetDestBlendingFactor(),
+				transparentRenderCommand->GetMaterial().GetSrcAlphaBlendingFactor(), transparentRenderCommand->GetMaterial().GetDestAlphaBlendingFactor());
+#if defined(WITH_RHI_SOFTWARE)
+			// An opaque-content hint (see Material::SetOpaqueContentHint()) keeps the command in this queue -
+			// its painter's-order position is what makes the content correct - but runs the draw with
+			// blending off, which is identical output for opaque content and lets the software rasterizer
+			// overwrite instead of blend and occlusion-cull the draws the content hides
+			RHI::Device::SetBlendingEnabled(!transparentRenderCommand->GetMaterial().GetOpaqueContentHint());
+#endif
+			const RHI::ShaderProgram* shaderProgram = transparentRenderCommand->GetMaterial().GetShaderProgram();
+			if (shaderProgram != lastCommittedShader) {
+				transparentRenderCommand->CommitCameraTransformation();
+				lastCommittedShader = shaderProgram;
+			}
+			transparentRenderCommand->Issue();
+		}
+		// Depth mask has to be enabled again before exiting this method or clearing the depth buffer won't have any effect
+		RHI::Device::SetDepthMaskEnabled(true);
+		RHI::Device::SetBlendingEnabled(false);
+
+		RHI::Device::SetScissorTestEnabled(false);
+	}
+
+	void RenderQueue::Clear()
+	{
+		_opaqueQueue.clear();
+		_opaqueBatchedQueue.clear();
+		_transparentQueue.clear();
+		_transparentBatchedQueue.clear();
+
+		RenderResources::GetRenderBatcher().Reset();
+	}
+}

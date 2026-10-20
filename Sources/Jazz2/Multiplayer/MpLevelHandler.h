@@ -1,0 +1,839 @@
+﻿#pragma once
+
+#if defined(WITH_MULTIPLAYER) || defined(DOXYGEN_GENERATING_OUTPUT)
+
+#include "../LevelHandler.h"
+#include "MpGameMode.h"
+#include "Teams.h"
+#include "NetworkManager.h"
+#include "WebhookClient.h"
+#include "GameModes/GameModeFactory.h"
+#include "../Actors/Player.h"
+#include "../UI/InGameConsole.h"
+
+#include <Threading/Spinlock.h>
+
+namespace Jazz2::Actors::Multiplayer
+{
+	class MpPlayer;
+	class PlayerOnServer;
+	class RemotablePlayer;
+	class RemoteActor;
+	class RemotePlayerOnServer;
+}
+
+namespace Jazz2::UI::Multiplayer
+{
+	class MpInGameCanvasLayer;
+	class MpInGameLobby;
+	class MpHUD;
+}
+
+namespace Jazz2::Multiplayer
+{
+	/**
+		@brief Checkpoint on the track through a level
+
+		Waypoint of the ordered polyline that describes the route through the level, used by the minimap in
+		every game mode and in race modes also by progress-based position ranking. Either authored in the level
+		(JJ2+ Text waypoints) or auto-generated from level geometry.
+	*/
+	struct RaceCheckpoint {
+		/** @brief Tile coordinates (multiply by @ref Tiles::TileSet::DefaultTileSize for world pixels) */
+		Vector2i Tile;
+		/** @brief Ordering index along the track (raw JJ2+ TextID, or 0, 1, 2, ... when auto-generated) */
+		std::uint16_t Order;
+		/** @brief Split/group ID (JJ2+ Offset); 0 for auto-generated and single-track levels */
+		std::uint8_t Group;
+	};
+
+	/**
+		@brief Spawn point in a multiplayer level
+	*/
+	struct MultiplayerSpawnPoint {
+		/** @brief Position */
+		Vector2f Pos;
+		/** @brief Team ID the spawn point belongs to */
+		std::uint8_t Team;
+
+		MultiplayerSpawnPoint(Vector2f pos, std::uint8_t team)
+			: Pos(pos), Team(team) {}
+	};
+
+	/**
+		@brief Level handler of a multiplayer game session (online or local splitscreen)
+		
+		Subclass of @ref LevelHandler that runs a multiplayer match on top of a @ref NetworkManager. It is the
+		authoritative server in two configurations: an online session (@ref NetworkState::Listening), where it
+		spawns and remotes actors to connected clients and processes their packets and commands, and a
+		socket-less local splitscreen session (@ref NetworkState::Local) with only local players and no
+		networking. As a client it applies state updates and forwards local input. It also manages the game
+		mode, round flow, asset validation/streaming and the in-game lobby.
+
+		@experimental
+	*/
+	class MpLevelHandler : public LevelHandler, public IServerStatusProvider, public GameModes::IGameModeContext
+	{
+		DEATH_RUNTIME_OBJECT(LevelHandler, IServerStatusProvider);
+
+#if defined(WITH_ANGELSCRIPT)
+		friend class Scripting::LevelScriptLoader;
+#endif
+		friend class Actors::Multiplayer::MpPlayer;
+		friend class Actors::Multiplayer::PlayerOnServer;
+		friend class Actors::Multiplayer::RemotablePlayer;
+		friend class Actors::Multiplayer::RemotePlayerOnServer;
+		friend class UI::Multiplayer::MpInGameCanvasLayer;
+		friend class UI::Multiplayer::MpInGameLobby;
+		friend class UI::Multiplayer::MpHUD;
+
+	public:
+		/** @brief Level state */
+		enum class LevelState {
+			Unknown,				/**< Unknown */
+			InitialUpdatePending,	/**< Level was just created and initial update needs to be sent */
+			PreGame,				/**< Pre-game is active */
+			WaitingForMinPlayers,	/**< Pre-game ended, but not enough players connected yet */
+			Countdown3,				/**< Countdown started (3) */
+			Countdown2,				/**< Countdown continues (2) */
+			Countdown1,				/**< Countdown continues (1) */
+			Running,				/**< Round started */
+			Ending,					/**< Round is ending */
+			Ended					/**< Round ended */
+		};
+
+		/** @brief Asset type */
+		enum class AssetType {
+			Unknown,	/**< Unknown */
+			Level,		/**< Level */
+			TileSet,	/**< Tile set */
+			Music,		/**< Music */
+			Script		/**< Script */
+		};
+
+		/**
+		 * @brief Creates a new instance
+		 *
+		 * @param root             Root controller
+		 * @param networkManager   Network manager that handles the connection
+		 * @param levelState       Initial level state
+		 */
+		MpLevelHandler(IRootController* root, NetworkManager* networkManager, LevelState levelState);
+		~MpLevelHandler() override;
+
+		bool Initialize(const LevelInitialization& levelInit) override;
+		bool Initialize(Stream& src, std::uint16_t version) override;
+
+		bool IsLocalSession() const override;
+		bool IsServer() const override;
+		std::uint32_t GetPlayerFurColor(const Actors::Player* player, std::uint32_t furColor) const override;
+		bool IsPlayerColorForced(const Actors::Player* player) const override;
+		bool IsPausable() const override;
+		bool CanPlayersCollide() const override;
+		bool CanActivateSugarRush() const override;
+		bool CanEventDisappear(EventType eventType) const override;
+		float GetHurtInvulnerableTime() const override;
+		bool GetActiveBossHealth(std::int32_t& health, std::int32_t& maxHealth) const override;
+
+		float GetDefaultAmbientLight() const override;
+		void SetAmbientLight(Actors::Player* player, float value) override;
+
+		void OnBeginFrame() override;
+		void OnEndFrame() override;
+		void OnInitializeViewport(std::int32_t width, std::int32_t height) override;
+		bool OnConsoleCommand(StringView line) override;
+
+#if defined(NCINE_HAS_TOUCH_CONTROLS)
+		void OnTouchEvent(const TouchEvent& event) override;
+#endif
+
+		void AddActor(std::shared_ptr<Actors::ActorBase> actor) override;
+
+		std::shared_ptr<AudioBufferPlayer> PlaySfx(Actors::ActorBase* self, StringView identifier, AudioBuffer* buffer, const Vector3f& pos, bool sourceRelative, float gain, float pitch, SfxFlags flags) override;
+		void StopSfx(Actors::ActorBase* self, StringView identifier, AudioBufferPlayer* player) override;
+		std::shared_ptr<AudioBufferPlayer> PlayCommonSfx(StringView identifier, const Vector3f& pos, float gain = 1.0f, float pitch = 1.0f) override;
+		void WarpCameraToTarget(Actors::ActorBase* actor, bool fast = false) override;
+
+		void BroadcastTriggeredEvent(Actors::ActorBase* initiator, EventType eventType, std::uint8_t* eventParams) override;
+		void BeginLevelChange(Actors::ActorBase* initiator, ExitType exitType, StringView nextLevel = {}) override;
+
+		void SendPacket(const Actors::ActorBase* self, ArrayView<const std::uint8_t> data) override;
+
+		void HandleBossActivated(Actors::Bosses::BossBase* boss, Actors::ActorBase* initiator) override;
+		void HandleLevelChange(LevelInitialization&& levelInit) override;
+		void HandleGameOver(Actors::Player* player) override;
+		bool HandlePlayerDied(Actors::Player* player) override;
+		void HandlePlayerWarped(Actors::Player* player, Vector2f prevPos, WarpFlags flags) override;
+		void HandlePlayerPushed(Actors::Player* player) override;
+		void HandlePlayerCoins(Actors::Player* player, std::int32_t prevCount, std::int32_t newCount) override;
+		void HandlePlayerGems(Actors::Player* player, std::uint8_t gemType, std::int32_t prevCount, std::int32_t newCount) override;
+		void SetCheckpoint(Actors::Player* player, Vector2f pos) override;
+		void RollbackToCheckpoint(Actors::Player* player) override;
+		void HandleActivateSugarRush(Actors::Player* player) override;
+		void HandleCreateParticleDebrisOnPerish(const Actors::ActorBase* self, Actors::ParticleDebrisEffect effect, Vector2f speed) override;
+		void HandleCreateSpriteDebris(const Actors::ActorBase* self, AnimState state, std::int32_t count) override;
+		void ShowLevelText(StringView text, Actors::ActorBase* initiator = nullptr) override;
+		StringView GetLevelText(std::uint32_t textId, std::int32_t index = -1, std::uint32_t delimiter = 0) override;
+		void OverrideLevelText(std::uint32_t textId, StringView value) override;
+		void LimitCameraView(Actors::Player* player, Vector2f playerPos, std::int32_t left, std::int32_t width) override;
+		void OverrideCameraView(Actors::Player* player, float x, float y, bool topLeft = false) override;
+		void ShakeCameraView(Actors::Player* player, float duration) override;
+		void ShakeCameraViewNear(Vector2f pos, float duration) override;
+		void SetTrigger(std::uint8_t triggerId, bool newState) override;
+		void SetWeather(WeatherType type, std::uint8_t intensity) override;
+		bool BeginPlayMusic(StringView path, bool setDefault = false, bool forceReload = false) override;
+
+		bool PlayerActionPressed(Actors::Player* player, PlayerAction action, bool includeGamepads, bool& isGamepad) override;
+		bool PlayerActionHit(Actors::Player* player, PlayerAction action, bool includeGamepads, bool& isGamepad) override;
+		float PlayerHorizontalMovement(Actors::Player* player) override;
+		float PlayerVerticalMovement(Actors::Player* player) override;
+		void PlayerExecuteRumble(Actors::Player* player, StringView rumbleEffect) override;
+
+		bool SerializeResumableToStream(Stream& dest) override;
+#if defined(WITH_EDITOR)
+		bool CanOpenInEditor() const override;
+#endif
+
+		void OnAdvanceDestructibleTileAnimation(std::int32_t tx, std::int32_t ty, std::int32_t amount) override;
+
+		StringView GetLevelDisplayName() const override;
+
+		/** @brief Returns current game mode */
+		MpGameMode GetGameMode() const;
+		/** @brief Returns the active game-mode rules object, or `nullptr` if the mode has not been migrated to @ref IGameMode yet */
+		GameModes::IGameMode* GetActiveGameMode() const;
+		/** @brief Lets the active game mode draw its part of the HUD into @p hud; returns `false` if no migrated mode is active (caller should fall back to its own drawing) */
+		bool DrawActiveGameModeHUD(GameModes::IGameModeHUD& hud, Actors::Player* player, const Rectf& view);
+
+		const ServerConfiguration& GetServerConfiguration() const override;
+		ArrayView<Actors::Player* const> GetPlayers() const override;
+		MpPlayerState& GetPlayerState(Actors::Player* player) override;
+		bool IsSpectating(Actors::Player* player) const override;
+		std::uint8_t GetCtfFlagStateCount() const override;
+		std::uint8_t GetCtfFlagState(std::uint8_t team) const override;
+		Vector2f GetSpawnPoint(Actors::Player* player) override;
+		float GetElapsedFrames() const override;
+		void EndGame(Actors::Player* winner) override;
+
+		/** @brief Returns the number of laps required to finish a race (Race/TeamRace) */
+		std::uint32_t GetTotalLaps() const;
+		/** @brief Returns the current round state (synced to clients) */
+		LevelState GetLevelState() const {
+			return _levelState;
+		}
+		/** @brief Sets current game mode */
+		bool SetGameMode(MpGameMode value);
+		/** @brief Synchronizes current game mode with all peers without restarting round */
+		bool SynchronizeGameMode();
+
+		/** @brief Requests to change the local player's team (client) or applies it directly (host) */
+		void RequestChangeTeam(std::uint8_t team);
+
+		/** @brief Single row of the multiplayer scoreboard */
+		struct PlayerScore {
+			String Name;
+			std::uint8_t Team;
+			std::uint32_t Kills;
+			std::uint32_t Deaths;
+			std::uint32_t Points;
+			std::uint32_t Extra;	// Laps (Race), treasure (Treasure Hunt) or captures (CTF), 0 otherwise
+			std::int32_t PingMs;	// Round-trip time in ms, -1 if unknown (e.g., the local/host player)
+			bool IsLocal;
+		};
+
+		/** @brief Returns the current scoreboard rows (built on the server and synced to clients) */
+		const SmallVector<PlayerScore, 0>& GetScoreboard() const {
+			return _scoreboard;
+		}
+
+		/** @brief Single row of the final round standings */
+		struct RoundResult {
+			String Name;
+			std::uint32_t ActorID;		// Player index, used to highlight the local player on clients
+			std::uint32_t Position;		// 1-based final position
+			std::uint32_t Score;		// Kills, laps or treasure, depending on the game mode
+			std::uint32_t Extra;		// Deaths, 0 in race modes
+			float TimeSecs;				// Total race time of a player that finished a race, 0 otherwise
+			bool Finished;				// Race modes: whether all required laps were completed before the round ended
+			bool IsLocal;
+			std::uint8_t Team;
+		};
+
+		/** @brief Returns the final round standings shown while the round is ending (empty in Cooperation) */
+		const SmallVector<RoundResult, 0>& GetRoundResults() const {
+			return _roundResults;
+		}
+
+		/** @brief Returns owner of the specified object or the player itself */
+		static Actors::Multiplayer::MpPlayer* GetWeaponOwner(Actors::ActorBase* actor);
+
+		// Server-only methods
+		/** @brief Processes the specified server command */
+		bool ProcessCommand(const Peer& peer, StringView line, bool isAdmin);
+		/** @brief Sends the message to the specified peer */
+		void SendMessage(const Peer& peer, UI::MessageLevel level, StringView message);
+		/** @brief Sends the message to all authenticated peers */
+		void SendMessageToAll(StringView message, bool asChatFromServer = false);
+
+		/** @brief Enables or disables spectate mode for the specified player (server-side) */
+		void SetPlayerSpectateMode(Actors::Player* player, SpectateMode mode);
+		/** @brief Client-side method to request spectate mode */
+		void RequestSpectateMode(bool enable);
+		/** @brief Returns `true` if the local player is currently spectating */
+		bool IsSpectating();
+		/** @brief Returns `true` if spectate mode is enabled by the server */
+		bool IsSpectateAvailable() const;
+
+		/** @brief Actor ID reported by @ref GetSpectateFollowActorId() when the spectator flies the camera itself */
+		static constexpr std::uint32_t SpectateFreeCamera = UINT32_MAX;
+
+		/** @brief Returns the actor ID of the player the local spectator follows, or @ref SpectateFreeCamera */
+		std::uint32_t GetSpectateFollowActorId() const {
+			return _spectateFollowActorId;
+		}
+		/** @brief Returns the name of the player the local spectator follows, or an empty view when free-flying */
+		StringView GetSpectateFollowPlayerName() const;
+		/** @brief Returns the team of the player the local spectator follows, or 0 when free-flying */
+		std::uint8_t GetSpectateFollowPlayerTeam() const;
+		/**
+		 * @brief Returns the position of the player the local spectator follows
+		 *
+		 * If that player is gone - disconnected, finished the race or turned spectator itself - the camera moves on
+		 * to the next player instead of being left behind where they were, and only returns `false` (handing the
+		 * camera back to the spectator) when nobody is left to watch.
+		 */
+		bool GetSpectateFollowPlayerPos(Vector2f& pos);
+		/**
+		 * @brief Moves the local spectator to the next/previous player to follow
+		 *
+		 * The free camera is one step of the cycle (right after the last player), so a single button can start
+		 * following, step through everyone and drop back to flying the camera by hand.
+		 *
+		 * @param direction  @cpp 1 @ce for the next player, @cpp -1 @ce for the previous one
+		 */
+		void CycleSpectateFollow(std::int32_t direction);
+		/** @brief Stops following and hands the camera back to the spectator */
+		void StopSpectateFollow();
+		/** @brief Shows the in-game lobby so the local player can (re)select a character, (re)joining the game on confirmation */
+		void ShowCharacterSelectLobby();
+
+		/** @brief Called when a peer disconnects from the server, see @ref INetworkHandler */
+		bool OnPeerDisconnected(const Peer& peer);
+		/** @brief Called when a packet is received, see @ref INetworkHandler */
+		bool OnPacketReceived(const Peer& peer, std::uint8_t channelId, std::uint8_t packetType, ArrayView<const std::uint8_t> data);
+
+		/** @brief Returns full path of the specified asset */
+		static String GetAssetFullPath(AssetType type, StringView path, StaticArrayView<Uuid::Size, Uuid::Type> remoteServerId = {}, bool forWrite = false);
+
+	protected:
+		LevelLoadOptions GetLevelLoadOptions() const override;
+		void AttachComponents(LevelDescriptor&& descriptor) override;
+		std::unique_ptr<UI::HUD> CreateHUD() override;
+		void SpawnPlayers(const LevelInitialization& levelInit) override;
+		std::shared_ptr<Actors::Player> CreateResumablePlayer(std::int32_t index) override;
+		void PrepareNextLevelInitialization(LevelInitialization& levelInit) override;
+		// Multiplayer sessions keep their own rollback, actors of remote peers cannot be resurrected locally
+		bool CanUseLevelStateSnapshots() const override {
+			return false;
+		}
+		bool IsCheatingAllowed(Actors::Player* player) override;
+		/** @brief Returns `true` if the specified player has admin privileges, `nullptr` refers to the local console */
+		bool IsPlayerAdmin(Actors::Player* player) const;
+
+		void BeforeActorDestroyed(Actors::ActorBase* actor) override;
+		void ProcessEvents(float timeMult) override;
+
+		void PauseGame() override;
+		void ResumeGame() override;
+		void ShowConsole() override;
+		void HideConsole() override;
+
+		/** @brief Called when a player entered a transition to change the level */
+		void HandlePlayerLevelChanging(Actors::Player* player, ExitType exitType);
+		/** @brief Called when a player pushes a solid object */
+		bool HandlePlayerPush(Actors::Player* player, float pushSpeedX);
+		/** @brief Called when a player interacts with a spring */
+		bool HandlePlayerSpring(Actors::Player* player, Vector2f pos, Vector2f force, bool keepSpeedX, bool keepSpeedY);
+		/** @brief Called when a player is going to warp */
+		void HandlePlayerBeforeWarp(Actors::Player* player, Vector2f pos, WarpFlags flags);
+		/** @brief Called when a player changed modifier, to sync it to the owning client and its decoration to the other peers */
+		void HandlePlayerSetModifier(Actors::Player* player, Actors::Player::Modifier modifier, const std::shared_ptr<Actors::ActorBase>& decor);
+		/** @brief Called when fly-cheat behavior is enabled or disabled on a player, to sync it to the owning client */
+		void HandlePlayerSetFlyCheat(Actors::Player* player, bool active);
+		/** @brief Called when a player freezes */
+		void HandlePlayerFreeze(Actors::Player* player, float timeLeft);
+		/** @brief Called when a player sets invulnerability */
+		void HandlePlayerSetInvulnerability(Actors::Player* player, float timeLeft, Actors::Player::InvulnerableType type);
+		/** @brief Called when a player sets score */
+		void HandlePlayerSetScore(Actors::Player* player, std::int32_t value);
+		/** @brief Called when a player sets health */
+		void HandlePlayerSetHealth(Actors::Player* player, std::int32_t count);
+		/** @brief Called when a player sets lives */
+		void HandlePlayerSetLives(Actors::Player* player, std::int32_t count);
+		/** @brief Called when a player takes a damage */
+		void HandlePlayerTakeDamage(Actors::Player* player, std::int32_t amount, float pushForce);
+		/** @brief Called when a player is bumped by another player to synchronize the resulting knockback */
+		void HandlePlayerBumped(Actors::Player* player);
+		/** @brief Returns `true` if players can stand on top of each other (per-level @ref ServerConfiguration::PlayerStacking) */
+		bool IsPlayerStackingEnabled() const;
+		/**
+		 * @brief Returns `true` if the minimap is available to players (per-level @ref ServerConfiguration::AllowMinimap)
+		 *
+		 * Meaningful only on the server, a client learns the outcome from whether the track is synchronized to it.
+		 */
+		bool IsMinimapAllowed() const;
+		/** @brief Returns `true` if players are allowed to climb ledges (per-level @ref ServerConfiguration::AllowLedgeClimb) */
+		bool IsLedgeClimbAllowed() const;
+		/** @brief Returns the player actor the given player is standing/landing on (one-way platform check), or `nullptr` */
+		Actors::ActorBase* FindPlayerToStandOn(Actors::Player* player, float timeMult) override;
+		/** @brief Called when a player requests to synchronize weapon ammo */
+		void HandlePlayerRefreshAmmo(Actors::Player* player, WeaponType weaponType);
+		/** @brief Called when a player requests to synchronize weapon upgrades */
+		void HandlePlayerRefreshWeaponUpgrades(Actors::Player* player, WeaponType weaponType);
+		/** @brief Called when a player requests to morph to another type */
+		void HandlePlayerMorphTo(Actors::Player* player, PlayerType type);
+		/** @brief Called when a player changed duration of dizziness */
+		void HandlePlayerSetDizzy(Actors::Player* player, float timeLeft);
+		/** @brief Called when another player starts/stops standing on a player, to sync its cosmetic lift animation */
+		void HandlePlayerSetBeingStoodOn(Actors::Player* player, bool beingStoodOn);
+		/** @brief Called when a player sets a shield */
+		void HandlePlayerSetShield(Actors::Player* player, ShieldType shieldType, float timeLeft);
+		/** @brief Called when sugar rush starts or ends on a player, to sync it to the owning client and the other peers */
+		void HandlePlayerSetSugarRush(Actors::Player* player, float timeLeft);
+		/**
+		 * @brief Sends an ambient light intensity to the client owning @p player
+		 *
+		 * @param applyNow		Apply the value to the player's view right away
+		 * @param asCheckpoint	Remember the value as the one to restore when respawning at the checkpoint
+		 *
+		 * Does nothing for a player that isn't owned by a remote peer.
+		 */
+		void HandlePlayerSetAmbientLight(Actors::Player* player, float value, bool applyNow, bool asCheckpoint);
+		/**
+		 * @brief Pushes the complete weapon inventory of a player to the owning client
+		 *
+		 * Ammo and upgrades are otherwise only sent when they change, so a client that just (re)spawned with restored
+		 * progression has no way to verify it holds the same values as the server. Called after such a spawn.
+		 */
+		void SyncPlayerInventoryToPeer(Actors::Player* player);
+		/** @brief Called when a player emits a weapon flare */
+		void HandlePlayerEmitWeaponFlare(Actors::Player* player);
+		/** @brief Called when a player changes their current weapon */
+		void HandlePlayerWeaponChanged(Actors::Player* player, Actors::Player::SetCurrentWeaponReason reason);
+
+	private:
+#ifndef DOXYGEN_GENERATING_OUTPUT
+		// Doxygen 1.12.0 outputs also private structs/unions even if it shouldn't
+		struct RemotingActorInfo {
+			std::uint32_t ActorID;
+			bool IsMirrored;			// Whether clients recreate the actor from the event map instead (see ActorShouldBeMirrored())
+			std::int32_t LastPosX;
+			std::int32_t LastPosY;
+			std::uint32_t LastAnimation;
+			std::uint16_t LastRotation;
+			std::uint16_t LastScaleX;
+			std::uint16_t LastScaleY;
+			std::uint8_t LastRendererType;
+			SmallVector<std::uint8_t, 0> LastLights;	// Encoded light block last broadcast, so an unchanged one isn't resent
+		};
+
+		struct PlayerName {
+			String Name;
+			std::uint8_t Flags;
+			std::uint32_t FurColor;
+			std::uint8_t Team;
+			bool IsSpectating;		// Synced separately (PlayerPropertyType::Spectate), spectators are not drawn or followed
+		};
+
+		struct PlayerPositionInRound {
+			std::uint32_t ActorID;
+			std::uint32_t PositionInRound;
+			std::uint32_t PointsInRound;
+		};
+
+		enum class CtfFlagState : std::uint8_t {
+			AtBase,		// Resting on its home base
+			Carried,	// Being carried by an enemy player (CarrierPlayerIndex)
+			Dropped		// Lying at DropPos after the carrier was killed/left
+		};
+
+		struct CtfFlag {
+			std::uint8_t Team;
+			Vector2f BasePos;
+			Vector2f DropPos;
+			CtfFlagState State;
+			std::uint32_t CarrierPlayerIndex;
+			std::shared_ptr<Actors::ActorBase> Actor;		// Server: local visual flag actor (host view; not remoted)
+			std::shared_ptr<Actors::ActorBase> BaseActor;	// Server: local visual base structure (host view; not remoted)
+		};
+
+		// Client: per-team flag info mirrored from the server. The flag/base are rendered as client-local actors
+		// (not remoted) driven by this state, so they don't depend on actor remoting/id reuse.
+		struct CtfClientFlag {
+			std::uint8_t State;
+			Vector2f BasePos;
+			Vector2f DropPos;
+			std::uint32_t CarrierActorId;	// Valid when State == Carried (player index = remote actor id)
+			std::shared_ptr<Actors::ActorBase> FlagActor;	// Client-local visual flag
+			std::shared_ptr<Actors::ActorBase> BaseActor;	// Client-local visual base
+		};
+
+		struct PendingSfx {
+			Actors::ActorBase* Actor;
+			String Identifier;
+			std::uint16_t Gain;
+			std::uint16_t Pitch;
+			SfxFlags Flags;
+
+			PendingSfx(Actors::ActorBase* actor, String identifier, std::uint16_t gain, std::uint16_t pitch, SfxFlags flags)
+				: Actor(actor), Identifier(std::move(identifier)), Gain(gain), Pitch(pitch), Flags(flags) {}
+		};
+
+#if defined(WITH_AUDIO)
+		// Client: a sound the server played with SfxFlags::Exclusive, at most one per actor and identifier. Kept so
+		// the next one can replace it and the server can stop it, and moved with its actor while it plays. Held
+		// here rather than by the actor, because the owner's own player receives some of these too (weapons).
+		struct TrackedSfx {
+			std::uint32_t ActorId;
+			String Identifier;
+			std::shared_ptr<AudioBufferPlayer> Player;
+		};
+#endif
+
+		struct RequiredAsset {
+			AssetType Type;
+			std::uint32_t Crc32;
+			String Path;
+			String FullPath;
+			std::int64_t Size;
+
+			RequiredAsset(AssetType type, StringView path, StringView fullPath, std::int64_t size, std::uint32_t crc32)
+				: Type(type), Crc32(crc32), FullPath(fullPath), Path(path), Size(size) {}
+		};
+
+		enum class VoteType : std::uint8_t {
+			None,
+			Restart,
+			ResetPoints,
+			Skip,
+			Kick
+		};
+#endif
+
+		//static constexpr float UpdatesPerSecond = 16.0f; // ~62 ms interval
+		static constexpr float UpdatesPerSecond = 30.0f; // ~33 ms interval
+		static constexpr std::int64_t ServerDelay = 64;
+		static constexpr float EndingDuration = 10 * FrameTimer::FramesPerSecond;
+		// Competitive rounds end with a standings board on screen, which needs longer than a plain "Winner is ..." alert
+		static constexpr float EndingDurationWithResults = 15 * FrameTimer::FramesPerSecond;
+		static constexpr std::uint32_t MaxRoundResults = 10;
+		// Race positions are based on the distance travelled along the track, which changes continuously, so they
+		// are recalculated several times per second (the projection itself is cheap)
+		static constexpr float RecalcPositionInRoundInterval = FrameTimer::FramesPerSecond / 4.0f;
+		static constexpr float TeamSwitchCooldownFrames = 5.0f * FrameTimer::FramesPerSecond;
+		static constexpr float CtfTouchRadius = 40.0f;	// Pixel radius for picking up / returning / capturing flags
+		// A connected peer that doesn't authenticate in this time is kicked - a genuine client does it right away
+		static constexpr std::int32_t AuthTimeoutSecs = 20;
+
+		// Anti-cheat escalation, see AntiCheatState - a violation adds 0.5-4 points to the suspicion, which decays by
+		// AntiCheatDecayPerSec, so an honest player's occasional desync never comes close to the thresholds
+		static constexpr float AntiCheatDecayPerSec = 0.1f;
+		static constexpr float AntiCheatNotifyThreshold = 5.0f;		// Server console and admins are notified
+		static constexpr float AntiCheatKickThreshold = 12.0f;		// The player is kicked, if the evidence is also sustained:
+		static constexpr std::uint32_t AntiCheatKickMinViolations = 5;	// - at least this many violations in the incident
+		static constexpr std::uint64_t AntiCheatKickMinIncidentMs = 10000;	// - spread over at least this time
+		static constexpr std::uint64_t AntiCheatNotifyIntervalMs = 30000;
+		static constexpr float AntiCheatBurstSecs = 1.5f;			// How much unused movement budget can be accumulated
+		static constexpr float AntiCheatMaxUncorrectedExcess = 128.0f;	// An excess up to this is tolerated without a snap back
+		static constexpr float AntiCheatWarpTargetDistance = 96.0f;	// How far from a warp target a client may already be
+		static constexpr std::uint64_t AntiCheatClockWindowMs = 10000;
+		static constexpr std::int64_t AntiCheatClockDriftToleranceMs = 1000;	// Per window, i.e. a client clock 10% faster
+
+		NetworkManager* _networkManager;
+		std::unique_ptr<GameModes::IGameMode> _gameMode;
+		float _updateTimeLeft;
+		float _gameTimeLeft;
+		LevelState _levelState;
+		bool _isServer;
+		bool _isLocalSession;	// Local splitscreen session - there are no peers, so no packets are ever built
+		bool _forceResyncPending;
+		bool _enableSpawning;
+		bool _enqueuedPlaylistChange; // Server: apply the next playlist entry once the end-of-level transition finishes
+		HashMap<std::uint32_t, std::shared_ptr<Actors::ActorBase>> _remoteActors; // Client: Actor ID -> Remote Actor created by server
+		HashMap<Actors::ActorBase*, RemotingActorInfo> _remotingActors; // Server: Local Actor created by server -> Info
+		HashMap<std::uint32_t, PlayerName> _playerNames; // Client: Actor ID -> Player name (and flags)
+		SmallVector<PlayerPositionInRound, 0> _positionsInRound; // Client: Actor ID -> Position In Round
+		SmallVector<std::uint32_t, 0> _teamScores;	// Server: computed each check; Client: mirrored for the HUD (index = team id)
+		SmallVector<CtfFlag, 0> _ctfFlags;			// Server: one flag per team in Capture The Flag
+		std::uint32_t _ctfCaptures[MaxTeamCount];	// Server: per-team capture count (used as the team score in CTF)
+		std::uint32_t _teamKills[MaxTeamCount];		// Server: per-team kill count credited at kill time (team score in TeamBattle; independent of current membership so switching teams can't transfer a score)
+		SmallVector<CtfClientFlag, 0> _ctfFlagStates; // Server + Client: per-team flag info for the HUD and carried-flag attachment
+		SmallVector<PlayerScore, 0> _scoreboard;	// Server: built periodically; Client: mirrored for the scoreboard
+		float _scoreboardSyncTime;					// Server: countdown until the next scoreboard broadcast
+		SmallVector<RoundResult, 0> _roundResults;	// Server: built when the round ends; Client: mirrored for the HUD
+		std::int32_t _activeBossHealth;				// Server: last broadcasted boss health (-1 forces a rebroadcast); Client: health synced from the server
+		std::int32_t _activeBossMaxHealth;			// Server: last broadcasted boss max health; Client: max health synced from the server (0 = no active boss)
+		SmallVector<MultiplayerSpawnPoint, 0> _multiplayerSpawnPoints;
+		SmallVector<Vector2i, 0> _raceCheckpoints;					// Unordered, used for race position ranking
+		SmallVector<RaceCheckpoint, 0> _orderedRaceCheckpoints;		// Ordered polyline for the minimap, and for the race ranking (server-built, synced to clients)
+		SmallVector<Vector2i, 0> _raceStartMarkers;					// Warp "Set Lap" tiles shown as start/finish on the minimap (synced to clients)
+		Vector2i _minimapBoundsMin;									// Minimap extent in tiles (covers the whole area players can reach; synced to clients)
+		Vector2i _minimapBoundsMax;
+		bool _raceCheckpointsOrdered;								// Whether _orderedRaceCheckpoints come from authored waypoints (trusted for progress-based ranking)
+		SmallVector<PendingSfx, 0> _pendingSfx;
+#if defined(WITH_AUDIO)
+		SmallVector<TrackedSfx, 0> _trackedSfx;
+#endif
+		std::uint32_t _lastSpawnedActorId;	// Server: last assigned actor/player ID, Client: ID assigned by server
+		std::uint32_t _spectateFollowActorId;	// Local only: actor ID the local spectator follows, or SpectateFreeCamera
+		std::int32_t _waitingForPlayerCount;	// Client: number of players needed to start the game
+		std::uint32_t _lastUpdated; // Server/Client: last update from the server
+		std::uint64_t _seqNumWarped; // Client: set to _seqNum from HandlePlayerWarped() when warped
+		std::uint64_t _lastSentPressedActions; // Client: input state last sent in PlayerKeyPress
+		Threading::Spinlock _lock;
+		bool _suppressRemoting; // Server: if true, actor will not be automatically remoted to other players
+		bool _ignorePackets;
+		bool _controllableExternal;
+		bool _autoWeightTreasure;
+		VoteType _activePoll;
+		float _activePollTimeLeft;
+		float _recalcPositionInRoundTime;
+		float _overtimeTimeLeft;
+		bool _overtimeStarted;
+		std::uint32_t _raceFinishedCount;	// Server: number of players that completed all laps in the current round
+		float _roundStartedFrames;			// Server: _elapsedFrames when the round switched to LevelState::Running
+		std::int32_t _limitCameraLeft;
+		std::int32_t _limitCameraWidth;
+		Vector2f _lastCheckpointPos;
+		float _lastCheckpointLight;
+		std::int32_t _totalTreasureCount;
+
+		SmallVector<RequiredAsset, 0> _requiredAssets;
+
+#if defined(DEATH_DEBUG)
+		std::int32_t _debugAverageUpdatePacketSize;
+#endif
+
+		std::unique_ptr<UI::Multiplayer::MpInGameCanvasLayer> _inGameCanvasLayer;
+		std::unique_ptr<UI::Multiplayer::MpInGameLobby> _inGameLobby;
+		bool _changingCharacterInLobby; // Client: lobby was opened to re-pick a character mid-game (not initial join)
+
+		void InitializeRequiredAssets();
+		void SynchronizePeers(float timeMult);
+		std::uint32_t FindFreeActorId();
+		std::uint8_t FindFreePlayerId();
+		std::int32_t GetNonSpectatePlayerCount();
+		bool IsLocalPlayer(Actors::ActorBase* actor);
+		/** @brief Collects the actor IDs of the players the local spectator can follow, in a stable (ascending) order */
+		void CollectSpectateFollowCandidates(SmallVector<std::uint32_t, 0>& candidates) const;
+		/** @brief Returns the position of the specified player, or `false` if it isn't there to be followed */
+		bool TryGetSpectatablePlayerPos(std::uint32_t actorId, Vector2f& pos) const;
+		/** @brief Broadcasts the spectate state of the specified player to every synchronized peer but its owner */
+		void BroadcastPlayerSpectateState(const Actors::Multiplayer::MpPlayer* player);
+		/** @brief Returns `true` if a player can be spawned right now (spawning enabled, no boss fight, joining allowed) */
+		bool CanSpawnPlayers() const;
+		/**
+		 * @brief Returns `true` if the player can leave spectate mode right now
+		 *
+		 * A spectate mode forced by the server lasts only as long as its reason - a race the player already finished,
+		 * or a moment nobody can join in. If the player can't leave it, @p peer is told why.
+		 */
+		bool CanLeaveSpectateMode(const Peer& peer, const PeerDescriptor& peerDesc);
+		void ApplyGameModeToAllPlayers(MpGameMode gameMode);
+		void ApplyGameModeToPlayer(MpGameMode gameMode, Actors::Player* player);
+		std::uint8_t GetTeamCount() const override;
+		std::uint8_t FindSmallestTeam(Actors::Multiplayer::MpPlayer* exclude);
+		std::uint8_t ResolveTeam(Actors::Multiplayer::MpPlayer* player, std::uint8_t requested);
+		bool ChangePlayerTeam(Actors::Multiplayer::MpPlayer* player, std::uint8_t requestedTeam, bool fromAdmin);
+		void RebalanceTeams(bool force);
+		void BroadcastPlayerTeam(Actors::Multiplayer::MpPlayer* player);
+		std::uint32_t ColorizeFurForTeam(std::uint32_t furColor, std::uint8_t team) const;
+		void RecolorRemoteActor(std::uint32_t actorId, std::uint32_t furColor, std::uint8_t team);
+		std::uint32_t GetTeamScore(std::uint8_t team) override;
+		void SyncTeamScores();
+
+		void BuildCtfBases();
+		void UpdateCtf(float timeMult);
+		void UpdateCtfClient();
+		void DropCtfFlag(Actors::Player* player);
+		void BuildScoreboard();
+		void ShowAlertToAllPlayers(StringView text);
+		void SetControllableToAllPlayers(bool enable);
+		void SendLevelStateToAllPlayers();
+		void ResetAllPlayerStats();
+		Vector2f GetSpawnPoint(PlayerType playerType, std::uint8_t team = 0);
+		void BuildTrackCheckpoints();
+		void ConsolidateRaceCheckpoints();
+		void ConsolidateOrderedRaceCheckpoints();
+		void GenerateTrackCheckpointsFromGeometry();
+		void WarpAllPlayersToStart();
+		void RollbackLevelState();
+		void CalculatePositionInRound(bool forceSend = false);
+		/**
+		 * @brief Returns how far along the race track the given position is, in pixels
+		 *
+		 * Projects @p pos onto the ordered checkpoint polyline and returns the arc length travelled, so players can
+		 * be ranked by their progress inside the current lap and not just by completed laps. @p lastProgress is the
+		 * previously measured progress of the same player; a track that crosses or runs back on itself has several
+		 * segments close to the player, and this makes the one they can actually have reached win. The total length
+		 * of the track is returned in @p trackLength.
+		 */
+		float CalculateRaceProgress(Vector2f pos, float lastProgress, float& trackLength);
+		/** @brief Moves every player that just completed all required laps to spectate mode; returns how many did */
+		std::uint32_t UpdateRaceFinishers();
+		/** @brief Marks a player as having completed all required laps and moves them to spectate mode (server-side) */
+		void MarkRaceFinisher(Actors::Multiplayer::MpPlayer* player);
+		/** @brief Returns `true` if at least one player still has laps to complete */
+		bool IsAnyoneStillRacing();
+		/** @brief Returns the player that won a race (the first finisher, or the leader if nobody finished) */
+		Actors::Multiplayer::MpPlayer* FindRaceWinner();
+		/** @brief Returns the team that won a team race (most players across the finish line, then the most laps) */
+		std::uint8_t FindBestRaceTeam();
+		/** @brief Builds the final round standings, which in race modes also assign the final position of every player */
+		void BuildRoundResults();
+		/** @brief Sends the final round standings to all players */
+		void SyncRoundResultsToAllPlayers();
+		/**
+		 * @brief Collects the round standings for a webhook notification, best player first
+		 *
+		 * Ranks all non-spectating players by the metric of the current game mode and returns its plural unit
+		 * name (e.g. @cpp "kills" @ce), or an empty view in game modes that have no meaningful ranking. If
+		 * @p onlyTeam is not @cpp -1 @ce, only members of that team are collected.
+		 */
+		StringView BuildWebhookStandings(SmallVectorImpl<WebhookClient::LeaderboardEntry>& entries, std::int32_t onlyTeam = -1);
+		void CheckGameEnds();
+		void EndGame(Actors::Multiplayer::MpPlayer* winner);
+		void EndGameWithTeam(std::uint8_t team) override;
+		void EndGameOnTimeOut();
+
+		bool ApplyFromPlaylist();
+		void RestartPlaylist();
+		void SkipInPlaylist();
+		void ResetPeerPoints();
+		void SetWelcomeMessage(StringView message);
+		void SetPlayerReady(PlayerType playerType, std::uint8_t team);
+		void BroadcastLocalPlayerIdle(bool isIdle);
+
+		void EndActivePoll();
+
+		/** @brief Kind of anti-cheat violation */
+		enum class CheatViolation : std::uint8_t {
+			ImplausibleSpeed,
+			ImplausibleMovement,
+			ClockSpeedup,
+			WarpMismatch
+		};
+
+		/** @brief Returns monotonic server time in milliseconds used by the anti-cheat */
+		static std::uint64_t GetAntiCheatTimeMs();
+		/** @brief Returns the maximum plausible player speed (per axis, in pixels per frame) for the current gameplay */
+		float GetMaxPlausibleSpeed() const;
+		/**
+		 * @brief Records an anti-cheat violation of a peer and escalates
+		 *
+		 * Every violation is logged, a peer whose suspicion crosses @ref AntiCheatNotifyThreshold is reported to the
+		 * server console and admins, and a peer whose suspicion crosses @ref AntiCheatKickThreshold with enough
+		 * sustained evidence is kicked (unless disabled or the peer is an admin).
+		 */
+		void ReportCheatViolation(const Peer& peer, PeerDescriptor& peerDesc, CheatViolation type, float weight, StringView details);
+		/** @brief Compares the progression of the client clock with the server clock to detect a speed hack */
+		void CheckClientClockDrift(const Peer& peer, PeerDescriptor& peerDesc, std::uint64_t clientNowMs, std::uint64_t serverNowMs);
+		/**
+		 * @brief Returns `true` if a move from @p from to @p to can be explained by a warp
+		 *
+		 * The client handles warps on its own, so it may take a warp a moment before the server does. The move is
+		 * plausible if a warp origin lies within @p reach of @p from and one of its targets near @p to. The flags of the
+		 * warp are returned in @p flags.
+		 */
+		bool IsPlausibleClientWarp(Vector2f from, Vector2f to, float reach, WarpFlags& flags);
+
+		static bool ActorShouldBeMirrored(Actors::ActorBase* actor);
+		static std::int32_t GetTreasureWeight(std::uint8_t gemType);
+		static bool PlayerShouldHaveUnlimitedHealth(MpGameMode gameMode);
+		void InitializeValidateAssetsPacket(MemoryStream& packet);
+		void InitializeLoadLevelPacket(MemoryStream& packet);
+		static void InitializeCreateRemoteActorPacket(MemoryStream& packet, std::uint32_t actorId, Actors::ActorBase* actor);
+
+		// Per-packet handlers dispatched from OnPacketReceived(); they run on the network thread,
+		// so all gameplay mutations inside go through InvokeAsync()
+		bool HandleClientPacketRpc(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleClientPacketAuth(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleClientPacketLevelReady(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleClientPacketChatMessage(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleClientPacketValidateAssetsResponse(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleClientPacketPlayerReady(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleClientPacketForceResyncActors(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleClientPacketPlayerUpdate(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleClientPacketPlayerKeyPress(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleClientPacketPlayerChangeWeaponRequest(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleClientPacketPlayerSpectateRequest(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleClientPacketPlayerChangeCharacter(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleClientPacketPlayerChangeTeamRequest(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleClientPacketPlayerAckWarped(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketRpc(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPeerSetProperty(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketLoadLevel(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketLevelSetProperty(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketShowInGameLobby(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketFadeOut(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPlaySfx(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPlayCommonSfx(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketStopSfx(const Peer& peer, ArrayView<const std::uint8_t> data);
+		// Remote actor ID a sound of `self` is sent under (`UINT32_MAX` if not remoted yet), and whether its
+		// owner is left out because it plays the sound itself
+		std::uint32_t GetSfxActorId(Actors::ActorBase* self, StringView identifier, bool& excludeSelf);
+		// Client: the actor a sound from the server is attached to - the own player or a remote actor, or `nullptr`
+		Actors::ActorBase* FindSfxActor(std::uint32_t actorId);
+		// Client: stops the tracked sound of an actor with the identifier, see TrackedSfx
+		void StopTrackedSfx(std::uint32_t actorId, StringView identifier);
+		// Client: moves tracked sounds with their actors and drops the finished ones and those of vanished actors
+		void UpdateTrackedSfx();
+		bool HandleServerPacketShowAlert(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketChatMessage(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketSyncTileMap(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketSetTrigger(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketAdvanceTileAnimation(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketCreateDebris(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketCreateControllablePlayer(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketCreateRemoteActor(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketCreateMirroredActor(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketDestroyRemoteActor(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketUpdateAllActors(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketChangeRemoteActorMetadata(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketMarkRemoteActorAsPlayer(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketUpdatePositionsInRound(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketSyncMinimapTrack(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketSyncTeamScores(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketSyncScoreboard(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketSyncRoundResults(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPlayerSetProperty(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPlayerResetProperties(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPlayerRespawn(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPlayerMoveInstantly(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPlayerAckWarped(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPlayerEmitWeaponFlare(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPlayerChangeWeapon(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPlayerTakeDamage(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPlayerPush(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPlayerActivateSpring(const Peer& peer, ArrayView<const std::uint8_t> data);
+		bool HandleServerPacketPlayerWarpIn(const Peer& peer, ArrayView<const std::uint8_t> data);
+
+#if defined(DEATH_DEBUG) && defined(WITH_IMGUI)
+		static constexpr std::int32_t PlotValueCount = 512;
+		
+		std::int32_t _plotIndex;
+		float _actorsMaxCount;
+		float _actorsCount[PlotValueCount];
+		float _remoteActorsCount[PlotValueCount];
+		float _remotingActorsCount[PlotValueCount];
+		float _mirroredActorsCount[PlotValueCount];
+		float _updatePacketMaxSize;
+		float _updatePacketSize[PlotValueCount];
+		float _compressedUpdatePacketSize[PlotValueCount];
+
+		void ShowDebugWindow();
+#endif
+	};
+}
+
+#endif

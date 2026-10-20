@@ -1,0 +1,123 @@
+﻿#pragma once
+
+#if defined(WITH_MULTIPLAYER) || defined(DOXYGEN_GENERATING_OUTPUT)
+
+#include "../ActorBase.h"
+#include "StateInterpolationBuffer.h"
+#include "../Collectibles/CollectibleBase.h"
+#include "../../ShieldType.h"
+
+namespace Jazz2::Actors::Multiplayer
+{
+	/**
+		@brief Remote object in online session
+		
+		A generic actor whose transform, animation and miscellaneous state are synchronized from a remote authority
+		(the server). It has no gameplay logic of its own; the received position is buffered and interpolated on the
+		receiving side to smooth out network delay.
+	*/
+	class RemoteActor : public ActorBase
+	{
+		DEATH_RUNTIME_OBJECT(ActorBase);
+
+	public:
+		/** @brief Creates a new instance */
+		RemoteActor();
+		~RemoteActor();
+
+		/**
+		 * @brief Creates the remote representation for an actor with the specified metadata
+		 *
+		 * Most actors are covered by the generic synchronization, but some render through something else than
+		 * their own sprite (e.g., locally-spawned particles), which has to be replayed on the receiving side by
+		 * a specialized subclass. This factory picks the right one from the metadata path the server sent.
+		 */
+		static std::shared_ptr<RemoteActor> Create(StringView metadataPath);
+
+		/** @brief Initializes the actor from metadata received from the server */
+		virtual void AssignMetadata(std::uint8_t flags, ActorState state, StringView path, AnimState anim, float rotation, float scaleX, float scaleY, ActorRendererType rendererType, DrawableNode::BlendingPreset blendingPreset);
+		/** @brief Sets the per-player recolor (0 = none); reloads the sprites indexed and (re)applies the palette */
+		void SetPlayerColor(std::uint32_t furColor);
+		/** @brief Changes the metadata (e.g., on character change), keeping the current recolor applied */
+		void ChangeMetadata(StringView path);
+		/** @brief Synchronizes the position with the server */
+		void SyncPositionWithServer(Vector2f pos);
+		/** @brief Synchronizes the animation and transform with the server */
+		void SyncAnimationWithServer(AnimState anim, float rotation, float scaleX, float scaleY, Actors::ActorRendererType rendererType);
+		/** @brief Synchronizes miscellaneous state flags with the server */
+		void SyncMiscWithServer(std::uint8_t flags);
+		/**
+		 * @brief Synchronizes the emitted lights with the server
+		 *
+		 * @param lights  Lights to emit, positioned relative to the actor
+		 */
+		void SyncLightsWithServer(ArrayView<const LightEmitter> lights);
+		/** @brief Sets the active shield shown around this remote player (synced from the server) */
+		void SetShield(ShieldType shieldType, float timeLeft);
+		/**
+		 * @brief Attaches a decoration that follows this remote player, or detaches it with `nullptr`
+		 *
+		 * Used for the lizard copter a player hangs on. It's a separate actor that the server destroys as soon as it
+		 * is mounted (see @ref Player::SetModifier()), so the reference kept here is what keeps it alive and drawn.
+		 */
+		void SetModifierDecor(std::shared_ptr<ActorBase> decor);
+		/** @brief Starts (or ends with zero) the sugar rush of this remote player, whose star trail is replayed locally */
+		void SetSugarRush(float timeLeft);
+
+	protected:
+#ifndef DOXYGEN_GENERATING_OUTPUT
+		StateInterpolationBuffer _stateBuffer;
+		AnimState _lastAnim;
+		bool _isAttachedLocally;
+		// Set by subclasses that replay the actor's visuals themselves (the sprite stays draw-disabled): keeps
+		// position interpolation active, which is otherwise collapsed on every push while the renderer is hidden,
+		// making the position only step at (coinciding) packet arrivals instead of moving smoothly
+		bool _alwaysInterpolate;
+		std::uint32_t _furColor;
+		// Allocated palette offset into the shared palette texture for this player's recolor (-1 = none)
+		std::int32_t _paletteOffset;
+		// Blending mode the object draws itself with on the server, kept because it has to be re-applied
+		// whenever the sprite's shader changes (see ApplyBlendingPreset())
+		DrawableNode::BlendingPreset _blendingPreset;
+		// Active shield shown around this player (synced from the server). The decoration is drawn in OnDraw; the
+		// time decays locally, mirroring the owning player (the server only sends shield state changes).
+		ShieldType _activeShield;
+		float _activeShieldTime;
+		std::unique_ptr<RenderCommand> _shieldRenderCommands[2];
+		// Decoration attached to this player (the lizard copter it hangs on), moved along with it (synced from the server)
+		std::shared_ptr<ActorBase> _modifierDecor;
+		// Remaining sugar rush of this player (synced from the server, decays locally like the shield). The white
+		// renderer arrives with the actor updates, but the star trail is local debris the owner spawns for itself.
+		float _sugarRushLeft;
+		float _sugarRushStarsTime;
+		// How long this player's run-in-place pose has been up, and the spark schedule that follows from it.
+		// Both are local: the charge is a pure function of that time, so nothing about the wind-up is sent and
+		// counting it here gives the same number the owner has. See Player::UpdateRemoteRevUp().
+		float _revUpTime;
+		float _revUpSparkCooldown;
+		// Lights the object emits on the server (see ActorBase::OnEmitRemotedLights()). A remote actor runs none
+		// of the object's logic, so it can only replay what it was told. Positions are relative to the actor, so
+		// they keep following the interpolated sprite between updates.
+		SmallVector<LightEmitter, 0> _lights;
+		// Swarm of lights around an illuminated collectible, seeded locally from the remoted
+		// ActorState::Illuminated - it's decoration nobody can tell apart from the server's own
+		Collectibles::CollectibleBase::IlluminateLights _illuminateLights;
+#endif
+
+		Task<bool> OnActivatedAsync(const ActorActivationDetails& details) override;
+		void OnUpdate(float timeMult) override;
+		bool OnDraw(RenderQueue& renderQueue) override;
+		void OnEmitLights(SmallVectorImpl<LightEmitter>& lights) override;
+		void OnAttach(ActorBase* parent) override;
+		void OnDetach(ActorBase* parent) override;
+
+		// Allocates/updates/releases this player's palette row from _furColor and selects it on the renderer
+		void RefreshColorPalette();
+		// (Re)applies the synchronized blending mode. Assigning a shader to the sprite's material - which a
+		// renderer type change and every recolor do - resets the blending factors to that shader's own default,
+		// so anything not drawn with plain alpha blending has to set them again afterwards.
+		void ApplyBlendingPreset();
+	};
+}
+
+#endif

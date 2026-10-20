@@ -1,0 +1,154 @@
+#include "D3D11RenderTarget.h"
+#include "D3D11Device.h"
+#include "D3D11Texture.h"
+
+#include <d3d11.h>
+
+namespace nCine::RHI::D3D11
+{
+	D3D11RenderTarget::D3D11RenderTarget()
+		: _numDrawBuffers(1)
+	{
+		for (std::uint32_t i = 0; i < MaxColorAttachments; i++) {
+			_colorTextures[i] = nullptr;
+			_rtvs[i] = nullptr;
+			_rtvTextures[i] = nullptr;
+		}
+	}
+
+	D3D11RenderTarget::~D3D11RenderTarget()
+	{
+		// Clear from the device first so a destroyed render target can't dangle as _currentRenderTarget
+		// (this also scrubs every released RTV from the device's last-bound shadow)
+		D3D11Device::UnbindRenderTarget(this);
+		for (std::uint32_t i = 0; i < MaxColorAttachments; i++) {
+			ReleaseRTV(i);
+		}
+	}
+
+	void D3D11RenderTarget::ReleaseRTV(std::uint32_t index)
+	{
+		if (_rtvs[index] != nullptr) {
+			// Scrub from the device's last-bound shadow first: the view is released right after this call and a
+			// new RTV recycling the same pointer would otherwise be mistaken for still bound and its bind skipped
+			D3D11Device::OnRtvReleased(_rtvs[index]);
+			_rtvs[index]->Release();
+			_rtvs[index] = nullptr;
+		}
+		_rtvTextures[index] = nullptr;
+	}
+
+	ID3D11RenderTargetView* D3D11RenderTarget::GetRTV(std::uint32_t index)
+	{
+		if (index >= MaxColorAttachments) {
+			return nullptr;
+		}
+		D3D11Texture* color = _colorTextures[index];
+		if (color == nullptr) {
+			return nullptr;
+		}
+		// Rebuild if the attachment changed or the view has not been created yet
+		if (_rtvs[index] != nullptr && _rtvTextures[index] == color) {
+			return _rtvs[index];
+		}
+		ReleaseRTV(index);
+
+		ID3D11Device* device = D3D11Device::GetD3DDevice();
+		ID3D11Texture2D* tex = color->GetOrCreateTexture2D();
+		if (device == nullptr || tex == nullptr) {
+			return nullptr;
+		}
+		if (FAILED(device->CreateRenderTargetView(tex, nullptr, &_rtvs[index]))) {
+			_rtvs[index] = nullptr;
+			return nullptr;
+		}
+		_rtvTextures[index] = color;
+		return _rtvs[index];
+	}
+
+	std::uint32_t D3D11RenderTarget::GetAttachedCount() const
+	{
+		std::uint32_t count = 0;
+		while (count < MaxColorAttachments && _colorTextures[count] != nullptr) {
+			count++;
+		}
+		return count;
+	}
+
+	std::uint32_t D3D11RenderTarget::GetRTVs(ID3D11RenderTargetView* outRtvs[MaxColorAttachments])
+	{
+		// The bound set is the contiguous attached run, limited by the draw-buffer count (mirroring
+		// glDrawBuffers) and truncated at the first attachment whose view cannot be created
+		std::uint32_t count = GetAttachedCount();
+		if (_numDrawBuffers > 0 && _numDrawBuffers < count) {
+			count = _numDrawBuffers;
+		}
+		for (std::uint32_t i = 0; i < count; i++) {
+			outRtvs[i] = GetRTV(i);
+			if (outRtvs[i] == nullptr) {
+				return i;
+			}
+		}
+		return count;
+	}
+
+	void D3D11RenderTarget::AttachColorTexture(D3D11Texture& texture, std::uint32_t index)
+	{
+		if (index < MaxColorAttachments) {
+			_colorTextures[index] = &texture;
+			texture.SetRenderTarget(true);
+			ReleaseRTV(index);
+		}
+	}
+
+	void D3D11RenderTarget::DetachColorTexture(std::uint32_t index)
+	{
+		if (index < MaxColorAttachments) {
+			_colorTextures[index] = nullptr;
+			ReleaseRTV(index);
+		}
+	}
+
+	void D3D11RenderTarget::AttachDepthStencil(DepthStencilFormat format, std::int32_t width, std::int32_t height)
+	{
+		static_cast<void>(format);
+		static_cast<void>(width);
+		static_cast<void>(height);
+	}
+
+	void D3D11RenderTarget::DetachDepthStencil(DepthStencilFormat format)
+	{
+		static_cast<void>(format);
+	}
+
+	void D3D11RenderTarget::BindDraw()
+	{
+		D3D11Device::SetRenderTarget(this);
+	}
+
+	void D3D11RenderTarget::UnbindDraw()
+	{
+		D3D11Device::SetRenderTarget(nullptr);
+	}
+
+	bool D3D11RenderTarget::SetDrawBuffers(std::uint32_t numColorAttachments)
+	{
+		_numDrawBuffers = numColorAttachments;
+		return true;
+	}
+
+	bool D3D11RenderTarget::IsStatusComplete()
+	{
+		return (_colorTextures[0] != nullptr);
+	}
+
+	void D3D11RenderTarget::InvalidateDepthStencil(DepthStencilFormat format)
+	{
+		static_cast<void>(format);
+	}
+
+	void D3D11RenderTarget::SetObjectLabel(StringView label)
+	{
+		static_cast<void>(label);
+	}
+}

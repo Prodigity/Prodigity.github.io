@@ -1,0 +1,245 @@
+﻿#pragma once
+
+// Set default name and version if not provided by CMake
+/** @brief Application name */
+#if !defined(NCINE_APP)
+#	define NCINE_APP "jazz2"
+#endif
+/** @brief Application full name */
+#if !defined(NCINE_APP_NAME)
+#	define NCINE_APP_NAME "Jazz² Resurrection"
+#endif
+/** @brief Application version */
+#if !defined(NCINE_VERSION)
+#	define NCINE_VERSION "3.9.0"
+#endif
+
+/**
+	@brief Game ID of the GameCube disc image
+
+	Six characters, the game code and the maker code. The game recognizes its own disc by it and creates its memory
+	card saves under it, and AssetPacker takes it as the default of `create-image --game-id=` --- the GameCube build
+	passes it to the tool explicitly anyway (`GAMECUBE_GAME_ID` in CMake). "GJJ" is no retail game, so Dolphin
+	applies no game-specific settings or patches to the disc and its saves do not mix with anything else's, "E" is
+	the region (NTSC-U, which every loader and optical drive emulator boots), and "JR" is the maker code.
+*/
+#if !defined(NCINE_GAMECUBE_GAME_ID)
+#	define NCINE_GAMECUBE_GAME_ID "GJJEJR"
+#endif
+
+/**
+	@brief Application multiplayer protocol version
+
+	Decides whether a client and a server can play together, independently of @ref NCINE_VERSION. Bump it
+	whenever the wire changes incompatibly --- packet types, property types, field layouts or the meaning of a
+	field --- and leave it alone for releases that don't touch the wire, so those can still play together.
+
+	It is compared in full, patch included, so a bump of any component is enough to separate two builds and the
+	number is free to move independently of the release it ships in. Only ever set here: it is deliberately not
+	derived from the build or from Git, so two builds of the same wire format always agree on it.
+
+	A server accepts the clients from @ref NCINE_PROTOCOL_VERSION_MIN to @ref NCINE_PROTOCOL_VERSION_MAX, which
+	is only this version unless set otherwise.
+*/
+#if !defined(NCINE_PROTOCOL_VERSION)
+#	define NCINE_PROTOCOL_VERSION "3.9.0"
+#endif
+/**
+	@brief Oldest client multiplayer protocol version the server accepts
+
+	Together with @ref NCINE_PROTOCOL_VERSION_MAX it bounds the protocol versions of the clients a server lets
+	in, which is checked when a client authenticates. The server announces the range in local discovery, in the
+	public server list and in its answer to the authentication, so the server list can tell which servers the
+	local client fits, and the client can leave a server whose answer carries no range (a server older than the
+	range, which let it in by a looser check of its own).
+
+	Lower it only when the server still talks to the older clients correctly, i.e. the wire changed since then
+	only in ways they don't notice, or the server handles those clients differently. Both bounds are inclusive.
+*/
+#if !defined(NCINE_PROTOCOL_VERSION_MIN)
+#	define NCINE_PROTOCOL_VERSION_MIN NCINE_PROTOCOL_VERSION
+#endif
+/**
+	@brief Newest client multiplayer protocol version the server accepts
+
+	See @ref NCINE_PROTOCOL_VERSION_MIN. Raise it above @ref NCINE_PROTOCOL_VERSION only for a newer protocol
+	version already known to stay compatible with this one.
+*/
+#if !defined(NCINE_PROTOCOL_VERSION_MAX)
+#	define NCINE_PROTOCOL_VERSION_MAX NCINE_PROTOCOL_VERSION
+#endif
+
+/** @brief Application build year */
+#if !defined(NCINE_BUILD_YEAR)
+#	define NCINE_BUILD_YEAR "2026"
+#endif
+/** @brief Application package name on Linux */
+#if !defined(NCINE_LINUX_PACKAGE)
+#	define NCINE_LINUX_PACKAGE NCINE_APP_NAME
+#endif
+
+// Prefer local version of shared libraries in CMake build
+#if defined(CMAKE_BUILD) && defined(__has_include)
+#	if __has_include("../Shared/Common.h")
+#		define __HAS_LOCAL_COMMON
+#	endif
+#endif
+#ifdef __HAS_LOCAL_COMMON
+#	include "../Shared/Common.h"
+#	include "../Shared/Asserts.h"
+#else
+#	include <Common.h>
+#	include <Asserts.h>
+#endif
+
+#include <stdlib.h>
+
+/** @brief Install prefix on Unix systems, usually `"/usr/local"` */
+#if (!defined(NCINE_INSTALL_PREFIX) && defined(DEATH_TARGET_UNIX)) || defined(DOXYGEN_GENERATING_OUTPUT)
+#	define NCINE_INSTALL_PREFIX "/usr/local"
+#endif
+
+// Check platform-specific capabilities
+/** @brief Whether the current platform supports a gamepad rumble, see @relativeref{nCine,IInputManager::joystickRumble()} */
+#if (defined(WITH_SDL2) || defined(WITH_SDL3)) || defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_WINDOWS_RT) || defined(DEATH_TARGET_N64) || defined(DOXYGEN_GENERATING_OUTPUT)
+#	define NCINE_HAS_GAMEPAD_RUMBLE
+#endif
+/**
+	@brief Whether the current platform can deliver keyboard input
+
+	The consoles excluded below have no keyboard the engine can read: their input backends implement
+	@relativeref{nCine,IInputManager::keyboardState()} only to satisfy the interface and never produce a key
+	event, so a key binding on them can never fire. It would still be built into the mapping tables and listed
+	in the controls screen, which is why the defaults skip them entirely.
+*/
+#if (!defined(DEATH_TARGET_N64) && !defined(DEATH_TARGET_DREAMCAST) && !defined(DEATH_TARGET_GAMECUBE) && \
+	!defined(DEATH_TARGET_WII) && !defined(DEATH_TARGET_3DS) && !defined(DEATH_TARGET_PSP) && \
+	!defined(DEATH_TARGET_PS2) && !defined(DEATH_TARGET_PS3)) || defined(DOXYGEN_GENERATING_OUTPUT)
+#	define NCINE_HAS_KEYBOARD
+#endif
+/** @brief Whether the current platform has a native (hardware) back button */
+#if defined(DEATH_TARGET_ANDROID) || defined(DOXYGEN_GENERATING_OUTPUT)
+#	define NCINE_HAS_NATIVE_BACK_BUTTON
+#endif
+/** @brief Whether the current platform supports vibrations of the device */
+#if defined(DEATH_TARGET_ANDROID)
+#	define NCINE_HAS_VIBRATIONS
+#endif
+/** @brief Whether the current platform has non-fullscreen windows */
+#if !defined(DEATH_TARGET_ANDROID) && !defined(DEATH_TARGET_IOS) && !defined(DEATH_TARGET_SWITCH) && \
+		!defined(DEATH_TARGET_DREAMCAST) && !defined(DEATH_TARGET_WII) && !defined(DEATH_TARGET_GAMECUBE) && \
+		!defined(DEATH_TARGET_3DS) && !defined(DEATH_TARGET_PSP) && !defined(DEATH_TARGET_VITA) && !defined(DEATH_TARGET_PS2) && \
+		!defined(DEATH_TARGET_PS3) && !defined(DEATH_TARGET_N64) && !defined(DEATH_TARGET_AMIGAOS)
+#	define NCINE_HAS_WINDOWS
+#endif
+/**
+	@brief Whether the current platform can have a touchscreen
+
+	Listed rather than excluded, so a platform that has no touchscreen doesn't acquire one by not being
+	mentioned - which is how the consoles ended up offering to configure touch controls.
+
+	Where it is not defined, no touch event ever reaches the game (the input backends drop them at the
+	source), so the on-screen controls can never appear - and the code that only serves them is compiled
+	out: the HUD's touch buttons and joystick, the touch dispatch and back arrow of the menus, the touch
+	handling of the in-game console and the multiplayer lobby, and the section that configures the controls.
+	The PS Vita does have a front touchscreen and a rear touchpad, but both sit exactly where the console is
+	held, so they only ever fire by accident - it is played with the sticks and buttons.
+*/
+#if defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_IOS) || defined(DEATH_TARGET_EMSCRIPTEN) || \
+		defined(DEATH_TARGET_SWITCH) || \
+		defined(DEATH_TARGET_WINDOWS) || defined(DEATH_TARGET_UNIX) || defined(DOXYGEN_GENERATING_OUTPUT)
+#	define NCINE_HAS_TOUCH_CONTROLS
+#endif
+/**
+	@brief Whether the current platform can drive the RGB lighting of connected devices
+
+	Only Windows (through the Razer Chroma™ SDK) and the web build (through a local bridge) actually do so;
+	the other desktop platforms are included because that is where such a device is plugged in, and where
+	@relativeref{Jazz2::Input,RgbLights} could gain a backend without the option having to reappear.
+*/
+#if (defined(DEATH_TARGET_WINDOWS) && !defined(DEATH_TARGET_WINDOWS_RT)) || defined(DEATH_TARGET_EMSCRIPTEN) || \
+		defined(DEATH_TARGET_UNIX) || (defined(DEATH_TARGET_APPLE) && !defined(DEATH_TARGET_IOS)) || \
+		defined(DOXYGEN_GENERATING_OUTPUT)
+#	define NCINE_HAS_RGB_LIGHTS
+#endif
+/**
+	@brief Whether the current platform can convert the original game data into a cache of its own
+
+	The Dreamcast and PlayStation 2 play from a disc, the Nintendo 64 from a read-only ROM image,
+	and the GameCube has nowhere to put a cache the size of a converted installation, and the web
+	build is prepared entirely ahead of time - none of them can write one, so they consume a content
+	tree prebaked with @ref asset-packer "AssetPacker", skip the conversion altogether and never look
+	for the original game files, which are not there in the first place.
+
+	Everywhere else the first-run conversion exists, including the PlayStation Portable and the Wii,
+	where the content sits on a writable memory stick or SD card. Those two are usually given a prebaked
+	tree as well, which is recognized at runtime rather than assumed here, see
+	@relativeref{Jazz2,ContentResolver::IsContentPrebaked()}.
+*/
+#if !defined(DEATH_TARGET_EMSCRIPTEN) && !defined(DEATH_TARGET_DREAMCAST) && !defined(DEATH_TARGET_GAMECUBE) && !defined(DEATH_TARGET_PS2) && !defined(DEATH_TARGET_N64)
+#	define NCINE_HAS_WRITABLE_CACHE
+#endif
+/**
+	@brief Whether the current platform can store a resumable mid-level session
+
+	The state file is written next to the configuration, and on the Nintendo 64 that is the cartridge
+	EEPROM: libdragon's `eepromfs` is a fixed table of files declared up front, and the two kilobytes it
+	has hold the configuration alone, so a second file cannot be created there at all. Everything else
+	writes it, including the platforms with no writable content cache --- the Dreamcast and the GameCube
+	put it on a memory card next to their settings.
+
+	Episode progress does not depend on this. That lives in the configuration itself
+	@m_span{m-text m-dim} (@relativeref{Jazz2,PreferencesCache::GetEpisodeContinue()}) @m_endspan and is
+	saved on every platform, so the N64 remembers which levels have been finished and where an episode
+	was left --- only continuing from the middle of a level is unavailable there.
+*/
+#if !defined(DEATH_TARGET_N64)
+#	define NCINE_HAS_RESUMABLE_STATE
+#endif
+/**
+	@brief Whether the audio device plays sound in formats of its own instead of samples the engine decodes
+
+	The content prepared for the Nintendo 64 carries every sound effect as a `.wav64` file the mixer streams
+	from the cartridge, and every track as an `.xm64` module or a `.wav64` recording, all of which libdragon
+	plays without the engine decoding anything. There @relativeref{nCine,AudioBuffer} and
+	@relativeref{nCine,AudioStream} only hand files over to the device, and the whole decoding path is compiled
+	out: the audio loaders and readers, sample uploads, the streaming buffer queue and the decoding thread.
+	Everywhere else it is the other way around, and the native playback interface does not exist.
+*/
+#if defined(DEATH_TARGET_N64)
+#	define NCINE_HAS_NATIVE_AUDIO
+#endif
+
+/** @brief Function name */
+#if defined(__DEATH_CURRENT_FUNCTION)
+#	define NCINE_CURRENT_FUNCTION __DEATH_CURRENT_FUNCTION
+#else
+#	define NCINE_CURRENT_FUNCTION ""
+#endif
+
+#ifndef DOXYGEN_GENERATING_OUTPUT
+
+// Return assert macros
+#define RETURN_ASSERT(x) do { if DEATH_UNLIKELY(!(x)) { LOGE("RETURN_ASSERT(" #x ")"); return; } } while (false)
+
+// Return false assert macros
+#define RETURNF_ASSERT(x) do { if DEATH_UNLIKELY(!(x)) { LOGE("RETURNF_ASSERT(" #x ")"); return false; } } while (false)
+
+// Fatal assert macros
+#define FATAL_ASSERT(x)						\
+	do {									\
+		if DEATH_UNLIKELY(!(x)) {			\
+			LOGF("FATAL_ASSERT(" #x ")");	\
+			DEATH_ASSERT_BREAK();			\
+		}									\
+	} while (false)
+
+#define FATAL_ASSERT_MSG(x, fmt, ...)		\
+	do {									\
+		if DEATH_UNLIKELY(!(x)) {			\
+			LOGF(fmt, ##__VA_ARGS__);		\
+			DEATH_ASSERT_BREAK();			\
+		}									\
+	} while (false)
+
+#endif

@@ -1,0 +1,1783 @@
+﻿#include "MainApplication.h"
+#include "IAppEventHandler.h"
+#include "Input/IInputManager.h"
+#include "Threading/Thread.h"
+#include "../Main.h"
+
+#include <IO/FileSystem.h>
+
+#if (defined(WITH_SDL2) || defined(WITH_SDL3))
+#	include "Backends/SdlGfxDevice.h"
+#	include "Backends/SdlInputManager.h"
+#elif defined(WITH_GLFW)
+#	include "Backends/GlfwGfxDevice.h"
+#	include "Backends/GlfwInputManager.h"
+#elif defined(WITH_QT5)
+#	include "Backends/Qt5GfxDevice.h"
+#	include "Backends/Qt5InputManager.h"
+#elif defined(WITH_OGC)
+#	include "Backends/Ogc/OgcGfxDevice.h"
+#	include "Backends/Ogc/OgcInputManager.h"
+#	include "Backends/Ogc/OgcStorage.h"
+#elif defined(WITH_CTR)
+#	include "Backends/Ctr/CtrGfxDevice.h"
+#	include "Backends/Ctr/CtrInputManager.h"
+#	include "Backends/Ctr/CtrPlatform.h"
+#elif defined(WITH_DC)
+#	include "Backends/Dc/DcGfxDevice.h"
+#	include "Backends/Dc/DcInputManager.h"
+#elif defined(WITH_PSP)
+#	include "Backends/Psp/PspGfxDevice.h"
+#	include "Backends/Psp/PspInputManager.h"
+#	include "Backends/Psp/PspNetwork.h"
+#elif defined(WITH_PS2)
+#	include "Backends/Ps2/Ps2GfxDevice.h"
+#	include "Backends/Ps2/Ps2InputManager.h"
+#	include "Backends/Ps2/Ps2Modules.h"
+#	include "Backends/Ps2/Ps2Storage.h"
+#elif defined(WITH_PS3)
+#	include "Backends/Ps3/Ps3GfxDevice.h"
+#	include "Backends/Ps3/Ps3InputManager.h"
+#elif defined(WITH_N64)
+#	include "Backends/N64/N64GfxDevice.h"
+#	include "Backends/N64/N64InputManager.h"
+#elif defined(WITH_AMIGA)
+#	include "Backends/Amiga/AmigaGfxDevice.h"
+#	include "Backends/Amiga/AmigaInputManager.h"
+#	include "Backends/Amiga/AmigaPlatform.h"
+#endif
+
+// For resizing the swap chain when the window size changes (the call is uniform across the backends;
+// it is a no-op on the OpenGL and software backends, which have no backend-owned swap chain)
+#include "Graphics/RHI/Rhi.h"
+
+#if defined(DEATH_TARGET_EMSCRIPTEN)
+#	include <emscripten/emscripten.h>
+#elif defined(DEATH_TARGET_SWITCH)
+#	include <switch.h>
+#elif defined(DEATH_TARGET_DREAMCAST)
+#	include <kos.h>
+#elif defined(DEATH_TARGET_N64)
+#	include <libdragon.h>
+#elif defined(DEATH_TARGET_WII) || defined(DEATH_TARGET_GAMECUBE)
+#	include <gccore.h>
+#	include <fat.h>
+#	include <ogc/pad.h>
+#	include <sys/iosupport.h>
+#	if defined(DEATH_TARGET_WII)
+#		include <wiiuse/wpad.h>
+#	endif
+#elif defined(DEATH_TARGET_3DS)
+#	include <3ds.h>
+#elif defined(DEATH_TARGET_PS2)
+extern "C" {
+#	include <kernel.h>
+#	include <sifrpc.h>
+#	include <loadfile.h>
+#	include <libcdvd.h>
+#	include <libmc.h>
+#	include <delaythread.h>
+#	include <debug.h>
+}
+#	include <cstdio>
+#	if defined(WITH_PS2AUDIO)
+#		include "Audio/Backends/Ps2/Ps2AudioDevice.h"
+#	endif
+#elif defined(DEATH_TARGET_PSP)
+#	include "Backends/Psp/PspPower.h"
+#	include <pspkernel.h>
+#	include <pspdebug.h>
+#	include <psppower.h>
+#	include <kubridge.h>
+#elif defined(DEATH_TARGET_VITA)
+#	include <vitasdk.h>
+#	include <vitaGL.h>
+#elif defined(DEATH_TARGET_UNIX)
+#	include <pwd.h>
+#	include <unistd.h>
+#elif defined(DEATH_TARGET_WINDOWS)
+#	include <timeapi.h>
+#	include <Utf8.h>
+#endif
+
+#include "Input/IInputEventHandler.h"
+
+#include <Utf8.h>
+
+#include "tracy.h"
+
+using namespace Death;
+using namespace Death::Containers::Literals;
+using namespace Death::IO;
+#if (defined(WITH_SDL2) || defined(WITH_SDL3)) || defined(WITH_GLFW) || defined(WITH_QT5) || defined(WITH_OGC) || defined(WITH_CTR) || defined(WITH_DC) || defined(WITH_PSP) || defined(WITH_PS2) || defined(WITH_PS3) || defined(WITH_N64) || defined(WITH_AMIGA)
+using namespace nCine::Backends;
+#endif
+
+#if defined(DEATH_TARGET_WINDOWS_RT)
+#	error "For DEATH_TARGET_WINDOWS_RT, UwpApplication should be used instead of MainApplication"
+#endif
+
+#if defined(DEATH_TARGET_N64)
+// libdragon's `debug.h` hides the whole logging API behind `#ifndef NDEBUG`: in a release build
+// `debug_init_usblog()` and `debug_init_emulog()` are macros that expand to `false` without calling
+// anything, and `debugf()` expands to nothing at all. The FUNCTIONS are still there - libdragon itself
+// is not built with our NDEBUG, so libdragon.a exports them - and they are the only thing that installs
+// the stderr sink (`hook_stdio_calls`), so a release build that goes through the macros gets no log
+// channel whatsoever and silently drops every trace message. Declaring them directly bypasses the
+// macros; the `#undef`s are needed because the macros would otherwise eat these declarations too.
+#	undef debug_init_usblog
+#	undef debug_init_emulog
+extern "C" bool debug_init_usblog(void);
+extern "C" bool debug_init_emulog(void);
+
+static bool N64DebugInitUsbLog() { return debug_init_usblog(); }
+static bool N64DebugInitEmuLog() { return debug_init_emulog(); }
+
+#endif
+
+#if defined(DEATH_TARGET_N64) || defined(DEATH_TARGET_DREAMCAST) || defined(DEATH_TARGET_PS2)
+namespace __gnu_cxx
+{
+	/**
+		@brief Replaces libstdc++'s default @ref std::terminate handler
+
+		The default one names the exception being propagated in its message, and to do that it runs the
+		C++ demangler, which is 20 to 55 KB of code depending on the target and one of the largest library
+		objects in the link. These builds have exceptions disabled, so nothing can be propagating: terminate
+		is reachable only through a pure-virtual call, a `noexcept` violation or an explicit call, none of
+		which has a type name to print. Defining the symbol here is what keeps the demangler out of the
+		image - the linker never has to pull libstdc++'s copy to resolve it.
+
+		Only on the consoles whose memory this actually buys something on, and where it has been measured;
+		everywhere else the default handler and its more informative message are kept.
+	*/
+	void __verbose_terminate_handler()
+	{
+		LOGF("std::terminate() was called, the process cannot continue");
+		::abort();
+	}
+}
+#endif
+
+#if defined(DEATH_TARGET_WINDOWS)
+#	include <shellapi.h>
+#	include <unknwn.h>
+
+// {4ce576fa-83dc-4F88-951c-9d0782b4e376}
+static const GUID CLSID_UIHostNoLaunch = { 0x4CE576FA, 0x83DC, 0x4f88, { 0x95, 0x1C, 0x9D, 0x07, 0x82, 0xB4, 0xE3, 0x76 } };
+// {37c994e7_432b_4834_a2f7_dce1f13b834b}
+static const GUID IID_ITipInvocation = { 0x37c994e7, 0x432b, 0x4834, { 0xa2, 0xf7, 0xdc, 0xe1, 0xf1, 0x3b, 0x83, 0x4b } };
+
+struct ITipInvocation : IUnknown
+{
+	virtual HRESULT STDMETHODCALLTYPE Toggle(HWND wnd) = 0;
+};
+
+static DWORD GetTabTipPathFromRegistry(wchar_t* dstPath, DWORD dstSize)
+{
+	HKEY hKey;
+	if (::RegOpenKeyEx(HKEY_LOCAL_MACHINE, TEXT("SOFTWARE\\Classes\\CLSID\\{054AAE20-4BEA-4347-8A35-64A533254A9D}\\LocalServer32"), 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+		return 0;
+	}
+
+	DWORD type, cbData;
+	if (::RegQueryValueEx(hKey, NULL, NULL, &type, NULL, &cbData) != ERROR_SUCCESS) {
+		::RegCloseKey(hKey);
+		return 0;
+	}
+
+	if ((type != REG_SZ && type != REG_EXPAND_SZ) || dstSize <= (cbData / sizeof(wchar_t))) {
+		::RegCloseKey(hKey);
+		return 0;
+	}
+
+	if (::RegQueryValueEx(hKey, NULL, NULL, NULL, reinterpret_cast<LPBYTE>(dstPath), &cbData) != ERROR_SUCCESS) {
+		::RegCloseKey(hKey);
+		return 0;
+	}
+
+	::RegCloseKey(hKey);
+	return DWORD(wcsnlen(dstPath, dstSize));
+}
+#endif
+
+#if defined(DEATH_TARGET_PSP)
+// The firmware reads these out of the ELF to decide how to load it, so they have to exist at namespace
+// scope in the executable itself, and the module name has to stay plain ASCII (it goes into a 27-byte
+// field), which is why it is NCINE_APP rather than NCINE_APP_NAME.
+//
+// Any negative heap size means "everything that is free, less the threshold below" - the magnitude is not
+// read at all, because PSPSDK's _sbrk only tests the sign - which is what a game that loads its assets into
+// main memory wants, since a fixed budget would only leave memory unusable. The whole block is allocated
+// once, on the first sbrk (so before main), and never grows.
+//
+// The threshold is what stays free for everything the firmware allocates outside that heap, and PSPSDK's
+// own default of 512 KB is not enough here: it has to hold the network PRXes - two for the common module,
+// three more for infrastructure mode, five more for ad hoc mode - plus sceNetInit()'s 128 KB pool and the
+// stacks its threads and sceNetApctlInit() ask for. Loading the ad hoc module against the default failed
+// with a kernel allocation error, so it is raised; PspNetwork logs how much is actually free before every
+// module load, which is the number to dial this back against if the memory is ever needed elsewhere.
+//
+// PSP_MAIN_THREAD_ATTR asks for the VFPU, whose vector unit is the Allegrex's only fast float path. The
+// shared math code compiles to ordinary FPU instructions today, but a thread that was not created with
+// THREAD_ATTR_VFPU cannot use it at all, so the attribute is set now rather than being a surprise later.
+PSP_MODULE_INFO(NCINE_APP, PSP_MODULE_USER, 1, 0);
+PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
+PSP_HEAP_SIZE_KB(-1);
+PSP_HEAP_THRESHOLD_SIZE_KB(2048);
+#endif
+
+namespace nCine
+{
+#if defined(DEATH_TARGET_WII) || defined(DEATH_TARGET_GAMECUBE)
+	// Set from the power/reset event callbacks, which run in interrupt context and must not do more
+	// than this - the main loop picks it up and shuts the game down in an orderly way
+	static volatile bool ogcShutdownRequested = false;
+
+	static ssize_t OgcNullWrite(struct _reent* r, void* fd, const char* ptr, size_t len)
+	{
+		return len;
+	}
+
+	// Replaces the boot console's stdout once the real video device owns the screen (see below)
+	static const devoptab_t ogcNullOut = { "stdout", 0, nullptr, nullptr, OgcNullWrite };
+#endif
+
+#if defined(DEATH_TARGET_PSP)
+	// Set from the HOME-button exit callback, which runs on its own firmware thread and must not do more
+	// than this - the main loop picks it up and shuts the game down in an orderly way (exactly like the
+	// libogc power/reset callbacks above)
+	static volatile bool pspShutdownRequested = false;
+
+	static int PspExitCallback(int arg1, int arg2, void* common)
+	{
+		static_cast<void>(arg1); static_cast<void>(arg2); static_cast<void>(common);
+		pspShutdownRequested = true;
+		return 0;
+	}
+
+	// The callback can only be registered from a thread that then sleeps waiting for callbacks, so it needs
+	// a thread of its own - this is the standard PSPSDK arrangement (sceKernelSleepThreadCB is what makes
+	// the firmware deliver them). Without it the HOME button does nothing and the console can only be
+	// switched off, which is why every PSP title sets this up before anything else. The power callback
+	// goes on the same thread, for the same reason (see PspPower).
+	static int PspCallbackThread(SceSize args, void* argp)
+	{
+		static_cast<void>(args); static_cast<void>(argp);
+		int callbackId = sceKernelCreateCallback("nCineExitCallback", PspExitCallback, nullptr);
+		sceKernelRegisterExitCallback(callbackId);
+		Backends::PspPower::RegisterCallback();
+		sceKernelSleepThreadCB();
+		return 0;
+	}
+
+#endif
+
+#if defined(DEATH_TARGET_PSP) || defined(DEATH_TARGET_VITA)
+	/**
+		@brief Returns the hardware revision the console reports for itself
+
+		These handhelds shipped in revisions that differ in ways a bug report cannot be read without: a
+		PSP-1000 has half the memory of every later model and no second analog anywhere in the family, and
+		a PlayStation TV is a Vita with no screen, no touch panels and no sixaxis. A desktop log can be
+		read back to a machine from the GPU and driver strings; a console log has nothing of the sort, so
+		the model goes into the banner itself.
+	*/
+	static const char* GetConsoleModelName()
+	{
+#	if defined(DEATH_TARGET_PSP)
+		// `sceKernelGetModel()` is a kernel export and cannot be reached from a user-mode module, so this
+		// goes through kubridge's user-mode relay of it instead (see the `pspkubridge` note in CMake).
+		// The value it returns is the hardware generation minus one - 0 is 01g, 1 is 02g and so on - and
+		// the gaps below (06g, 08g, 10g) are motherboard revisions that were never a retail model.
+		switch (kuKernelGetModel()) {
+			case 0: return "PSP-1000";
+			case 1: return "PSP-2000";
+			case 2: return "PSP-3000 (03g)";
+			case 3: return "PSP-3000 (04g)";
+			case 4: return "PSP-Go";
+			case 6: return "PSP-3000 (07g)";
+			case 8: return "PSP-E1000 (09g)";
+			case 10: return "PSP-E1000 (11g)";
+			default: return "unknown PSP model";
+		}
+#	else
+		switch (sceKernelGetModel()) {
+			case SCE_KERNEL_MODEL_VITA: return "PS Vita";
+			case SCE_KERNEL_MODEL_VITATV: return "PlayStation TV";
+			default: return "unknown PS Vita model";
+		}
+#	endif
+	}
+#endif
+
+#if defined(DEATH_TARGET_PS2)
+	namespace
+	{
+		/**
+			@brief Fills the whole display with one colour, with no framebuffer involved at all
+
+			`PMODE = 0` switches both read circuits off, which leaves the raster showing `BGCOLOR` alone - the
+			two GS privileged registers, which are reachable from the very first instruction. Each stage of the
+			startup below sets a different colour, so a boot that stops before the boot console can draw a
+			line still says how far it got: the last colour stays on the television.
+		*/
+		void Ps2BootMarker(std::uint32_t rgb)
+		{
+			*reinterpret_cast<volatile std::uint64_t*>(0x12000000) = 0;		// PMODE
+			*reinterpret_cast<volatile std::uint64_t*>(0x120000E0) = rgb;	// BGCOLOR, R in the low byte
+		}
+
+		constexpr std::uint32_t Ps2MarkerStaticInit = 0x0000FF;	// Red: static initialization has begun
+		constexpr std::uint32_t Ps2MarkerRun = 0x00FF00;			// Green: main() reached MainApplication::Run()
+		constexpr std::uint32_t Ps2MarkerTrace = 0xFF0000;			// Blue: the trace system is up, the boot console is next
+
+		/** @brief Runs ahead of every other static constructor, so red means "the executable started at all" */
+		struct Ps2EarlyMarker {
+			Ps2EarlyMarker() {
+				Ps2BootMarker(Ps2MarkerStaticInit);
+			}
+		};
+		Ps2EarlyMarker ps2EarlyMarker __attribute__((init_priority(101)));
+	}
+#endif
+
+	Application& theApplication()
+	{
+		static MainApplication instance;
+		return instance;
+	}
+
+	int MainApplication::Run(CreateAppEventHandlerDelegate createAppEventHandler, int argc, NativeArgument* argv)
+	{
+		if (createAppEventHandler == nullptr) {
+			return EXIT_FAILURE;
+		}
+
+#if defined(DEATH_TARGET_PS2)
+		Ps2BootMarker(Ps2MarkerRun);
+#endif
+
+		MainApplication& app = static_cast<MainApplication&>(theApplication());
+
+#if defined(DEATH_TRACE)
+		// The sink goes up before any of the platform bring-up below, so all of it can just use LOG*. It is
+		// idempotent, so the later PreInitCommon() call stays harmless. The remaining printf()s below write
+		// to a channel the sink cannot reach yet, or halt the console.
+		app.InitializeTrace();
+#endif
+
+#if defined(DEATH_TARGET_SWITCH)
+		socketInitializeDefault();
+		nxlinkStdio();
+		romfsInit();
+#elif defined(DEATH_TARGET_N64)
+		// Route stderr to the emulator log channel (ISViewer/emux, shown in the Ares log) and to the
+		// flashcart's USB log first: this is what installs libdragon's stderr sink, so it has to happen
+		// before the first trace message is written. Both are called through N64DebugInit* rather than
+		// the libdragon macros - see the declarations above for why a release build needs that.
+		//
+		// Then the early boot console comes up on the framebuffer, so startup messages are ALSO shown
+		// directly on the screen and a crash is visible without any host tool attached. Its hook only
+		// takes the stdout slot, so it neither replaces nor disables the stderr channel installed above
+		// (and `console_close()` in N64GfxDevice only gives that one slot back).
+		const bool n64EmuLog = N64DebugInitEmuLog();
+		const bool n64UsbLog = N64DebugInitUsbLog();
+		// libdragon's own start-up (`__init_cop1`) enables the FPU overflow, divide-by-zero and invalid-
+		// operation traps when the library is built without NDEBUG, which the toolchain's libdragon.a is.
+		// The game's arithmetic assumes IEEE behaviour like on every other platform. The flush-to-zero
+		// of denormals stays, the CPU has no denormals.
+		C1_WRITE_FCR31((C1_FCR31() & ~C1_ENABLE_MASK) | C1_FCR31_FS);
+		console_init();
+		console_set_debug(true);
+		printf("Application starting...\n");
+		// Which log channels answered decides whether any trace can leave the console at all, so the
+		// answer goes on the boot console - the one sink that is known to work at this point
+		printf("Trace channels: emulator log %s, USB log %s\n", n64EmuLog ? "yes" : "no", n64UsbLog ? "yes" : "no");
+
+		// The game does not fit in the 4 MB of a base console, so the Expansion Pak is a hard
+		// requirement rather than a preference. Claiming it here turns a missing one into libdragon's
+		// own "expansion pak required" screen at startup, instead of an allocation failure somewhere
+		// deep in content loading, and it silences the advisory the allocator prints on the way past
+		// 4 MB. The size goes on the boot console next to it, because a heap smaller than expected
+		// explains most of what can go wrong afterwards.
+		assert_memory_expanded();
+		printf("Memory size: %d KB\n", get_memory_size() / 1024);
+
+		// The cartridge filesystem holds the game content, and ContentResolver opens files while the
+		// application is still being constructed - earlier than any backend's constructor runs
+		if (dfs_init(DFS_DEFAULT_LOCATION) != DFS_ESUCCESS) {
+			// Without the DFS image there is no game content, so halt with a readable message instead of
+			// crashing on the missing files later
+			printf("\n  Cannot mount the cartridge filesystem!\n\n  The ROM was built without the attached game files.\n");
+			while (true) { }
+		}
+
+		// The console has no clock of its own, but some cartridges do, and some flashcarts and emulators offer
+		// one (the ROM header does not ask for it - see the packaging step for why). rtc_init() hooks whichever it
+		// finds into newlib's time functions, so the date-dependent parts of the game (the seasonal menu,
+		// timestamps) see the real date. Without one, time() keeps answering -1 and those keep their "date
+		// unknown" fallbacks.
+		const bool hasRtc = rtc_init();
+		printf("Real-time clock: %s\n", hasRtc ? "yes" : "no");
+#elif defined(DEATH_TARGET_WII) || defined(DEATH_TARGET_GAMECUBE)
+		// Bring up the shared subsystems before any device exists: the video hardware (OgcGfxDevice picks
+		// the mode and allocates framebuffers later), the SD/storage FAT layer and the controller ports
+		VIDEO_Init();
+
+		// Early boot console: everything written to stdout (including all trace messages) is shown
+		// directly on the screen until OgcGfxDevice reconfigures the video mode during initialization,
+		// so startup crashes are visible without a USB Gecko attached
+		GXRModeObj* earlyMode = VIDEO_GetPreferredMode(NULL);
+		void* earlyXfb = MEM_K0_TO_K1(SYS_AllocateFramebuffer(earlyMode));
+		CON_Init(earlyXfb, 20, 20, earlyMode->fbWidth, earlyMode->xfbHeight, earlyMode->fbWidth * VI_DISPLAY_PIX_SZ);
+		VIDEO_Configure(earlyMode);
+		VIDEO_SetNextFramebuffer(earlyXfb);
+		VIDEO_SetBlack(FALSE);
+		VIDEO_Flush();
+		VIDEO_WaitVSync();
+		printf("Application starting...\n");
+
+#	if defined(DEATH_TARGET_GAMECUBE)
+		// The game content is on the disc or on an SD card, and which one is decided once everything has been
+		// asked (see ContentResolver::InitializePaths(), which also stops with a readable message when neither
+		// has it). Only the SD cards are mounted here, along with where the loader started the executable from,
+		// which only `argv` says and only this function has.
+		OgcStorage::Initialize(argc > 0 ? argv[0] : nullptr);
+#	else
+		if (!fatInitDefault()) {
+			// Without a FAT device there is no game content and no writable storage, so halt with
+			// a readable message instead of crashing on the missing device later
+			printf("\n  Cannot access the SD card!\n\n  Insert an SD card with the game files and restart the console.\n");
+			while (true) {
+				VIDEO_WaitVSync();
+			}
+		}
+#	endif
+		PAD_Init();
+#	if defined(DEATH_TARGET_WII)
+		WPAD_Init();
+#	endif
+
+		// The console (and an emulator asking the title to stop) requests shutdown through these events;
+		// a title that ignores them keeps running until it is killed, so each one asks the game to quit
+		SYS_SetResetCallback([](std::uint32_t irq, void* ctx) {
+			static_cast<void>(irq); static_cast<void>(ctx);
+			ogcShutdownRequested = true;
+		});
+#	if defined(DEATH_TARGET_WII)
+		// The GameCube has no power event - its power switch cuts the supply directly
+		SYS_SetPowerCallback([]() { ogcShutdownRequested = true; });
+		WPAD_SetPowerButtonCallback([](std::int32_t chan) {
+			static_cast<void>(chan);
+			ogcShutdownRequested = true;
+		});
+#	endif
+#elif defined(DEATH_TARGET_3DS)
+		// The system services (graphics, the boot console on the bottom screen, the CPU speed-up of a New 3DS)
+		// come up before any device exists; the SD card is already mounted as "sdmc:" by libctru's own startup,
+		// which is what lets ContentResolver open files while the application is still being constructed
+		if (!CtrPlatform::Initialize()) {
+			CtrPlatform::Shutdown();
+			return EXIT_FAILURE;
+		}
+#elif defined(DEATH_TARGET_PS2)
+		// The CDVD device is not registered by default, so any "cdrom0:" path fails with EPERM until its IOP
+		// side is brought up - and ContentResolver opens one while the application is still being constructed,
+		// which is earlier than any backend's constructor runs. So it happens here, before Init().
+		//
+		// CDVDMAN is normally already resident, but loading it is harmless and makes the sequence independent
+		// of what the BIOS happened to leave behind; CDVDFSV is what actually serves file reads to the EE.
+		//
+		// But first the boot console: from here until Ps2GfxDevice hands the Graphics Synthesizer to the
+		// renderer, every trace line is also drawn on the television by libdebug's text console (see
+		// Application::OnTraceReceived(), which gates on RHI::Device::HasDisplayOwnership()). The trace's only
+		// other channel on this console is the EE's SIO register, which needs a serial cable to read - so a
+		// boot that stopped on hardware was a black screen with nothing to report, and everything that has ever
+		// stopped one (the disc wait, the module loads, the content and memory-card probes) happens before the
+		// renderer exists. libdebug picks NTSC or PAL from the ROM's region itself and resets only the GIF
+		// channel, so the SIF this block goes on to bring up is untouched. The colour marker right before it
+		// is the last of the three (see Ps2BootMarker()): blue with no text means init_scr() itself did not
+		// come back.
+		Ps2BootMarker(Ps2MarkerTrace);
+		init_scr();
+		scr_printf("Application starting...\n");
+
+		// Where the loader read the executable from is the only thing that says where the game's own files
+		// are when it was not booted from a disc, and it is only knowable here: `argv` belongs to whoever
+		// started the process, and ContentResolver - which is what needs the answer - is constructed from
+		// inside Init() below, with no arguments of its own. Recorded rather than acted on; see
+		// Ps2Storage::SetBootPath().
+		Ps2Storage::SetBootPath(argc > 0 ? argv[0] : nullptr);
+
+		SifInitRpc(0);
+		SifLoadModule("rom0:CDVDMAN", 0, nullptr);
+		SifLoadModule("rom0:CDVDFSV", 0, nullptr);
+		sceCdInit(SCECdINIT);
+
+		// Wait for the disc to be ready before anything tries to read a module off it - but only for a
+		// while. This console is as often booted from an SD card in an MX4SIO adapter as from a disc, and
+		// with an empty tray (or a lid the drive never reports closing) an unbounded wait here is a hang
+		// with nothing on screen to explain it. The timeout costs a boot from disc nothing: a disc that is
+		// spinning up answers well inside it.
+		bool discReady = false;
+		{
+			// Both counted in milliseconds, and the loop sleeps in milliseconds so they mean what they say
+			constexpr std::int32_t DiscReadyTimeoutMs = 10000;
+			constexpr std::int32_t DiscReadyPollIntervalMs = 10;
+			// How long the drive is given to say what is in it before an empty tray is believed - see the
+			// media-type check at the bottom of the loop
+			constexpr std::int32_t DiscTypeSettleMs = 1500;
+
+			for (std::int32_t waited = 0; waited < DiscReadyTimeoutMs; waited += DiscReadyPollIntervalMs) {
+				// The media type is part of the answer, not a separate question: `sceCdDiskReady()` can
+				// complete while the drive has still not identified what it is holding, and continuing on
+				// that would load CDFS against a disc the driver does not know about yet
+				if (sceCdDiskReady(0) == SCECdComplete && sceCdGetDiskType() != SCECdNODISC) {
+					discReady = true;
+					break;
+				}
+				// An empty tray is not something to wait out: without this the SD-card boot - the one the
+				// timeout was added for - would spend the entire ten seconds on a black screen before
+				// anything else happens.
+				//
+				// But it is only believed after the drive has had long enough to say otherwise. `sceCdInit()`
+				// returns once commands can be SENT, which is not the same as the mechacon having reported
+				// what is in the drive, and `SCECdNODISC` is the ZERO value of the media-type enum - so a
+				// console that is booting from a disc answers "no disc" for as long as it takes to identify
+				// the media, which is most of a second of mechanical reality and no time at all on an
+				// emulator. Reading the type one tick in therefore worked everywhere it was tested and
+				// failed on hardware, where it skipped CDFS, left the game with no content and no way to
+				// say so, and sent the startup off to look for an SD card that was not there either.
+				DelayThread(DiscReadyPollIntervalMs * 1000);
+				if (waited >= DiscTypeSettleMs && sceCdGetDiskType() == SCECdNODISC) {
+					break;
+				}
+			}
+			if (!discReady) {
+				// Tracked with a flag rather than inferred from the counter, which cannot tell a timeout
+				// from a drive that became ready on the very last poll
+				LOGW("The disc drive did not become ready, continuing without a disc");
+			} else {
+				LOGI("Disc drive ready, media type 0x{:.2x}", std::uint32_t(sceCdGetDiskType()));
+			}
+		}
+
+		// What the drive found decides how the rest of the I/O stack is assembled: with a disc in it the
+		// modules come off the disc and nothing goes looking for removable storage, without one they have
+		// to come out of the executable itself (see Ps2Modules.h)
+		Ps2Modules::SetDiscPresent(discReady);
+
+		// The BIOS "cdrom0:" handler is not reachable through the newlib port's open() - it answers ENODEV - so
+		// the disc is mounted as a filesystem by cdfs, which registers a "cdfs:" device with the ORIGINAL
+		// `ioman` - the same I/O manager newlib's POSIX calls reach. (Loading iomanX/fileXio alongside it was
+		// tried and is wrong: those route the POSIX calls to the *other* manager, where "cdfs" does not exist.)
+		// The module is loaded from the disc itself, which works because SifLoadModule() goes through the IOP's
+		// loadfile service rather than through the EE's file I/O - the reason this is not a chicken-and-egg.
+		//
+		// Only when the drive actually answered. The unbounded wait this replaced made that implicit - it
+		// could not reach this point otherwise - and loading CDFS off a drive that is not ready fails, which
+		// leaves no "cdfs:" device registered at all. ContentResolver then reads that as "the disc carries
+		// no content" and goes looking for an MX4SIO card, so a disc that was merely slow would boot into
+		// "no episode found" rather than into the game.
+		if (discReady) {
+			static const char* const ps2Modules[] = {
+				"cdrom0:\\CDFS.IRX;1"
+			};
+			for (const char* modulePath : ps2Modules) {
+				const int moduleId = SifLoadModule(modulePath, 0, nullptr);
+				if (moduleId < 0) {
+					LOGE("SifLoadModule(\"{}\") failed with error {}", modulePath, moduleId);
+				} else {
+					LOGI("SifLoadModule(\"{}\") = {}", modulePath, moduleId);
+				}
+			}
+		}
+
+		// The memory card is the only writable storage on this console, and once its IOP side is up it is an
+		// ordinary path: MCMAN registers a "mc" device with the SAME original `ioman` the newlib port's
+		// open() reaches, exactly as cdfs does above, so "mc0:/..." needs no special-case I/O anywhere. It
+		// has to be brought up here rather than lazily, because PreferencesCache::Initialize() chooses the
+		// config path during pre-initialization, before any backend exists to do it.
+		//
+		// SIO2MAN drives the controller ports, which the memory cards and the pads both hang off, so it goes
+		// first - and it is loaded HERE ONLY. Ps2InputManager used to load it as well; a device driver that
+		// registers twice fails the second time, and which of the two got the working one depended on
+		// construction order.
+		SifLoadModule("rom0:SIO2MAN", 0, nullptr);
+		SifLoadModule("rom0:MCMAN", 0, nullptr);
+		SifLoadModule("rom0:MCSERV", 0, nullptr);
+
+		// Loading the modules is not enough to reach a card. `mcInit()` is libmc's handshake with MCSERV, and
+		// nothing - not even MCMAN's own ioman entry points - answers for a slot before it has been probed
+		// through that: an mkdir on a perfectly good card comes back ENOENT until then. The probe itself, and
+		// the choice of which slot to save on, belong to PreferencesCache and are done there.
+		mcInit(MC_TYPE_MC);
+
+#	if defined(WITH_PS2AUDIO)
+		// The sound modules (`rom0:LIBSD`, `audsrv.irx`) are brought up here as well, not only when the audio
+		// device is constructed. That construction happens after Ps2GfxDevice has taken the display, and the
+		// bring-up is the one part of the IOP side that has been seen to hang - `audsrv_init()` spins forever
+		// on a module that never registered its RPC server - so done here, every step of it is still on the
+		// boot console above. InitializeModules() runs once per process and remembers what it found, so the
+		// device constructor only reads that back. (It costs the ~20 KB of IOP memory the modules take even
+		// when the configuration turns audio off, which is nothing against the 2 MB the IOP has.)
+		Ps2AudioDevice::InitializeModules();
+#	endif
+
+		// Nothing brings removable storage (a USB stick, or an SD card in an MX4SIO adapter) up here, even
+		// though this is where the rest of the I/O stack is assembled: the probe costs several module loads
+		// and a wait on hardware that may not be there, and only whoever is looking for files on it knows
+		// whether it is needed at all. It is therefore driven from ContentResolver, which is also where the
+		// layout on such a device is decided (see Backends::Ps2Storage). It stays reachable from here in
+		// load order - the adapter shares the SIO2 with the pads and memory cards, so SIO2MAN above has to
+		// be up first, and it is.
+#elif defined(DEATH_TARGET_PSP)
+		// Before anything else does any floating-point arithmetic at all
+		Thread::DisableFpuTraps(true);
+
+		// The HOME button has to be answered by the application itself, so its callback goes up first -
+		// before anything can go wrong during initialization and leave the console with no way out
+		{
+			int threadId = sceKernelCreateThread("CallbackThread", PspCallbackThread, 0x11, 0xFA0, 0, nullptr);
+			if (threadId >= 0) {
+				sceKernelStartThread(threadId, 0, nullptr);
+			}
+		}
+
+		// The console boots at 222 MHz to save battery; every game raises it to the maximum the hardware
+		// allows. The bus clock has to be exactly half the CPU clock, which is why 333/166 rather than
+		// 333/333 - the firmware rejects any other ratio.
+		scePowerSetClockFrequency(333, 333, 166);
+
+		// Early boot log on the debug screen: startup messages (including all trace messages) are shown
+		// directly on the screen, so crashes are visible before the renderer exists. PspGfxDevice's GU
+		// session takes the framebuffer over during Init(), after which the trace sink keeps writing to
+		// stdout alone - which the firmware discards, but PPSSPP shows in its log.
+		pspDebugScreenInit();
+		printf("Application starting...\n");
+
+#	if defined(WITH_CURL)
+		// Brings up the socket stack that nothing on this console has at boot. It has to happen before
+		// Init() below, because the first thing that uses the network - the update check - is started from
+		// the event handler's OnInit(), which that call reaches. Only the stack is brought up here, no
+		// access point is joined (see PspNetwork::ScopedConnection), so it costs nothing.
+		PspNetwork::Initialize();
+#	endif
+#elif defined(DEATH_TARGET_VITA)
+		// Homebrew is launched at a reduced power profile rather than the one a retail title gets, so the
+		// clocks are raised to the maximum the firmware allows before anything is timed against them. These
+		// are the four independent domains: the Cortex-A9 cluster, the bus feeding it, the SGX543 itself and
+		// the crossbar between the GPU and memory - raising only the first would leave the renderer where it
+		// was. The four values below are the documented ceilings; the firmware clamps anything above them, so
+		// a failure here is not fatal and only means the console stays at its default profile.
+		if (scePowerSetArmClockFrequency(444) < 0 || scePowerSetBusClockFrequency(222) < 0 ||
+			scePowerSetGpuClockFrequency(222) < 0 || scePowerSetGpuXbarClockFrequency(166) < 0) {
+			LOGW("Cannot raise the console clocks, performance will be reduced");
+		}
+		LOGI("Clocks: {} MHz ARM, {} MHz bus, {} MHz GPU, {} MHz GPU crossbar",
+			scePowerGetArmClockFrequency(), scePowerGetBusClockFrequency(),
+			scePowerGetGpuClockFrequency(), scePowerGetGpuXbarClockFrequency());
+
+#	if defined(NCINE_HAS_TOUCH_CONTROLS)
+		// Start sampling the front touchscreen and the rear touchpad
+		sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
+		sceTouchSetSamplingState(SCE_TOUCH_PORT_BACK, SCE_TOUCH_SAMPLING_STATE_START);
+#	endif
+
+		// Enabling sampling for the analogs
+		sceCtrlSetSamplingMode(SCE_CTRL_MODE_ANALOG_WIDE);
+#elif defined(DEATH_TARGET_DREAMCAST)
+		// Early boot log on the framebuffer console: startup messages (including all trace messages)
+		// are shown directly on the screen, so crashes are visible without a serial cable attached;
+		// DcGfxDevice switches dbgio back to the serial port when the real renderer takes over
+		dbgio_dev_select("fb");
+		printf("Application starting...\n");
+#elif defined(DEATH_TARGET_WINDOWS)
+		// Force set current directory, so everything is loaded correctly, because it's not usually intended
+		wchar_t workingDir[fs::MaxPathLength];
+		DWORD workingDirLength = ::GetModuleFileNameW(NULL, workingDir, (DWORD)arraySize(workingDir));
+		if (workingDirLength > 0) {
+			wchar_t* lastSlash = wcsrchr(workingDir, L'\\');
+			if (lastSlash == nullptr) {
+				lastSlash = wcsrchr(workingDir, L'/');
+			}
+			if (lastSlash != nullptr) {
+				lastSlash++;
+				workingDirLength = (DWORD)(lastSlash - workingDir);
+				*lastSlash = '\0';
+				if (::SetCurrentDirectoryW(workingDir)) {
+					LOGI("Using working directory: \"{}\"", Utf8::FromUtf16(workingDir, workingDirLength));
+				} else {
+					LOGE("Failed to change working directory with error 0x{:.8x}", ::GetLastError());
+				}
+			}
+		}
+
+		timeBeginPeriod(1);
+#endif
+
+#if defined(DEATH_TARGET_AMIGAOS)
+		// OS libraries, the EClock timer and the performance probe come up before anything can need
+		// them (the probe's preset decides the screen mode AmigaGfxDevice opens during Init())
+		if (!AmigaPlatform::Initialize()) {
+			AmigaPlatform::Shutdown();
+			return EXIT_FAILURE;
+		}
+#endif
+
+		app.Init(createAppEventHandler, argc, argv);
+
+#if defined(DEATH_TARGET_WII) || defined(DEATH_TARGET_GAMECUBE)
+		// The boot console is invisible from the moment OgcGfxDevice installed its own framebuffers
+		// during Init() (its constructor waits for the flip), but the console driver would keep
+		// rendering every log line into the old buffer. So stdout is routed into the void first,
+		// and only then can the boot framebuffer's ~600 KB go back to MEM1.
+		devoptab_list[STD_OUT] = &ogcNullOut;
+		free(MEM_K1_TO_K0(earlyXfb));
+#endif
+
+#if defined(DEATH_TARGET_EMSCRIPTEN)
+		emscripten_set_main_loop(MainApplication::EmscriptenStep, 0, 1);
+		emscripten_set_main_loop_timing(EM_TIMING_RAF, 1);
+#else
+#	if defined(DEATH_TARGET_PSP)
+		std::uint32_t pspSeenResumes = Backends::PspPower::GetResumeCount();
+#	endif
+		while (!app._shouldQuit) {
+			app.ProcessStep();
+#	if defined(DEATH_TARGET_3DS) || defined(DEATH_TARGET_PSP) || defined(DEATH_TARGET_VITA)
+			// The IME is modal to the firmware but not to the game, which keeps running and presenting behind
+			// it - so its result has to be collected from the frame loop rather than from whoever opened it.
+			// On the 3DS the keyboard is run from here in the first place: the applet blocks the thread, and
+			// this is the one point where no frame is in flight (see ShowScreenKeyboard)
+			app.UpdateScreenKeyboard();
+#	endif
+#	if defined(DEATH_TARGET_WII) || defined(DEATH_TARGET_GAMECUBE)
+			if (ogcShutdownRequested) {
+				app.Quit();
+			}
+#	elif defined(DEATH_TARGET_3DS)
+			// The system asks the application to leave through the APT event queue (the HOME menu closing it, a
+			// power-off), and an application that ignores that keeps running until it is killed
+			if (!CtrPlatform::Update()) {
+				app.Quit();
+			}
+#	elif defined(DEATH_TARGET_PSP)
+			if (pspShutdownRequested) {
+				app.Quit();
+			}
+			// The sleep itself is handled where it matters - the audio thread reserves its channel again - so
+			// this only puts the wake in the log, which is the one record there is of whether a later problem
+			// followed a sleep
+			const std::uint32_t pspResumes = Backends::PspPower::GetResumeCount();
+			if (pspResumes != pspSeenResumes) {
+				pspSeenResumes = pspResumes;
+				LOGI("The console woke up from sleep");
+			}
+#		if defined(WITH_CURL)
+			// Drops the access point association once nothing has needed it for a while - it is deliberately
+			// not dropped the moment the last user goes away (see PspNetwork::ScopedConnection), and this is
+			// what notices that the grace period is over. Never waits, so a frame is never held up by it.
+			PspNetwork::Update();
+#		endif
+#	endif
+		}
+#endif
+
+		app.ShutdownCommon();
+
+#if defined(DEATH_TARGET_AMIGAOS)
+		// The gfx device (screen/window) and input manager are gone after ShutdownCommon()
+		AmigaPlatform::Shutdown();
+#endif
+
+#if defined(DEATH_TARGET_SWITCH)
+		romfsExit();
+		socketExit();
+#elif defined(DEATH_TARGET_WII) || defined(DEATH_TARGET_GAMECUBE)
+		// Returning from main() only reaches a loader when one left its return stub behind (the Homebrew
+		// Channel and friends); booted directly there is nothing to return to, so the console is asked to
+		// end the title instead of running off into whatever follows the entry point
+		fatUnmount("sd:");
+		fatUnmount("carda:");
+#	if defined(DEATH_TARGET_GAMECUBE)
+		fatUnmount("cardb:");
+#	endif
+#	if defined(DEATH_TARGET_WII)
+		if (*(volatile std::uint32_t*)0x80001804 != 0x53545542 /*"STUB"*/) {
+			SYS_ResetSystem(SYS_RETURNTOMENU, 0, 0);
+		}
+#	else
+		SYS_ResetSystem(SYS_HOTRESET, 0, 0);
+#	endif
+#elif defined(DEATH_TARGET_3DS)
+		// The gfx device and the audio device are gone after ShutdownCommon(); returning from main() hands
+		// control back to the Homebrew Launcher
+		CtrPlatform::Shutdown();
+#elif defined(DEATH_TARGET_PSP)
+		// The network stack went down inside ShutdownCommon(), while the trace could still record it.
+		// Returning from main() would land back in the crt0 stub, which halts; the firmware expects a
+		// finished application to hand control back to whatever launched it instead
+		sceKernelExitGame();
+#elif defined(DEATH_TARGET_VITA)
+		sceKernelExitProcess(0);
+#elif defined(DEATH_TARGET_WINDOWS)
+		timeEndPeriod(1);
+#endif
+		return EXIT_SUCCESS;
+	}
+
+	void MainApplication::Quit()
+	{
+		Application::Quit();
+
+#if defined(DEATH_TARGET_EMSCRIPTEN)
+		// `window.close()` usually works only in PWA/standalone environment
+		EM_ASM({
+			window.close();
+		});
+#endif
+	}
+
+	bool MainApplication::EnablePlayStationExtendedSupport(bool enable)
+	{
+#if defined(WITH_SDL3)
+		// SDL3 merged the per-controller HIDAPI rumble hints into SDL_HINT_JOYSTICK_ENHANCED_REPORTS
+		SDL_SetHint(SDL_HINT_JOYSTICK_ENHANCED_REPORTS, enable ? "1" : "0");
+		return true;
+#elif defined(WITH_SDL2)
+		SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, enable ? "1" : "0");
+		// SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE inherits value from SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE
+		//SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, enable ? "1" : "0");
+		return true;
+#else
+		return false;
+#endif
+	}
+
+	String MainApplication::GetUserName()
+	{
+#if defined(DEATH_TARGET_SWITCH)
+		AccountUid uid;
+		AccountProfile profile;
+		if (R_SUCCEEDED(accountInitialize(AccountServiceType_Application))) {
+			String userName;
+			if (R_SUCCEEDED(accountGetPreselectedUser(&uid)) && R_SUCCEEDED(accountGetProfile(&profile, uid))) {
+				AccountProfileBase profileBase;
+				AccountUserData userData;
+				accountProfileGet(&profile, &userData, &profileBase);
+				String userName = profileBase.nickname;
+				accountProfileClose(&profile);
+			}
+			accountExit();
+
+			if (!userName.empty()) {
+				return userName;
+			}
+		}
+#elif defined(DEATH_TARGET_WINDOWS)
+		wchar_t userName[64];
+		DWORD userNameLength = (DWORD)arraySize(userName);
+		if (::GetUserName(userName, &userNameLength) && userNameLength > 0) {
+			return Utf8::FromUtf16(userName);
+		}
+#elif defined(DEATH_TARGET_APPLE)
+		StringView userName = ::getenv("USER");
+		if (!userName.empty()) {
+			return userName;
+		}
+#elif defined(DEATH_TARGET_UNIX)
+		struct passwd* pw = ::getpwuid(::getuid());
+		if (pw != nullptr) {
+			StringView userName = pw->pw_gecos;	// Display name
+			if (!userName.empty()) {
+				return userName;
+			}
+			userName = pw->pw_name;	// Plain name
+			if (!userName.empty()) {
+				return userName;
+			}
+		}
+
+		StringView userName = ::getenv("USER");
+		if (!userName.empty()) {
+			return userName;
+		}
+#endif
+		return {};
+	}
+
+	bool MainApplication::OpenUrl(StringView url)
+	{
+		if (!url.empty()) {
+#if defined(DEATH_TARGET_EMSCRIPTEN)
+			EM_ASM({
+				var url = UTF8ToString($0, $1);
+				if (url) window.open(url, '_blank');
+			}, url.data(), url.size());
+			return true;
+#elif (defined(WITH_SDL2) || defined(WITH_SDL3))
+#	if SDL_VERSION_ATLEAST(2, 0, 14)
+			return SDL_OpenURL(String::nullTerminatedView(url).data()) == 0;
+#	endif
+#endif
+		}
+
+		// TODO: Not implemented in GLFW
+		return false;
+	}
+	
+#if defined(DEATH_TARGET_PSP)
+	void MainApplication::UpdateScreenKeyboard()
+	{
+		if (!_oskActive) {
+			return;
+		}
+
+		// The state machine the SDK prescribes: VISIBLE is refreshed by the GU backend at present time (the
+		// dialog draws into the frame being finished, see GuDevice::PresentFrame()), QUIT asks for the
+		// shutdown, and FINISHED is when the result is valid to read. Anything else - none, or an error code,
+		// which is what the call returns once the dialog is gone - ends the collection too, so a keyboard
+		// that went away without reporting FINISHED cannot keep the game waiting for it.
+		switch (sceUtilityOskGetStatus()) {
+			case PSP_UTILITY_DIALOG_INIT:
+			case PSP_UTILITY_DIALOG_VISIBLE:
+				break;
+			case PSP_UTILITY_DIALOG_QUIT:
+				sceUtilityOskShutdownStart();
+				break;
+			default: {
+				_oskActive = false;
+
+				if (_oskData.result != PSP_UTILITY_OSK_RESULT_CANCELLED) {
+					// UCS-2 in (no surrogate pairs on this firmware), UTF-8 out
+					String text;
+					char encoded[4];
+					for (std::size_t i = 0; i < ImeMaxTextLength && _oskOutputBuffer[i] != 0; i++) {
+						std::size_t encodedLength = Death::Utf8::FromCodePoint((char32_t)_oskOutputBuffer[i], encoded);
+						if (encodedLength > 0) {
+							text += StringView(encoded, encodedLength);
+						}
+					}
+
+					if (_imeOnCompleted) {
+						// The caller can take the whole string, which is what the dialog actually collected - the
+						// field is replaced rather than appended to
+						_imeOnCompleted(text);
+					} else if (IInputEventHandler* handler = IInputManager::handler()) {
+						// Nobody asked for the string, so it is delivered as the text input events a
+						// keystroke-feeding keyboard would have produced. That appends, which is the best this
+						// fallback can do.
+						TextInputEvent textInputEvent;
+						for (std::size_t i = 0; i < text.size(); ) {
+							auto [codePoint, nextI] = Death::Utf8::NextChar(text, i);
+							i = nextI;
+							textInputEvent.length = (std::int32_t)Death::Utf8::FromCodePoint(codePoint, textInputEvent.text);
+							if (textInputEvent.length > 0) {
+								handler->OnTextInput(textInputEvent);
+							}
+						}
+					}
+				}
+
+				_imeOnCompleted = {};
+				break;
+			}
+		}
+	}
+#elif defined(DEATH_TARGET_VITA)
+	void MainApplication::UpdateScreenKeyboard()
+	{
+		if (sceImeDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_FINISHED) {
+			return;
+		}
+
+		SceImeDialogResult result;
+		std::memset(&result, 0, sizeof(result));
+		sceImeDialogGetResult(&result);
+
+		if (result.button == SCE_IME_DIALOG_BUTTON_ENTER) {
+			// UTF-16 in, UTF-8 out, recombining surrogate pairs on the way - without that every non-BMP
+			// character would come out as two invalid ones
+			String text;
+			char encoded[4];
+			for (std::size_t i = 0; i < ImeMaxTextLength && _imeInputBuffer[i] != 0; i++) {
+				char32_t codePoint = _imeInputBuffer[i];
+				if (codePoint >= 0xD800 && codePoint <= 0xDBFF && _imeInputBuffer[i + 1] != 0) {
+					codePoint = 0x10000 + ((codePoint - 0xD800) << 10) + (_imeInputBuffer[i + 1] - 0xDC00);
+					i++;
+				}
+				std::size_t encodedLength = Death::Utf8::FromCodePoint(codePoint, encoded);
+				if (encodedLength > 0) {
+					text += StringView(encoded, encodedLength);
+				}
+			}
+
+			if (_imeOnCompleted) {
+				// The caller can take the whole string, which is what the dialog actually collected - the
+				// field is replaced rather than appended to
+				_imeOnCompleted(text);
+			} else if (IInputEventHandler* handler = IInputManager::handler()) {
+				// Nobody asked for the string, so it is delivered as the text input events a keystroke-feeding
+				// keyboard would have produced. That appends, which is the best this fallback can do.
+				TextInputEvent textInputEvent;
+				for (std::size_t i = 0; i < text.size(); ) {
+					auto [codePoint, nextI] = Death::Utf8::NextChar(text, i);
+					i = nextI;
+					textInputEvent.length = (std::int32_t)Death::Utf8::FromCodePoint(codePoint, textInputEvent.text);
+					if (textInputEvent.length > 0) {
+						handler->OnTextInput(textInputEvent);
+					}
+				}
+			}
+		}
+
+		_imeOnCompleted = {};
+		sceImeDialogTerm();
+	}
+#elif defined(DEATH_TARGET_3DS)
+	void MainApplication::UpdateScreenKeyboard()
+	{
+		if (!_swkbdPending) {
+			return;
+		}
+		_swkbdPending = false;
+
+		// The frame has been presented (ProcessStep() is done) and the next one has not been begun, which is
+		// where citro3d wants a library applet run: swkbdInputText() hands both screens to the system's
+		// keyboard applet and returns once the user closes it, the game paused underneath for the duration.
+		// The applet takes UTF-8 in and gives UTF-8 back, so there is no encoding to do here; its length
+		// limit counts characters, the buffer counts bytes.
+		SwkbdState swkbd;
+		swkbdInit(&swkbd, SWKBD_TYPE_NORMAL, 2, std::int32_t(ImeMaxTextLength));
+		swkbdSetFeatures(&swkbd, SWKBD_DARKEN_TOP_SCREEN);
+		swkbdSetValidation(&swkbd, SWKBD_ANYTHING, 0, 0);
+		swkbdSetHintText(&swkbd, "Enter text");
+		swkbdSetButton(&swkbd, SWKBD_BUTTON_LEFT, "Cancel", false);
+		swkbdSetButton(&swkbd, SWKBD_BUTTON_RIGHT, "OK", true);
+		// Seed the editor with what the field already holds, so the user edits it instead of retyping it
+		if (!_swkbdInitialText.empty()) {
+			swkbdSetInitialText(&swkbd, String::nullTerminatedView(_swkbdInitialText).data());
+		}
+
+		char buffer[ImeMaxTextLength * 4 + 1] {};
+		const SwkbdButton button = swkbdInputText(&swkbd, buffer, sizeof(buffer));
+		// The applet read the pad itself, and the press that closed it is usually still held
+		Backends::CtrInputManager::discardInputUntilReleased();
+
+		if (button == SWKBD_BUTTON_CONFIRM) {
+			const StringView text = buffer;
+			if (_imeOnCompleted) {
+				// The caller can take the whole string, which is what the dialog actually collected - the
+				// field is replaced rather than appended to
+				_imeOnCompleted(text);
+			} else if (IInputEventHandler* handler = IInputManager::handler()) {
+				// Nobody asked for the string, so it is delivered as the text input events a keystroke-feeding
+				// keyboard would have produced. That appends, which is the best this fallback can do.
+				TextInputEvent textInputEvent;
+				for (std::size_t i = 0; i < text.size(); ) {
+					auto [codePoint, nextI] = Death::Utf8::NextChar(text, i);
+					i = nextI;
+					textInputEvent.length = (std::int32_t)Death::Utf8::FromCodePoint(codePoint, textInputEvent.text);
+					if (textInputEvent.length > 0) {
+						handler->OnTextInput(textInputEvent);
+					}
+				}
+			}
+		} else if (button == SWKBD_BUTTON_NONE) {
+			LOGW("The software keyboard closed without a result ({})", std::int32_t(swkbdGetResult(&swkbd)));
+		}
+
+		_imeOnCompleted = {};
+		_swkbdInitialText = {};
+	}
+#endif
+
+	bool MainApplication::CanShowScreenKeyboard()
+	{
+#if defined(DEATH_TARGET_WINDOWS) || defined(DEATH_TARGET_IOS) || defined(DEATH_TARGET_3DS) || defined(DEATH_TARGET_PSP) || defined(DEATH_TARGET_VITA)
+		return true;
+#else
+		return false;
+#endif
+	}
+
+	bool MainApplication::IsScreenKeyboardVisible()
+	{
+#if defined(DEATH_TARGET_PSP)
+		const std::int32_t status = sceUtilityOskGetStatus();
+		return (status == PSP_UTILITY_DIALOG_INIT || status == PSP_UTILITY_DIALOG_VISIBLE);
+#elif defined(DEATH_TARGET_VITA)
+		return (sceImeDialogGetStatus() == SCE_COMMON_DIALOG_STATUS_RUNNING);
+#elif defined(DEATH_TARGET_3DS)
+		// While the applet is actually up nothing in the game runs to ask; what can be observed is the request
+		// waiting for the end of the frame
+		return _swkbdPending;
+#elif defined(DEATH_TARGET_IOS)
+		// SDL tracks UIKit's keyboard through its view controller
+		SDL_Window* window = SdlGfxDevice::windowHandle();
+		return (window != nullptr && SDL_IsScreenKeyboardShown(window) == SDL_TRUE);
+#elif defined(DEATH_TARGET_WINDOWS)
+		HWND hwnd = ::FindWindowEx(NULL, NULL, L"IPTip_Main_Window", NULL);
+		return (hwnd != NULL && ::IsWindowVisible(hwnd));
+#else
+		return false;
+#endif
+	}
+
+	bool MainApplication::ToggleScreenKeyboard()
+	{
+#if defined(DEATH_TARGET_IOS) || defined(DEATH_TARGET_3DS) || defined(DEATH_TARGET_PSP) || defined(DEATH_TARGET_VITA)
+		return (IsScreenKeyboardVisible() ? HideScreenKeyboard() : ShowScreenKeyboard());
+#elif defined(DEATH_TARGET_WINDOWS)
+		if (HideScreenKeyboard()) {
+			return true;
+		}
+
+		return ShowScreenKeyboard();
+#else
+		return false;
+#endif
+	}
+
+	bool MainApplication::ShowScreenKeyboard(Containers::StringView initialText, Containers::Function<void(Containers::StringView)>&& onCompleted)
+	{
+#if defined(DEATH_TARGET_PSP)
+		// The same arrangement as on the Vita, with the firmware's `sceUtility` on-screen keyboard: a modal
+		// dialog that collects a whole string and hands it back once confirmed, collected by
+		// UpdateScreenKeyboard() from the frame loop. The status alone cannot say "idle": with no keyboard
+		// ever started the call returns an error code, so the flag is what says one is up.
+		if (_oskActive) {
+			return false;
+		}
+
+		std::memset(_oskInputBuffer, 0, sizeof(_oskInputBuffer));
+		std::memset(_oskOutputBuffer, 0, sizeof(_oskOutputBuffer));
+		std::memset(_oskTitle, 0, sizeof(_oskTitle));
+		_imeOnCompleted = std::move(onCompleted);
+
+		// Seed the editor with what the field already holds, so the user edits it instead of retyping it.
+		// UTF-8 in, UCS-2 out; a code point the encoding cannot hold (outside the BMP) is dropped.
+		{
+			std::size_t out = 0;
+			for (std::size_t i = 0; i < initialText.size() && out < ImeMaxTextLength; ) {
+				auto [codePoint, nextI] = Death::Utf8::NextChar(initialText, i);
+				i = nextI;
+				if (codePoint == U'\0') {
+					break;
+				}
+				if (codePoint <= 0xFFFF) {
+					_oskInputBuffer[out++] = (unsigned short)codePoint;
+				}
+			}
+			_oskInputBuffer[out] = 0;
+		}
+		static constexpr char TitleText[] = "Enter text";
+		for (std::size_t i = 0; i < sizeof(TitleText) - 1; i++) {
+			_oskTitle[i] = (unsigned short)TitleText[i];
+		}
+
+		std::memset(&_oskData, 0, sizeof(_oskData));
+		_oskData.language = PSP_UTILITY_OSK_LANGUAGE_DEFAULT;
+		_oskData.lines = 1;
+		_oskData.unk_24 = 1;
+		_oskData.inputtype = PSP_UTILITY_OSK_INPUTTYPE_ALL;
+		_oskData.desc = _oskTitle;
+		_oskData.intext = _oskInputBuffer;
+		_oskData.outtextlength = (int)ImeMaxTextLength;
+		_oskData.outtextlimit = (int)ImeMaxTextLength;
+		_oskData.outtext = _oskOutputBuffer;
+
+		std::memset(&_oskParams, 0, sizeof(_oskParams));
+		_oskParams.base.size = sizeof(_oskParams);
+		sceUtilityGetSystemParamInt(PSP_SYSTEMPARAM_ID_INT_LANGUAGE, &_oskParams.base.language);
+		sceUtilityGetSystemParamInt(PSP_SYSTEMPARAM_ID_INT_BUTTON_SWAP, &_oskParams.base.buttonSwap);
+		// The dialog's own threads run above the game's main thread (32), the usual arrangement from the
+		// SDK samples, so the keyboard stays responsive whatever the frame behind it is doing
+		_oskParams.base.graphicsThread = 17;
+		_oskParams.base.accessThread = 19;
+		_oskParams.base.fontThread = 18;
+		_oskParams.base.soundThread = 16;
+		_oskParams.datacount = 1;
+		_oskParams.data = &_oskData;
+
+		const std::int32_t result = sceUtilityOskInitStart(&_oskParams);
+		if (result < 0) {
+			LOGW("sceUtilityOskInitStart() failed with 0x{:.8x}, the on-screen keyboard is unavailable", std::uint32_t(result));
+			_imeOnCompleted = {};
+			return false;
+		}
+		_oskActive = true;
+		return true;
+#elif defined(DEATH_TARGET_3DS)
+		// libctru's software keyboard is a library applet: swkbdInputText() takes both screens over and blocks
+		// the calling thread until the dialog is closed, and it must not be run while a citro3d frame is open.
+		// A request arrives from a menu widget in the middle of a frame, so it is only noted here and run by
+		// UpdateScreenKeyboard() once the frame has been presented - the same collect-later shape as the two
+		// Sony dialogs, with the modal part moved to the other end.
+		if (_swkbdPending) {
+			return false;
+		}
+		_swkbdInitialText = initialText;
+		_imeOnCompleted = std::move(onCompleted);
+		_swkbdPending = true;
+		return true;
+#elif defined(DEATH_TARGET_VITA)
+		// The console has no keyboard overlay that feeds keystrokes the way the desktop ones do - what it has
+		// is the IME, a modal dialog that collects a whole string and hands it back when the user confirms.
+		// So this opens the dialog and VitaImeDialog::Update() below turns the result into the text input
+		// events the caller was expecting, one code point at a time.
+		if (sceImeDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_NONE) {
+			return false;
+		}
+
+		std::memset(_imeInputBuffer, 0, sizeof(_imeInputBuffer));
+		std::memset(_imeTitle, 0, sizeof(_imeTitle));
+		_imeOnCompleted = std::move(onCompleted);
+
+		// Seed the editor with what the field already holds, so the user edits it instead of retyping it.
+		// UTF-8 in, UTF-16 out, a code point at a time; anything past the buffer is dropped rather than
+		// truncating mid-character.
+		{
+			std::size_t out = 0;
+			for (std::size_t i = 0; i < initialText.size() && out < ImeMaxTextLength; ) {
+				auto [codePoint, nextI] = Death::Utf8::NextChar(initialText, i);
+				i = nextI;
+				if (codePoint == U'\0') {
+					break;
+				}
+				if (codePoint <= 0xFFFF) {
+					_imeInputBuffer[out++] = (SceWChar16)codePoint;
+				} else if (out + 1 < ImeMaxTextLength) {
+					codePoint -= 0x10000;
+					_imeInputBuffer[out++] = (SceWChar16)(0xD800 + (codePoint >> 10));
+					_imeInputBuffer[out++] = (SceWChar16)(0xDC00 + (codePoint & 0x3FF));
+				} else {
+					break;
+				}
+			}
+			_imeInputBuffer[out] = 0;
+		}
+		// The title is what the dialog shows above the field; UTF-16, and the API wants it writable
+		static constexpr char TitleText[] = "Enter text";
+		for (std::size_t i = 0; i < sizeof(TitleText) - 1; i++) {
+			_imeTitle[i] = (SceWChar16)TitleText[i];
+		}
+
+		SceImeDialogParam param;
+		sceImeDialogParamInit(&param);
+		param.supportedLanguages = 0;					// 0 with languagesForced false = whatever the user has
+		param.languagesForced = SCE_FALSE;
+		param.type = SCE_IME_TYPE_DEFAULT;
+		param.dialogMode = SCE_IME_DIALOG_DIALOG_MODE_DEFAULT;
+		param.textBoxMode = SCE_IME_DIALOG_TEXTBOX_MODE_DEFAULT;
+		param.title = _imeTitle;
+		param.maxTextLength = ImeMaxTextLength;
+		param.initialText = _imeInputBuffer;
+		param.inputTextBuffer = _imeInputBuffer;
+
+		if (sceImeDialogInit(&param) < 0) {
+			LOGW("sceImeDialogInit() failed, the on-screen keyboard is unavailable");
+			return false;
+		}
+		return true;
+#elif defined(DEATH_TARGET_WINDOWS)
+		if (::FindWindowEx(NULL, NULL, L"IPTip_Main_Window", NULL) != NULL) {
+			// IID_ITipInvocation is supported only on Windows 10 and later
+			ITipInvocation* tip;
+			if (::CoCreateInstance(CLSID_UIHostNoLaunch, nullptr,
+				CLSCTX_INPROC_HANDLER | CLSCTX_LOCAL_SERVER, IID_ITipInvocation, (void**)&tip) == S_OK) {
+				HRESULT hr = tip->Toggle(::GetDesktopWindow());
+				tip->Release();
+				return SUCCEEDED(hr);
+			}
+		}
+
+		// Create the process directly if the above fails on Windows 7
+#	if defined(DEATH_TARGET_32BIT)
+		PVOID redirectOldValue = nullptr;
+		BOOL redirectSuccess = ::Wow64DisableWow64FsRedirection(&redirectOldValue);
+#	endif
+		bool success = false;
+		wchar_t rawPath[MAX_PATH];
+		if (GetTabTipPathFromRegistry(rawPath, DWORD(arraySize(rawPath))) == 0) {
+			wcscpy_s(rawPath, L"\"%CommonProgramFiles%\\Microsoft Shared\\Ink\\TabTip.exe\"");
+		}
+		wchar_t path[MAX_PATH];
+		DWORD pathLength = ::ExpandEnvironmentStringsW(rawPath, path, DWORD(arraySize(path)));
+		if (pathLength > 0 && pathLength < DWORD(arraySize(path))) {
+			HINSTANCE hinst = ::ShellExecuteW(NULL, L"open", path,
+				nullptr, nullptr, SW_SHOWNORMAL);
+			success = ((INT_PTR)hinst > 32);
+		}
+#	if defined(DEATH_TARGET_32BIT)
+		if (redirectSuccess) {
+			::Wow64RevertWow64FsRedirection(redirectOldValue);
+		}
+#	endif
+		return success;
+#elif defined(DEATH_TARGET_IOS)
+		// The overlay kind of keyboard (see Application.h): SDL raises UIKit's keyboard once text input starts and
+		// delivers what is typed as text-input events, so the seed text and the callback are not used
+		static_cast<void>(initialText);
+		static_cast<void>(onCompleted);
+		SDL_StartTextInput();
+		return true;
+#else
+		return false;
+#endif
+	}
+
+	bool MainApplication::HideScreenKeyboard()
+	{
+#if defined(DEATH_TARGET_PSP)
+		if (sceUtilityOskGetStatus() != PSP_UTILITY_DIALOG_VISIBLE) {
+			return false;
+		}
+		// Nothing is collected from a dialog shut down this way: the result reads as cancelled
+		_oskData.result = PSP_UTILITY_OSK_RESULT_CANCELLED;
+		return (sceUtilityOskShutdownStart() >= 0);
+#elif defined(DEATH_TARGET_IOS)
+		if (!SDL_IsTextInputActive()) {
+			return false;
+		}
+		SDL_StopTextInput();
+		return true;
+#elif defined(DEATH_TARGET_3DS)
+		// Only a keyboard that has not been run yet can be taken back; the applet itself is closed by the user
+		if (!_swkbdPending) {
+			return false;
+		}
+		_swkbdPending = false;
+		_imeOnCompleted = {};
+		_swkbdInitialText = {};
+		return true;
+#elif defined(DEATH_TARGET_VITA)
+		if (sceImeDialogGetStatus() != SCE_COMMON_DIALOG_STATUS_RUNNING) {
+			return false;
+		}
+		// Aborting still leaves the dialog to be torn down, which the poll below does once it reports
+		// finished - terminating it here would race the firmware's own animation out
+		return (sceImeDialogAbort() >= 0);
+#elif defined(DEATH_TARGET_WINDOWS)
+		HWND hwnd = ::FindWindowEx(NULL, NULL, L"IPTip_Main_Window", NULL);
+		if (hwnd != NULL && ::IsWindowVisible(hwnd)) {
+			// IID_ITipInvocation is supported only on Windows 10 and later
+			ITipInvocation* tip;
+			if (::CoCreateInstance(CLSID_UIHostNoLaunch, nullptr,
+				CLSCTX_INPROC_HANDLER | CLSCTX_LOCAL_SERVER, IID_ITipInvocation, (void**)&tip) == S_OK) {
+				HRESULT hr = tip->Toggle(::GetDesktopWindow());
+				tip->Release();
+				return SUCCEEDED(hr);
+			}
+
+			// Close the window if the above fails on Windows 7
+			::PostMessage(hwnd, WM_SYSCOMMAND, SC_CLOSE, 0);
+			return true;
+		}
+#endif
+
+		return false;
+	}
+
+	void MainApplication::Init(CreateAppEventHandlerDelegate createAppEventHandler, int argc, NativeArgument* argv)
+	{
+		ZoneScopedC(0x81A861);
+#if defined(NCINE_PROFILING)
+		_profileStartTime = TimeStamp::now();
+#endif
+		_wasSuspended = ShouldSuspend();
+
+		// Only `OnPreInit()` can modify the application configuration
+		if (argc > 1) {
+#if defined(DEATH_TARGET_WINDOWS)
+			_appCfg._argv = Array<String>(ValueInit, argc - 1);
+			for (std::int32_t i = 1; i < argc; i++) {
+				_appCfg._argv[i - 1] = Utf8::FromUtf16(argv[i]);
+			}
+#elif defined(DEATH_TARGET_APPLE)
+			// Cocoa supports -Key value options which set the user defaults key "Key" to the value "value",
+			// skip them here, because they are handled internally by the operating system
+			std::int32_t count = 0;
+			std::int32_t i = 1;
+			while (i < argc) {
+				const char* arg = argv[i];
+				if (arg[0] == '-' && arg[1] == 'N' && arg[2] == 'S') {
+					i += 2; // Skip key and value
+				} else {
+					count++;
+					i++;
+				}
+			}
+
+			if (count > 0) {
+				_appCfg._argv = Array<StringView>(ValueInit, count);
+				count = 0;
+				i = 1;
+				while (i < argc) {
+					const char* arg = argv[i];
+					if (arg[0] == '-' && arg[1] == 'N' && arg[2] == 'S') {
+						i += 2; // Skip key and value
+					} else {
+						_appCfg._argv[count++] = arg;
+						i++;
+					}
+				}
+			}
+#else
+			_appCfg._argv = Array<StringView>(ValueInit, argc - 1);
+			for (std::int32_t i = 1; i < argc; i++) {
+				_appCfg._argv[i - 1] = argv[i];
+			}
+#endif
+		}
+
+		PreInitCommon(createAppEventHandler());
+
+		if (_shouldQuit) {
+			// If the app was quit from OnPreInit(), skip further initialization
+			return;
+		}
+
+#if defined(DEATH_DEBUG)
+#	define INIT_MESSAGE_SUFFIX " in debug configuration"
+#else
+#	define INIT_MESSAGE_SUFFIX ""
+#endif
+
+// The graphics backend the build was configured with; the no-graphics path below deliberately names none
+#if defined(WITH_GLFW)
+#	define INIT_MESSAGE_BACKEND " (GLFW)"
+#elif defined(WITH_SDL3)
+#	define INIT_MESSAGE_BACKEND " (SDL3)"
+#elif defined(WITH_SDL2)
+#	define INIT_MESSAGE_BACKEND " (SDL2)"
+#else
+#	define INIT_MESSAGE_BACKEND ""
+#endif
+
+// Consoles name the hardware revision they are running on as well (see GetConsoleModelName())
+#if defined(DEATH_TARGET_PSP) || defined(DEATH_TARGET_VITA)
+#	define LOG_INIT_MESSAGE(backend) LOGI(NCINE_APP_NAME " v" NCINE_VERSION backend " initializing" INIT_MESSAGE_SUFFIX " on {}...", GetConsoleModelName())
+#else
+#	define LOG_INIT_MESSAGE(backend) LOGI(NCINE_APP_NAME " v" NCINE_VERSION backend " initializing" INIT_MESSAGE_SUFFIX "...")
+#endif
+
+		if (_appCfg.withGraphics) {
+			LOG_INIT_MESSAGE(INIT_MESSAGE_BACKEND);
+
+			LOGB("Initializing graphics device and input manager...");
+
+			// Graphics device should always be created before the input manager
+			IGfxDevice::ContextInfo contextInfo(_appCfg);
+			const DisplayMode::VSync vSyncMode = (_appCfg.withVSync ? DisplayMode::VSync::Enabled : DisplayMode::VSync::Disabled);
+#if defined(RHI_USE_FB16) && defined(WITH_RHI_GL)
+			// 16-bit screen framebuffer (`NCINE_RHI_USE_FB16`): ask the window system for a 5/6/5 visual with no
+			// destination alpha, halving the memory and the present bandwidth of the default framebuffer. The
+			// render targets follow through Texture::ColorTargetFormat. The depth/stencil request is unchanged -
+			// the 2D pipeline never allocates them for the screen anyway, and a driver is free to pick a deeper
+			// buffer than asked for, so this is a request rather than a guarantee.
+			DisplayMode displayMode(5, 6, 5, 0, 24, 8, DisplayMode::DoubleBuffering::Enabled, vSyncMode);
+#else
+			DisplayMode displayMode(8, 8, 8, 8, 24, 8, DisplayMode::DoubleBuffering::Enabled, vSyncMode);
+#endif
+
+			const IGfxDevice::WindowMode windowMode(_appCfg.resolution.X, _appCfg.resolution.Y, _appCfg.windowPosition.X,
+				_appCfg.windowPosition.Y, _appCfg.fullscreen, _appCfg.resizable, _appCfg.windowScaling);
+
+#if (defined(WITH_SDL2) || defined(WITH_SDL3))
+			_gfxDevice = std::make_unique<SdlGfxDevice>(windowMode, contextInfo, displayMode);
+			_inputManager = std::make_unique<SdlInputManager>();
+#elif defined(WITH_GLFW)
+			_gfxDevice = std::make_unique<GlfwGfxDevice>(windowMode, contextInfo, displayMode);
+			_inputManager = std::make_unique<GlfwInputManager>();
+#elif defined(WITH_QT5)
+			FATAL_ASSERT_MSG(_qt5Widget, "The Qt5 widget has not been assigned");
+			_gfxDevice = std::make_unique<Qt5GfxDevice>(windowMode, contextInfo, displayMode, *_qt5Widget);
+			_inputManager = std::make_unique<Qt5InputManager>(*_qt5Widget);
+#elif defined(WITH_N64)
+			_gfxDevice = std::make_unique<N64GfxDevice>(windowMode, contextInfo, displayMode);
+			_inputManager = std::make_unique<N64InputManager>();
+#elif defined(WITH_AMIGA)
+			_gfxDevice = std::make_unique<AmigaGfxDevice>(windowMode, contextInfo, displayMode);
+			_inputManager = std::make_unique<AmigaInputManager>();
+#elif defined(WITH_OGC)
+			_gfxDevice = std::make_unique<OgcGfxDevice>(windowMode, contextInfo, displayMode);
+			_inputManager = std::make_unique<OgcInputManager>();
+#elif defined(WITH_CTR)
+			_gfxDevice = std::make_unique<CtrGfxDevice>(windowMode, contextInfo, displayMode);
+			_inputManager = std::make_unique<CtrInputManager>();
+#elif defined(WITH_DC)
+			_gfxDevice = std::make_unique<DcGfxDevice>(windowMode, contextInfo, displayMode);
+			_inputManager = std::make_unique<DcInputManager>();
+#elif defined(WITH_PSP)
+			_gfxDevice = std::make_unique<PspGfxDevice>(windowMode, contextInfo, displayMode);
+			_inputManager = std::make_unique<PspInputManager>();
+#elif defined(WITH_PS2)
+			_gfxDevice = std::make_unique<Ps2GfxDevice>(windowMode, contextInfo, displayMode);
+			_inputManager = std::make_unique<Ps2InputManager>();
+#elif defined(WITH_PS3)
+			_gfxDevice = std::make_unique<Ps3GfxDevice>(windowMode, contextInfo, displayMode);
+			_inputManager = std::make_unique<Ps3InputManager>();
+#endif
+			_gfxDevice->setWindowTitle(_appCfg.windowTitle.data());
+			if (!_appCfg.windowIconFilename.empty()) {
+				String windowIconFilePath = fs::CombinePath(GetDataPath(), _appCfg.windowIconFilename);
+				if (fs::IsReadableFile(windowIconFilePath)) {
+					_gfxDevice->setWindowIcon(windowIconFilePath);
+				}
+			}
+		} else {
+			LOG_INIT_MESSAGE("");
+
+			_gfxDevice = std::make_unique<NullGfxDevice>();
+			_inputManager = std::make_unique<NullInputManager>();
+		}
+
+#if defined(NCINE_PROFILING)
+		_timings[(std::int32_t)Timings::PreInit] = _profileStartTime.secondsSince();
+#endif
+#if !defined(WITH_QT5)
+		// Common initialization on Qt5 is performed later, when OpenGL can be used
+		InitCommon();
+#endif
+	}
+
+	void MainApplication::ProcessStep()
+	{
+		if (_appCfg.withGraphics) {
+#if defined(WITH_GLFW) || (defined(WITH_SDL2) || defined(WITH_SDL3))
+			ProcessEvents();
+#elif defined(WITH_QT5GAMEPAD)
+			static_cast<Qt5InputManager&>(*_inputManager).updateJoystickStates();
+#elif defined(WITH_N64)
+			// No window events on a console; polling the joypad ports is the whole event pump
+			N64InputManager::updateJoystickStates();
+#elif defined(WITH_AMIGA)
+			// The whole event pump: the game window's IDCMP queue (keyboard, mouse) plus the joyports
+			AmigaInputManager::updateJoystickStates();
+#elif defined(WITH_OGC)
+			// No window events on a console; polling the controller ports is the whole event pump
+			OgcInputManager::updateJoystickStates();
+#elif defined(WITH_CTR)
+			// No window events on a console; polling the HID service is the whole event pump (the APT events that
+			// ask the game to quit are drained from the main loop in Run() instead)
+			CtrInputManager::updateJoystickStates();
+#elif defined(WITH_DC)
+			// No window events on a console; polling the maple bus is the whole event pump
+			DcInputManager::updateJoystickStates();
+#elif defined(WITH_PSP)
+			// No window events on a console; polling the controller service is the whole event pump
+			PspInputManager::updateJoystickStates();
+#elif defined(WITH_PS2)
+			// No window events on a console; polling the pad ports is the whole event pump
+			Ps2InputManager::updateJoystickStates();
+#elif defined(WITH_PS3)
+			// The one console here that DOES have window events: the XMB can ask the game to quit or tell it
+			// that the user opened the in-game menu, and those arrive on the sysutil callback queue that
+			// updateJoystickStates() drains alongside polling the pads
+			Ps3InputManager::updateJoystickStates();
+#endif
+		}
+
+		const bool suspended = ShouldSuspend();
+		if (_wasSuspended != suspended) {
+			if (suspended) {
+				Suspend();
+			} else {
+				Resume();
+			}
+			_wasSuspended = suspended;
+		}
+
+		if (!suspended) {
+			Step();
+		}
+	}
+
+#if defined(WITH_SDL3)
+	void MainApplication::ProcessEvents()
+	{
+		ZoneScoped;
+
+		SDL_Event event;
+#	if !defined(DEATH_TARGET_EMSCRIPTEN)
+		if (ShouldSuspend()) {
+			SDL_WaitEvent(&event);
+			SDL_PushEvent(&event);
+			// Don't lose any events when resuming
+			while (SDL_PollEvent(&event)) {
+				SDL_PushEvent(&event);
+			}
+		}
+#	endif
+
+		while (SDL_PollEvent(&event)) {
+			// SDL3 flattened the SDL2 SDL_WINDOWEVENT/SDL_DISPLAYEVENT umbrellas into one event type per action,
+			// so the sub-events are dispatched directly off event.type here instead of event.window.event
+			switch (event.type) {
+				case SDL_EVENT_QUIT:
+					if (SdlInputManager::shouldQuitOnRequest()) {
+						_shouldQuit = true;
+					}
+					break;
+				case SDL_EVENT_WINDOW_FOCUS_GAINED:
+					if (SdlGfxDevice::isMainWindow(event.window.windowID)) {
+						SetFocus(true);
+					}
+					break;
+				case SDL_EVENT_WINDOW_FOCUS_LOST:
+					if (SdlGfxDevice::isMainWindow(event.window.windowID)) {
+						SetFocus(false);
+					}
+					break;
+				case SDL_EVENT_WINDOW_RESIZED:
+				case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+					if (SdlGfxDevice::isMainWindow(event.window.windowID)) {
+						SDL_Window* windowHandle = SDL_GetWindowFromID(event.window.windowID);
+						int logicalWidth = 0, logicalHeight = 0;
+						SDL_GetWindowSize(windowHandle, &logicalWidth, &logicalHeight);
+						_gfxDevice->_width = logicalWidth;
+						_gfxDevice->_height = logicalHeight;
+						_gfxDevice->_isFullscreen = (SDL_GetWindowFlags(windowHandle) & SDL_WINDOW_FULLSCREEN) != 0;
+						// Query the pixel size the way the active backend measures it, then resize the backend
+						// swap chain to match (no-op on OpenGL / software); see the SDL2 branch for the rationale
+						SdlGfxDevice::queryDrawableSize(windowHandle, logicalWidth, logicalHeight,
+							_gfxDevice->_drawableWidth, _gfxDevice->_drawableHeight);
+						RHI::Device::ResizeSwapchain(_gfxDevice->_drawableWidth, _gfxDevice->_drawableHeight);
+						ResizeScreenViewport(_gfxDevice->_drawableWidth, _gfxDevice->_drawableHeight);
+					}
+					break;
+				case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+					// SDL only turns a close request into SDL_EVENT_QUIT when the closed window is the LAST one, which
+					// stops being true as soon as another window exists (ImGui opens one per panel dragged out of the
+					// main window), so the main window's close button is honored here. The event still falls through
+					// to the input manager below, which is how ImGui closes a window of its own.
+					if (SdlGfxDevice::isMainWindow(event.window.windowID) && SdlInputManager::shouldQuitOnRequest()) {
+						_shouldQuit = true;
+					}
+					DEATH_FALLTHROUGH
+				default:
+					if (event.type >= SDL_EVENT_DISPLAY_FIRST && event.type <= SDL_EVENT_DISPLAY_LAST) {
+						_gfxDevice->updateMonitors();
+					} else if (_appCfg.withGraphics) {
+						SdlInputManager::parseEvent(event);
+					}
+					break;
+			}
+		}
+	}
+#elif defined(WITH_SDL2)
+	void MainApplication::ProcessEvents()
+	{
+		ZoneScoped;
+
+		SDL_Event event;
+#	if !defined(DEATH_TARGET_EMSCRIPTEN)
+		if (ShouldSuspend()) {
+			SDL_WaitEvent(&event);
+			SDL_PushEvent(&event);
+			// Don't lose any events when resuming
+			while (SDL_PollEvent(&event)) {
+				SDL_PushEvent(&event);
+			}
+		}
+#	endif
+
+		while (SDL_PollEvent(&event)) {
+			switch (event.type) {
+				case SDL_QUIT:
+					if (SdlInputManager::shouldQuitOnRequest()) {
+						_shouldQuit = true;
+					}
+					break;
+				case SDL_APP_TERMINATING:
+					// iOS (and Android through SDL): the system is about to end the process, nothing follows this
+					_shouldQuit = true;
+					break;
+				case SDL_APP_LOWMEMORY:
+					LOGW("The system is running low on memory");
+					break;
+				case SDL_DISPLAYEVENT:
+					_gfxDevice->updateMonitors();
+					break;
+				case SDL_WINDOWEVENT: {
+					if (SdlGfxDevice::isMainWindow(event.window.windowID)) {
+						switch (event.window.event) {
+							case SDL_WINDOWEVENT_FOCUS_GAINED:
+								SetFocus(true);
+								break;
+							case SDL_WINDOWEVENT_FOCUS_LOST:
+								SetFocus(false);
+								break;
+							case SDL_WINDOWEVENT_CLOSE:
+								// SDL only turns a close into SDL_QUIT when the closed window is the LAST one, which
+								// stops being true as soon as another window exists (ImGui opens one per panel
+								// dragged out of the main window), so the main window's close button is honored here
+								if (SdlInputManager::shouldQuitOnRequest()) {
+									_shouldQuit = true;
+								}
+								break;
+							case SDL_WINDOWEVENT_SIZE_CHANGED: {
+								_gfxDevice->_width = event.window.data1;
+								_gfxDevice->_height = event.window.data2;
+								SDL_Window* windowHandle = SDL_GetWindowFromID(event.window.windowID);
+								_gfxDevice->_isFullscreen = (SDL_GetWindowFlags(windowHandle) & SDL_WINDOW_FULLSCREEN) != 0;
+								// Query the pixel size the way the active backend measures it, then resize the
+								// backend swap chain to match (no-op on OpenGL / software). The explicit resize
+								// is deterministic on Vulkan: some drivers never report OUT_OF_DATE for a
+								// window/swap-chain size mismatch, so relying on the present path alone would
+								// leave the swap chain stuck at the old size; ResizeSwapchain re-queries the
+								// surface caps for the authoritative extent (this value is the hint/fallback).
+								SdlGfxDevice::queryDrawableSize(windowHandle, event.window.data1, event.window.data2,
+									_gfxDevice->_drawableWidth, _gfxDevice->_drawableHeight);
+								RHI::Device::ResizeSwapchain(_gfxDevice->_drawableWidth, _gfxDevice->_drawableHeight);
+								ResizeScreenViewport(_gfxDevice->_drawableWidth, _gfxDevice->_drawableHeight);
+								break;
+							}
+						}
+					}
+					// Unlike every other event type, these were not reaching the input manager at all - and ImGui
+					// drives its platform windows off them (closing, moving, focusing, entering one), so a window
+					// it owns could not even be closed. Nothing in the engine's own input handling reads them.
+					if (_appCfg.withGraphics) {
+						SdlInputManager::parseEvent(event);
+					}
+					break;
+				}
+				default:
+					if (_appCfg.withGraphics) {
+						SdlInputManager::parseEvent(event);
+					}
+					break;
+			}
+		}
+	}
+#elif defined(WITH_GLFW)
+	void MainApplication::ProcessEvents()
+	{
+		// GLFW does not seem to correctly handle Emscripten focus and blur events
+#	if !defined(DEATH_TARGET_EMSCRIPTEN)
+		SetFocus(GlfwInputManager::hasFocus());
+#	endif
+
+		if (ShouldSuspend()) {
+			glfwWaitEvents();
+		} else {
+			glfwPollEvents();
+		}
+
+		if (_appCfg.withGraphics) {
+			GlfwInputManager::updateJoystickStates();
+		}
+	}
+#endif
+
+#if defined(DEATH_TARGET_EMSCRIPTEN)
+	void MainApplication::EmscriptenStep()
+	{
+		static_cast<MainApplication&>(theApplication()).ProcessStep();
+	}
+#endif
+}

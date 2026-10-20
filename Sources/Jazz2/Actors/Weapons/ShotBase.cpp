@@ -1,0 +1,121 @@
+#include "ShotBase.h"
+#include "../../ILevelHandler.h"
+#include "../../Tiles/TileMap.h"
+#include "../../Events/EventMap.h"
+#include "../Player.h"
+#include "../SolidObjectBase.h"
+#include "../Enemies/EnemyBase.h"
+
+#include "../../../nCine/Base/Random.h"
+#include "../../../nCine/Application.h"
+
+using namespace Jazz2::Tiles;
+
+namespace Jazz2::Actors::Weapons
+{
+	ShotBase::ShotBase()
+		: _timeLeft(0), _upgrades(0), _strength(0), _lastRicochet(nullptr)
+	{
+	}
+
+	Task<bool> ShotBase::OnActivatedAsync(const ActorActivationDetails& details)
+	{
+		SetState(ActorState::CanBeFrozen, false);
+
+		async_return true;
+	}
+
+	Player* ShotBase::GetOwner()
+	{
+		return runtime_cast<Player>(_owner.get());
+	}
+
+	WeaponType ShotBase::GetWeaponType()
+	{
+		return WeaponType::Unknown;
+	}
+
+	void ShotBase::TriggerRicochet(ActorBase* other)
+	{
+		TimeStamp now = TimeStamp::now();
+
+		if (other == nullptr) {
+			if ((now - _lastRicochetTime).seconds() > 1.0f) {
+				_lastRicochet = nullptr;
+				_lastRicochetTime = now;
+				OnRicochet();
+			}
+		} else {
+			if (_lastRicochet != other) {
+				_lastRicochet = other;
+				_lastRicochetTime = now;
+				OnRicochet();
+			} else if ((now - _lastRicochetTime).seconds() < 1.0f) {
+				DecreaseHealth(INT32_MAX);
+			}
+		}
+	}
+
+	void ShotBase::OnUpdate(float timeMult)
+	{
+		_timeLeft -= timeMult;
+		if (_timeLeft <= 0.0f) {
+			DecreaseHealth(INT32_MAX);
+		}
+	}
+
+	bool ShotBase::OnHandleCollision(ActorBase* other)
+	{
+		if (auto* enemyBase = runtime_cast<Enemies::EnemyBase>(other)) {
+			if (enemyBase->CanCollideWithShots) {
+				DecreaseHealth(INT32_MAX);
+			}
+		}
+
+		return false;
+	}
+
+	void ShotBase::OnRicochet()
+	{
+		MoveInstantly(Vector2f(_speed.X * -0.4f, _speed.Y * -0.4f), MoveType::Relative | MoveType::Force);
+
+		_speed.Y = _speed.Y * -0.9f + Random().NextFloat(-2.0f, 2.0f);
+		_speed.X = _speed.X * -0.9f + Random().NextFloat(-2.0f, 2.0f);
+	}
+
+	void ShotBase::TryMovement(float timeMult, TileCollisionParams& params)
+	{
+		float accelY = (_internalForceY + _externalForce.Y) * timeMult;
+
+		_speed.X = std::clamp(_speed.X, -16.0f, 16.0f);
+		_speed.Y = std::clamp(_speed.Y + accelY, -16.0f, 16.0f);
+
+		float effectiveSpeedX = _speed.X + _externalForce.X * timeMult;
+		float effectiveSpeedY = _speed.Y + 0.5f * accelY;
+		effectiveSpeedX *= timeMult;
+		effectiveSpeedY *= timeMult;
+
+		if (!MoveInstantly(Vector2f(effectiveSpeedX, effectiveSpeedY), MoveType::Relative, params)) {
+			OnHitWall(timeMult);
+		}
+	}
+
+	std::int32_t ShotBase::GetMovementSubstepCount(float timeMult) const
+	{
+		// What decides whether a step can pass through thin geometry is its *length*, so that is what is
+		// bounded here - the same way and against the same limit as ActorBase::TryStandardMovement().
+		//
+		// Deriving the count from `timeMult` alone was a proxy for this. It did keep the length independent of
+		// the frame rate, but left it proportional to the shot's speed, so the two halves of the problem were
+		// each still wrong in one direction: a fast shot tunnelled through a one-tile wall at *any* frame rate,
+		// and a slow one paid the fast one's cost anyway (five sub-steps at `MaxTimeMult` where one is already
+		// tunnel-proof, times every shot on screen).
+		float distance = std::max(std::abs(_speed.X + _externalForce.X * timeMult),
+			std::abs(_speed.Y + _externalForce.Y * timeMult)) * timeMult;
+		if (distance <= MaxMovementStep) {
+			return 1;
+		}
+
+		return std::min<std::int32_t>((std::int32_t)(distance / MaxMovementStep) + 1, MaxMovementSubsteps);
+	}
+}

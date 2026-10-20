@@ -1,0 +1,88 @@
+﻿#pragma once
+
+#if defined(WITH_MULTIPLAYER) || defined(DOXYGEN_GENERATING_OUTPUT)
+
+#include "../HUD.h"
+#include "../../Multiplayer/MpLevelHandler.h"
+#include "../../Rendering/PolylineRenderer.h"
+
+namespace Jazz2::UI::Multiplayer
+{
+	/**
+		@brief Player HUD for multiplayer
+		
+		Multiplayer-specific extension of @ref HUD. It overrides the overview and score drawing to show
+		multiplayer information such as the player's position in the current round, and adds a centered countdown
+		display.
+	*/
+	class MpHUD : public HUD, public Jazz2::Multiplayer::GameModes::IGameModeHUD
+	{
+	public:
+		/** @brief Creates a new instance */
+		MpHUD(Jazz2::Multiplayer::MpLevelHandler* levelHandler);
+
+		void OnUpdate(float timeMult) override;
+		bool OnDraw(RenderQueue& renderQueue) override;
+
+		/** @brief Shows countdown text in the middle of the screen */
+		void ShowCountdown(std::int32_t secsLeft);
+
+	protected:
+		void OnDrawOverview(const Rectf& view, const Rectf& adjustedView, Actors::Player* player) override;
+		void OnDrawScore(const Rectf& view, Actors::Player* player) override;
+		void OnDrawSpectate(const Rectf& view, const Rectf& adjustedView, Actors::Player* player) override;
+		void OnAddPerformanceMetrics(PerformanceOverlay& overlay) override;
+
+		/** @brief Draws the position of the player in the current round (also serves as @ref IGameModeHUD::DrawPositionInRound) */
+		void DrawPositionInRound(const Rectf& view, Actors::Player* player) override;
+
+		/** @brief Draws the minimap in the top-right corner, in any game mode with a track, if the server allows it */
+		void DrawMinimap(const Rectf& view, Actors::Player* player);
+
+		/** @brief Draws the final standings of the round in the middle of the screen while the round is ending */
+		void DrawRoundResults();
+
+		// IGameModeHUD - drawing surface used by the hosted game mode to render its part of the HUD
+		void DrawHudText(Jazz2::Multiplayer::GameModes::GameModeFontType font, StringView text, float x, float y, float shadowOffsetY,
+			Alignment alignment, const Colorf& color, float scale, float charSpacing,
+			float angleOffset, float variance, float speed) override;
+		void DrawHudIcon(Jazz2::Multiplayer::GameModes::GameModeHudIcon icon, float x, float y, float shadowOffsetY,
+			Alignment alignment, const Colorf& color, float scaleX, float scaleY) override;
+
+	private:
+		Font* _mediumFont;
+		String _countdownText;
+		float _countdownTimeLeft;
+		float _hudScale;	// 1.0 normally, < 1.0 in splitscreen so the multiplayer HUD elements take less space
+
+		// Cached smoothed minimap track centerline (in tile coordinates), rebuilt only when the checkpoints change.
+		// The actual thick-line mesh is rebuilt each frame from this (cheap) because it depends on the view.
+		SmallVector<Vector2f, 0> _minimapPoints;
+		SmallVector<std::int32_t, 0> _minimapRunOffsets;	// Start index of each run; the last entry is the total count
+		std::uint32_t _minimapCacheKey;
+		Rendering::PolylineRenderer _minimapLine;			// Draws the line mesh, its vertices and commands are rebuilt every frame
+		// Direct rendering tier only: the whole track rasterized once into textures the size of the minimap box
+		// (the line, and its thicker shadow), drawn as two sprites a frame - see RefreshMinimapTrackTextures()
+		std::unique_ptr<Texture> _minimapTrackTexture;
+		std::unique_ptr<Texture> _minimapTrackShadowTexture;
+		std::uint32_t _minimapTrackTextureKey = 0;
+		Vector2i _minimapTrackTextureSize;
+
+		/** @brief Rebuilds the cached smoothed track centerline if the checkpoints changed */
+		void RefreshMinimapTrack(Jazz2::Multiplayer::MpLevelHandler* mpLevelHandler);
+		/** @brief Draws a smoothed thick polyline as a triangle-strip mesh */
+		void DrawMinimapTrackLine(const Vector2f* points, std::int32_t count, Vector2f offset, float halfThickness, std::uint16_t z, const Colorf& color);
+		/**
+		 * @brief Rebuilds the rasterized track textures for the given box size and projection, if anything changed
+		 *
+		 * The fixed-function consoles have no mesh-sprite program for the strip @ref DrawMinimapTrackLine() draws,
+		 * and drawing the up to a thousand segments as individual quads cost the PSP two thirds of its frame rate.
+		 * The track is static in minimap space, so it is rasterized on the CPU once (an antialiased thick polyline
+		 * into an alpha mask the size of the box, at the line's thickness and again at the shadow's) and only redone
+		 * when the track or the box changes.
+		 */
+		void RefreshMinimapTrackTextures(std::int32_t boxWidth, std::int32_t boxHeight, Vector2f localOrigin, Vector2f worldMin, float scale, float lineHalfThickness, float shadowHalfThickness);
+	};
+}
+
+#endif

@@ -1,0 +1,133 @@
+#include <CommonBase.h>
+
+#if defined(NCINE_INCLUDE_OPENGL)
+#	if defined(DEATH_TARGET_VITA)
+#		include <vitaGL.h>
+#	elif defined(RHI_GL_PROFILE_ES)
+#		define GL_GLEXT_PROTOTYPES
+#		if defined(RHI_GL_PROFILE_ES2)
+			// The true OpenGL|ES 2.0 profile compiles against the real ES 2.0 headers (exactly as a PlayStation
+			// Vita / vitaGL port would), proving no ES 3.x symbol leaks into the profile. The shim below defines
+			// the handful of enums that only profile-gated-out code paths still reference; see GLEs2HeaderShims.h.
+#			include <GLES2/gl2.h>
+#			include <GLES2/gl2ext.h>
+#			include "Graphics/RHI/GL/GLEs2HeaderShims.h"
+#		elif defined(DEATH_TARGET_IOS)
+			// Apple ships the ES headers inside the OpenGLES framework rather than under the Khronos paths, and its
+			// glext.h declares only what iOS GPUs implement; see the shim for the few enums the engine still names
+#			include <OpenGLES/ES3/gl.h>
+#			include <OpenGLES/ES3/glext.h>
+#			include "Graphics/RHI/GL/GLEsAppleHeaderShims.h"
+#		else
+#			include <GLES3/gl3.h>
+#			include <GLES2/gl2ext.h>
+#		endif
+#	elif defined(WITH_GLEW)
+#		define GLEW_NO_GLU
+#		include <GL/glew.h>
+#	elif defined(DEATH_TARGET_APPLE)
+#		define GL_SILENCE_DEPRECATION
+#		include <OpenGL/gl3.h>
+#		include <OpenGL/gl3ext.h>
+#	else
+#		if !defined(CMAKE_BUILD) && defined(__has_include)
+#			if __has_include("GL/glew.h")
+#				define __HAS_LOCAL_GLEW
+#			endif
+#		endif
+#		if defined(__HAS_LOCAL_GLEW)
+#			include "GL/glew.h"
+#		else
+#			define GL_GLEXT_PROTOTYPES
+#			include <GL/gl.h>
+#			include <GL/glext.h>
+#		endif
+#	endif
+#endif
+
+#if defined(NCINE_INCLUDE_OPENAL)
+#	if !defined(AL_ALEXT_PROTOTYPES)
+#		define AL_ALEXT_PROTOTYPES
+#	endif
+#	if defined(DEATH_TARGET_IOS)
+		// OpenAL Soft compiled from source (static, see cmake/ncine_ios_dependencies.cmake), with its own header layout
+#		include <AL/al.h>
+#		include <AL/alext.h>
+#	elif defined(DEATH_TARGET_APPLE)
+#		include <OpenAL/al.h>
+#	elif defined(DEATH_TARGET_EMSCRIPTEN)
+#		include <AL/al.h>
+#	else
+#		if !defined(CMAKE_BUILD) && defined(__has_include)
+#			if __has_include("AL/al.h")
+#				define __HAS_LOCAL_OPENAL
+#			endif
+#		endif
+#		if defined(__HAS_LOCAL_OPENAL)
+#			include "AL/al.h"
+#			include "AL/alext.h"
+#		else
+#			include <al.h>
+#			include <alext.h>
+#		endif
+#	endif
+#endif
+
+#if defined(NCINE_INCLUDE_OPENALC)
+#	if !defined(AL_ALEXT_PROTOTYPES)
+#		define AL_ALEXT_PROTOTYPES
+#	endif
+#	if defined(DEATH_TARGET_IOS)
+#		include <AL/alc.h>
+#		include <AL/al.h>
+#		include <AL/alext.h>
+#		include <AL/efx.h>
+#	elif defined(DEATH_TARGET_APPLE)
+#		include <OpenAL/alc.h>
+#		include <OpenAL/al.h>
+#	elif defined(DEATH_TARGET_EMSCRIPTEN)
+#		include <AL/alc.h>
+#		include <AL/al.h>
+#	else
+#		if !defined(CMAKE_BUILD) && defined(__has_include)
+#			if __has_include("AL/al.h")
+#				define __HAS_LOCAL_OPENALC
+#			endif
+#		endif
+#		if defined(__HAS_LOCAL_OPENALC)
+#			include "AL/alc.h"
+#			include "AL/al.h"
+#			include "AL/alext.h"
+#			if __has_include("AL/efx.h")
+				// Current OpenAL Soft pulls efx.h in from alext.h, older ones ship it as a separate
+				// header, and the EFX filters the underwater effect uses are declared only there
+#				include "AL/efx.h"
+#			endif
+#			if __has_include("AL/inprogext.h")
+#				include "AL/inprogext.h"
+#			endif
+#		else
+#			include <alc.h>
+#			include <al.h>
+#			include <alext.h>
+#			if defined(__has_include)
+#				if __has_include(<efx.h>)
+					// See the note above: separate in older OpenAL Soft, included by alext.h in current ones
+#					include <efx.h>
+#				endif
+#				if __has_include(<inprogext.h>)
+#					include <inprogext.h>
+#				endif
+#			endif
+#		endif
+#	endif
+#endif
+
+// Whether the EFX low-pass filter the underwater effect uses is available, i.e. whether
+// ALAudioDevice::setSourceLowPass() has anything to call. The PSP's OpenAL is an early OpenAL Soft
+// that predates EFX being a header: the library exports alGenFilters() but ships no efx.h, so the
+// enums the low-pass path needs do not exist there and sounds are simply not muffled underwater.
+#if (defined(NCINE_INCLUDE_OPENAL) || defined(NCINE_INCLUDE_OPENALC)) && \
+		!defined(DEATH_TARGET_APPLE) && !defined(DEATH_TARGET_EMSCRIPTEN) && !defined(DEATH_TARGET_PSP)
+#	define OPENAL_FILTERS_SUPPORTED
+#endif

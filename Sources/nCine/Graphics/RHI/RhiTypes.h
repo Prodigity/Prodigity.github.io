@@ -1,0 +1,350 @@
+#pragma once
+
+#include <cstdint>
+
+namespace nCine
+{
+	/**
+		@brief Primitive topology of a draw call
+
+		Backend-neutral replacement for the `GL_TRIANGLES`-style primitive enums. The numeric values
+		intentionally match the corresponding OpenGL constants, so the OpenGL backend can translate
+		with a plain cast. Other backends map these values through their own tables.
+	*/
+	enum class PrimitiveType : std::uint32_t
+	{
+		Points = 0x0000,			/**< A list of individual points */
+		Lines = 0x0001,				/**< A list of independent line segments */
+		LineLoop = 0x0002,			/**< A connected line strip closed back to the first vertex */
+		LineStrip = 0x0003,			/**< A connected strip of line segments */
+		Triangles = 0x0004,			/**< A list of independent triangles */
+		TriangleStrip = 0x0005,		/**< A connected strip of triangles */
+		TriangleFan = 0x0006		/**< A fan of triangles sharing the first vertex */
+	};
+
+	/**
+		@brief Source or destination factor of the blending equation
+
+		Backend-neutral replacement for the `GL_SRC_ALPHA`-style blending factor enums. The numeric
+		values intentionally match the corresponding OpenGL constants, so the OpenGL backend can
+		translate with a plain cast.
+	*/
+	enum class BlendingFactor : std::uint32_t
+	{
+		Zero = 0x0000,						/**< Multiplies by zero */
+		One = 0x0001,						/**< Multiplies by one */
+		SrcColor = 0x0300,					/**< Multiplies by the source color */
+		OneMinusSrcColor = 0x0301,			/**< Multiplies by one minus the source color */
+		SrcAlpha = 0x0302,					/**< Multiplies by the source alpha */
+		OneMinusSrcAlpha = 0x0303,			/**< Multiplies by one minus the source alpha */
+		DstAlpha = 0x0304,					/**< Multiplies by the destination alpha */
+		OneMinusDstAlpha = 0x0305,			/**< Multiplies by one minus the destination alpha */
+		DstColor = 0x0306,					/**< Multiplies by the destination color */
+		OneMinusDstColor = 0x0307,			/**< Multiplies by one minus the destination color */
+		SrcAlphaSaturate = 0x0308,			/**< Multiplies by the saturated source alpha (source factor only) */
+		ConstantColor = 0x8001,				/**< Multiplies by the constant blend color */
+		OneMinusConstantColor = 0x8002,		/**< Multiplies by one minus the constant blend color */
+		ConstantAlpha = 0x8003,				/**< Multiplies by the constant blend alpha */
+		OneMinusConstantAlpha = 0x8004		/**< Multiplies by one minus the constant blend alpha */
+	};
+
+	/**
+		@brief Expected update pattern of a vertex or index buffer
+
+		Backend-neutral replacement for the `GL_STATIC_DRAW`-style buffer usage hints. The numeric
+		values intentionally match the corresponding OpenGL constants, so the OpenGL backend can
+		translate with a plain cast.
+	*/
+	enum class BufferUsage : std::uint32_t
+	{
+		StreamDraw = 0x88E0,		/**< Written once and drawn only a few times */
+		StaticDraw = 0x88E4,		/**< Written once and drawn many times */
+		DynamicDraw = 0x88E8		/**< Rewritten repeatedly and drawn many times */
+	};
+
+	/**
+		@brief Binding target of a buffer object
+
+		Backend-neutral replacement for the `GL_ARRAY_BUFFER`-style buffer binding targets. The numeric
+		values intentionally match the corresponding OpenGL constants, so the OpenGL backend can
+		translate with a plain cast.
+	*/
+	enum class BufferTarget : std::uint32_t
+	{
+		Vertex = 0x8892,		/**< Vertex attribute data */
+		Index = 0x8893,			/**< Index (element array) data */
+		Uniform = 0x8A11		/**< Uniform block data */
+	};
+
+	/**
+		@brief Buffer mapping and immutable storage flags
+
+		Backend-neutral replacement for the `GL_MAP_WRITE_BIT`-style mapping flags, combinable as bit
+		flags. The numeric values intentionally match the corresponding OpenGL constants, so the OpenGL
+		backend can translate with a plain cast.
+	*/
+	enum class MapFlags : std::uint32_t
+	{
+		None = 0,					/**< No mapping (a host-side buffer is used instead) */
+		Write = 0x0002,				/**< The mapping is written to */
+		InvalidateRange = 0x0004,	/**< The previous contents of the mapped range can be discarded */
+		InvalidateBuffer = 0x0008,	/**< The previous contents of the whole buffer can be discarded */
+		FlushExplicit = 0x0010,		/**< Modified ranges are flushed explicitly */
+		Unsynchronized = 0x0020,	/**< The device does not synchronize pending operations on the buffer */
+		Persistent = 0x0040,		/**< The mapping stays valid while the device reads from the buffer */
+		Coherent = 0x0080			/**< Writes become visible to the device without an explicit flush */
+	};
+
+	constexpr MapFlags operator|(MapFlags a, MapFlags b) {
+		return MapFlags(std::uint32_t(a) | std::uint32_t(b));
+	}
+	constexpr MapFlags operator&(MapFlags a, MapFlags b) {
+		return MapFlags(std::uint32_t(a) & std::uint32_t(b));
+	}
+
+	/**
+		@brief Data format of the indices in an index buffer
+
+		The numeric values intentionally match the corresponding OpenGL constants, so the OpenGL
+		backend can translate with a plain cast.
+	*/
+	enum class IndexFormat : std::uint32_t
+	{
+		UInt16 = 0x1403,		/**< 16-bit unsigned indices */
+		UInt32 = 0x1405			/**< 32-bit unsigned indices */
+	};
+
+	/**
+		@brief Face culling mode
+
+		The numeric values intentionally match the corresponding OpenGL constants, so the OpenGL
+		backend can translate with a plain cast.
+	*/
+	enum class CullFaceMode : std::uint32_t
+	{
+		Front = 0x0404,			/**< Front faces are culled */
+		Back = 0x0405,			/**< Back faces are culled */
+		FrontAndBack = 0x0408	/**< All faces are culled */
+	};
+
+	/**
+		@brief Opaque handle to a GPU fence created by the device
+	*/
+	using FenceHandle = void*;
+
+	/**
+		@brief Component data type of a vertex attribute
+
+		Backend-neutral replacement for the `GL_FLOAT`-style component type constants used with vertex
+		formats. The numeric values intentionally match the corresponding OpenGL constants, so the OpenGL
+		backend can translate with a plain cast.
+	*/
+	enum class VertexAttribType : std::uint32_t
+	{
+		UnsignedByte = 0x1401,	/**< 8-bit unsigned components */
+		Float = 0x1406			/**< 32-bit floating-point components */
+	};
+
+	/**
+		@brief Programmable pipeline stage a shader source is attached to
+
+		Backend-neutral replacement for the `GL_VERTEX_SHADER`-style shader type constants, so that shared
+		pipeline code (Shader / RenderResources) never names a GL constant. Each backend maps the stage to
+		its own compiler input.
+	*/
+	enum class ShaderStage
+	{
+		Vertex,			/**< The vertex stage */
+		Fragment		/**< The fragment (pixel) stage */
+	};
+
+	/**
+		@brief Depth and stencil format of a render target
+
+		The values are backend-neutral, each backend maps them to its own depth/stencil storage formats.
+	*/
+	enum class DepthStencilFormat
+	{
+		None,				/**< No depth or stencil buffer */
+		Depth16,			/**< 16-bit depth buffer */
+		Depth24,			/**< 24-bit depth buffer */
+		Depth24_Stencil8	/**< 24-bit depth buffer with an 8-bit stencil buffer */
+	};
+
+	/**
+		@brief Buffers of a render target that can be cleared
+
+		Combinable as bit flags. Unlike the other enums in this header the values are backend-neutral,
+		each backend maps them to its own clear mask.
+	*/
+	enum class ClearFlags : std::uint32_t
+	{
+		None = 0,			/**< No buffer */
+		Color = 0x01,		/**< The color buffer */
+		Depth = 0x02,		/**< The depth buffer */
+		Stencil = 0x04		/**< The stencil buffer */
+	};
+
+	constexpr ClearFlags operator|(ClearFlags a, ClearFlags b) {
+		return ClearFlags(std::uint32_t(a) | std::uint32_t(b));
+	}
+	constexpr ClearFlags operator&(ClearFlags a, ClearFlags b) {
+		return ClearFlags(std::uint32_t(a) & std::uint32_t(b));
+	}
+
+	/**
+		@brief Pixel format of texture data
+
+		Backend-neutral description of every texel layout supported for empty and decoded textures,
+		shared by @ref Texture (as `Texture::Format`), @ref TextureFormat and the texture loaders. Each
+		backend maps these logical formats to its own internal/external formats and data types. The
+		external channel order (RGB vs. BGR) is carried separately by @ref TextureFormat.
+	*/
+	// (See BytesPerPixel() below the enum - a new uncompressed entry has to be added there as well)
+	enum class PixelFormat
+	{
+		Unknown,		/**< Unknown or unsupported format */
+
+		// Uncompressed, 8 bits per channel (the runtime-exercised formats)
+		R8,				/**< One channel, 8 bits per pixel */
+		RG8,			/**< Two channels, 16 bits per pixel */
+		RGB8,			/**< Three channels, 24 bits per pixel */
+		RGBA8,			/**< Four channels, 32 bits per pixel */
+
+		// Packed integer formats (16 bits per pixel)
+		RGB565,			/**< Packed RGB, 5/6/5 bits per channel */
+		RGB5A1,			/**< Packed RGBA, 5/5/5/1 bits per channel */
+		RGBA4,			/**< Packed RGBA, 4 bits per channel */
+
+		// Floating-point formats
+		RGB16F,			/**< Three half-float channels */
+		RGBA16F,		/**< Four half-float channels */
+		RGB32F,			/**< Three single-float channels */
+		RGBA32F,		/**< Four single-float channels */
+
+		// Depth formats
+		Depth16,		/**< 16-bit depth */
+		Depth24,		/**< 24-bit depth */
+		Depth32F,		/**< 32-bit floating-point depth */
+
+		// Compressed S3TC / DXT
+		DXT1RGB,		/**< S3TC DXT1, RGB (no alpha) */
+		DXT1RGBA,		/**< S3TC DXT1, RGBA (1-bit alpha) */
+		DXT3,			/**< S3TC DXT3, RGBA (explicit alpha) */
+		DXT5,			/**< S3TC DXT5, RGBA (interpolated alpha) */
+
+		// Compressed ETC / EAC
+		ETC1,			/**< ETC1, RGB */
+		ETC2RGB8,		/**< ETC2, RGB */
+		ETC2RGB8A1,		/**< ETC2, RGB with 1-bit punch-through alpha */
+		ETC2RGBA8,		/**< ETC2 + EAC, RGBA */
+		EAC_R11,		/**< EAC, one channel */
+		EAC_RG11,		/**< EAC, two channels */
+
+		// Compressed ATC
+		ATC_RGB,				/**< ATC, RGB */
+		ATC_RGBA_Explicit,		/**< ATC, RGBA with explicit alpha */
+		ATC_RGBA_Interpolated,	/**< ATC, RGBA with interpolated alpha */
+
+		// Compressed PVRTC
+		PVRTC_2BPP_RGB,		/**< PVRTC v1, 2 bpp, RGB */
+		PVRTC_2BPP_RGBA,	/**< PVRTC v1, 2 bpp, RGBA */
+		PVRTC_4BPP_RGB,		/**< PVRTC v1, 4 bpp, RGB */
+		PVRTC_4BPP_RGBA,	/**< PVRTC v1, 4 bpp, RGBA */
+
+		// Compressed ASTC (all block sizes are RGBA, LDR)
+		ASTC_4x4,		/**< ASTC, 4x4 block */
+		ASTC_5x4,		/**< ASTC, 5x4 block */
+		ASTC_5x5,		/**< ASTC, 5x5 block */
+		ASTC_6x5,		/**< ASTC, 6x5 block */
+		ASTC_6x6,		/**< ASTC, 6x6 block */
+		ASTC_8x5,		/**< ASTC, 8x5 block */
+		ASTC_8x6,		/**< ASTC, 8x6 block */
+		ASTC_8x8,		/**< ASTC, 8x8 block */
+		ASTC_10x5,		/**< ASTC, 10x5 block */
+		ASTC_10x6,		/**< ASTC, 10x6 block */
+		ASTC_10x8,		/**< ASTC, 10x8 block */
+		ASTC_10x10,		/**< ASTC, 10x10 block */
+		ASTC_12x10,		/**< ASTC, 12x10 block */
+		ASTC_12x12		/**< ASTC, 12x12 block */
+	};
+
+	/**
+		@brief Bytes one pixel of an uncompressed @ref PixelFormat occupies, or `0` (unknown or compressed)
+
+		The one authoritative table next to the enum itself, so a backend that needs the answer does not
+		grow its own switch (which then silently answers `0` for every entry added after it was copied).
+		Compressed formats have no per-pixel size - callers reason about their blocks instead.
+	*/
+	constexpr std::int32_t BytesPerPixel(PixelFormat format)
+	{
+		switch (format) {
+			case PixelFormat::R8: return 1;
+			case PixelFormat::RG8: return 2;
+			case PixelFormat::RGB8: return 3;
+			case PixelFormat::RGBA8: return 4;
+			case PixelFormat::RGB565: return 2;
+			case PixelFormat::RGB5A1: return 2;
+			case PixelFormat::RGBA4: return 2;
+			case PixelFormat::RGB16F: return 6;
+			case PixelFormat::RGBA16F: return 8;
+			case PixelFormat::RGB32F: return 12;
+			case PixelFormat::RGBA32F: return 16;
+			case PixelFormat::Depth16: return 2;
+			case PixelFormat::Depth24: return 3;
+			case PixelFormat::Depth32F: return 4;
+			default: return 0;
+		}
+	}
+
+	/**
+		@brief Type of texture the backend allocates and binds
+
+		The renderer only uses two-dimensional textures; the enum exists so pipeline code does not name
+		a backend-specific texture target constant.
+	*/
+	enum class TextureTarget
+	{
+		Texture2D		/**< A two-dimensional texture */
+	};
+
+	/**
+		@brief Texture minification and magnification filtering modes
+	*/
+	enum class SamplerFilter
+	{
+		Unknown,
+
+		Nearest,
+		Linear,
+		NearestMipmapNearest,
+		LinearMipmapNearest,
+		NearestMipmapLinear,
+		LinearMipmapLinear
+	};
+
+	/**
+		@brief Texture coordinate wrapping modes
+	*/
+	enum class SamplerWrapping
+	{
+		Unknown,
+
+		ClampToEdge,
+		MirroredRepeat,
+		Repeat
+	};
+
+	/**
+		@brief Source for a sampled texture channel (see @ref Texture::SetSwizzle())
+	*/
+	enum class SwizzleChannel
+	{
+		Red,
+		Green,
+		Blue,
+		Alpha,
+		Zero,
+		One
+	};
+}

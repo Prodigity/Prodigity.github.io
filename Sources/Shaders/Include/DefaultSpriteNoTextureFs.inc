@@ -1,0 +1,4 @@
+void fragment() {
+	COLOR = vColor;
+}
+

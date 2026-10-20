@@ -1,0 +1,199 @@
+#include "RuntimeShader.h"
+
+#include <Containers/SmallVector.h>
+#include <Containers/StringConcatenable.h>
+
+namespace ShaderCompiler
+{
+	// GlslType (internal) and UniformType (artifact view) declare the same enumerators in the same order
+	static_assert(std::uint8_t(GlslType::Float) == std::uint8_t(UniformType::Float));
+	static_assert(std::uint8_t(GlslType::Mat4) == std::uint8_t(UniformType::Mat4));
+	static_assert(std::uint8_t(GlslType::Sampler2D) == std::uint8_t(UniformType::Sampler2D));
+	static_assert(std::uint8_t(GlslType::Struct) == std::uint8_t(UniformType::Struct));
+
+	namespace
+	{
+#if defined(RHI_GL_PROFILE_ES2)
+		// The engine's OpenGL|ES 2.0 profile is only ever built for hardware that has nothing else (the PS
+		// Vita's vitaGL, WebGL 1, old mobile parts), so runtime-compiled shaders are assembled from the same
+		// LOW_POWER_GPU view the precompiled ones get offline (see Emit.cpp). The ESSL 100 lowering of what
+		// comes out happens later, in Shader::LoadFromMemory. Reflection is unaffected: it runs on the
+		// preprocessed declaration stream, which no backend conditional is allowed to change.
+		constexpr bool LowPowerGpu = true;
+#else
+		constexpr bool LowPowerGpu = false;
+#endif
+
+		std::uint16_t ToViewArraySize(std::uint32_t arraySize, bool symbolic)
+		{
+			return (symbolic ? SymbolicArraySize : std::uint16_t(arraySize));
+		}
+
+		/** Runs strip-comments + preprocess + reflect for one stage of one variant */
+		bool ReflectVariantStage(const ShaderDocument& document, bool vertexStage, StringView define,
+			StageReflection& result, Diagnostic& diag)
+		{
+			SmallVector<SourceLine, 0> lines = document.Prelude;
+			const SmallVectorImpl<SourceLine>& stage = (vertexStage ? document.VertexLines : document.FragmentLines);
+			lines.insert(lines.end(), stage.begin(), stage.end());
+
+			ShaderParser::StripComments(lines);
+
+			Preprocessor preprocessor;
+			if (!define.empty()) {
+				preprocessor.Define(define, "1");
+			}
+			SmallVector<SourceLine, 0> preprocessed;
+			if (!preprocessor.Run(lines, preprocessed, diag)) {
+				return false;
+			}
+			return GlslReflector::ReflectStage(preprocessed, vertexStage, result, diag);
+		}
+	}
+
+	const RuntimeVariant* RuntimeProgram::FindVariant(StringView name) const
+	{
+		// The base variant is unnamed — an empty name resolves to it (always Variants[0])
+		if (name.empty()) {
+			return (Variants.empty() ? nullptr : &Variants[0]);
+		}
+		for (const RuntimeVariant& v : Variants) {
+			if (v.Name == name) {
+				return &v;
+			}
+		}
+		return nullptr;
+	}
+
+	void RuntimeProgram::BuildView()
+	{
+		const std::size_t variantCount = Variants.size();
+		viewUniforms_.resize(variantCount);
+		viewBlockMembers_.resize(variantCount);
+		viewBlocks_.resize(variantCount);
+		viewTextures_.resize(variantCount);
+		viewAttributes_.resize(variantCount);
+		viewVariants_.resize(variantCount);
+
+		for (std::size_t i = 0; i < variantCount; i++) {
+			const RuntimeVariant& v = Variants[i];
+			const StageReflection& r = v.Reflection;
+
+			viewUniforms_[i].reserve(r.Uniforms.size());
+			for (const UniformInfo& u : r.Uniforms) {
+				viewUniforms_[i].push_back({ u.Name.data(), UniformType(u.Type), std::uint16_t(u.ArraySize) });
+			}
+
+			viewBlockMembers_[i].resize(r.Blocks.size());
+			viewBlocks_[i].reserve(r.Blocks.size());
+			for (std::size_t j = 0; j < r.Blocks.size(); j++) {
+				const BlockInfo& b = r.Blocks[j];
+				SmallVectorImpl<BlockMember>& members = viewBlockMembers_[i][j];
+				members.reserve(b.Members.size());
+				for (const MemberInfo& m : b.Members) {
+					members.push_back({ m.Name.data(), UniformType(m.Type), ToViewArraySize(m.ArraySize, m.SymbolicArray), m.Offset });
+				}
+				viewBlocks_[i].push_back({ b.Name.data(), b.BaseSize, b.InstanceStride, members.size(), members.data() });
+			}
+
+			viewTextures_[i].reserve(r.Textures.size());
+			for (const TextureInfo& t : r.Textures) {
+				viewTextures_[i].push_back({ t.Name.data(), t.Unit });
+			}
+
+			viewAttributes_[i].reserve(r.Attributes.size());
+			for (const AttributeInfo& a : r.Attributes) {
+				viewAttributes_[i].push_back({ a.Name.data(), UniformType(a.Type), a.Location });
+			}
+
+			viewVariants_[i] = {
+				v.Name.data(), v.Define.data(), v.VsSource.data(), v.FsSource.data(),
+				viewUniforms_[i].size(), viewUniforms_[i].data(),
+				viewBlocks_[i].size(), viewBlocks_[i].data(),
+				viewTextures_[i].size(), viewTextures_[i].data(),
+				viewAttributes_[i].size(), viewAttributes_[i].data(),
+				// No baked ES2 (ESSL 100) sources for runtime-compiled ".shader" files — the offline
+				// Essl100Emitter is not linked into the engine, so the ES2 profile falls back for these.
+				// The remaining backend fields are likewise offline-only: the HLSL sources, DXBC blobs and
+				// SPIR-V modules stay null/0, and so do the Metal (MSL) sources spelled out last.
+				nullptr, nullptr,
+				nullptr, nullptr, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0,
+				nullptr, nullptr
+			};
+		}
+
+		view_ = { Name.data(), RenderModes, viewVariants_.size(), viewVariants_.data() };
+	}
+
+	bool CompileRuntimeProgram(StringView content, StringView baseDir, FileReader& reader, RuntimeProgram& out, Diagnostic& diag)
+	{
+		String expanded = content;
+		{
+			String includeError;
+			if (!ShaderParser::ExpandIncludes(expanded, baseDir, reader, 0, includeError)) {
+				diag.Message = std::move(includeError);
+				diag.Line = 0;
+				return false;
+			}
+		}
+
+		SmallVector<ShaderDocument, 0> documents;
+		if (!ShaderParser::ParseDocuments(expanded, documents, diag)) {
+			return false;
+		}
+		// Batched twin documents ("batched" in canvas_item files) are an offline-only feature
+		// for now — the runtime compiles only the first (primary, non-batched) program
+		const ShaderDocument& document = documents[0];
+
+		out.Name = document.ProgramName;
+		out.RenderModes = document.RenderModes;
+		out.Variants.clear();
+
+		// The unnamed base variant (Name "", always Variants[0]) plus one additional entry
+		// per declared variant (no cross-products)
+		out.Variants.emplace_back();
+		for (const String& name : document.Variants) {
+			RuntimeVariant v;
+			v.Name = name;
+			v.Define = name;
+			out.Variants.push_back(std::move(v));
+		}
+
+		for (RuntimeVariant& v : out.Variants) {
+			StageReflection vertex, fragment;
+			if (!ReflectVariantStage(document, true, v.Define, vertex, diag) ||
+				!ReflectVariantStage(document, false, v.Define, fragment, diag)) {
+				return false;
+			}
+			if (!GlslReflector::MergeStages(vertex, fragment, v.Reflection, diag)) {
+				return false;
+			}
+
+			v.VsSource = ShaderParser::BuildStageSource(document, true, v.Define,
+				/*softwareRenderer*/ false, /*noDynamicBranching*/ false, LowPowerGpu);
+			v.FsSource = ShaderParser::BuildStageSource(document, false, v.Define,
+				/*softwareRenderer*/ false, /*noDynamicBranching*/ false, LowPowerGpu);
+		}
+
+		// Apply "texture_unit(N)" hint unit assignments across all variants
+		for (const TextureDirective& directive : document.Textures) {
+			bool found = false;
+			for (RuntimeVariant& v : out.Variants) {
+				for (TextureInfo& t : v.Reflection.Textures) {
+					if (t.Name == directive.Name) {
+						t.Unit = directive.Unit;
+						found = true;
+					}
+				}
+			}
+			if (!found) {
+				diag.Message = "texture unit assignment \"" + directive.Name + "\" does not match any sampler uniform";
+				diag.Line = directive.Line;
+				return false;
+			}
+		}
+
+		out.BuildView();
+		return true;
+	}
+}

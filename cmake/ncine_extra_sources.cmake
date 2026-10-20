@@ -1,0 +1,2428 @@
+target_include_directories(${NCINE_APP} PRIVATE
+	"${NCINE_SOURCE_DIR}/Dependencies"
+	"${NCINE_SOURCE_DIR}/Shared"
+)
+
+if(ATOMIC_FOUND)
+	target_link_libraries(${NCINE_APP} PRIVATE Atomic::Atomic)
+endif()
+
+if(TARGET Backward)
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_BACKWARD")
+	target_link_libraries(${NCINE_APP} PRIVATE Backward)
+endif()
+
+# Client library and profile macros of the OpenGL family backend. Only this backend has a GL dependency at
+# all: the software rasterizer draws on the CPU, the console backends talk to their own hardware API, and
+# D3D11 / Vulkan / Metal bring their own (d3d11/dxgi/d3dcompiler, a dynamically loaded vulkan-1, the Metal
+# framework). None of them
+# must drag in a GL runtime - pspdev even ships a libGL (pspgl) wrapping the very GE the GU backend drives
+# itself, which find_package(OpenGL) happily locates.
+if(NCINE_PREFERRED_RHI STREQUAL "OpenGL")
+	# Exactly one profile macro is defined, plus RHI_GL_PROFILE_ES for the two ES ones (they share the
+	# client library, the EGL/GLES headers and everything but the context version and shader dialect)
+	if(NCINE_RHI_GL_PROFILE STREQUAL "ES2")
+		target_compile_definitions(${NCINE_APP} PRIVATE "RHI_GL_PROFILE_ES2" "RHI_GL_PROFILE_ES")
+	elseif(NCINE_RHI_GL_PROFILE STREQUAL "ES3")
+		target_compile_definitions(${NCINE_APP} PRIVATE "RHI_GL_PROFILE_ES3" "RHI_GL_PROFILE_ES")
+	else()
+		target_compile_definitions(${NCINE_APP} PRIVATE "RHI_GL_PROFILE_CORE")
+	endif()
+
+	if(NCINE_RHI_GL_PROFILE MATCHES "^ES")
+		if(ANGLE_FOUND)
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_ANGLE")
+		endif()
+
+		if(VITA)
+			# This arm is only reached with NCINE_PREFERRED_RHI=OpenGL, where the PS Vita renders through
+			# vitaGL, a static OpenGL|ES 2.0 implementation layered on sceGxm. It is linked (together with its
+			# Sce stub libraries) further below, and unconditionally - see the note there, the SDL2 window
+			# backend needs it under GXM too. find_package(OpenGLES2) cannot locate it either way: that module
+			# only probes for GLES2/gl2.h and libGLESv2/libEGL.
+		elseif(ANDROID OR EMSCRIPTEN)
+			# Android links libGLESv2/libGLESv3 and libEGL from the NDK (see the Android bridge CMakeLists);
+			# Emscripten's WebGL implementation is part of the runtime the linker provides itself
+		elseif(IOS)
+			# OpenGL|ES is a system framework on iOS (deprecated since iOS 12, still shipped); the context comes
+			# from SDL's EAGL view, so there is no EGL to link either
+			target_link_libraries(${NCINE_APP} PRIVATE "-framework OpenGLES")
+		elseif(TARGET OpenGLES2::GLES2)
+			target_link_libraries(${NCINE_APP} PRIVATE EGL::EGL OpenGLES2::GLES2)
+		else()
+			message(FATAL_ERROR "NCINE_RHI_GL_PROFILE=${NCINE_RHI_GL_PROFILE} needs an OpenGL|ES client library (libGLESv2 + libEGL), which was not found. Install it, or build the Core profile against desktop OpenGL.")
+		endif()
+
+		# ETC1-compressed textures (".pkm") are an Android-only asset form, and the loader guards itself the
+		# same way (see TextureLoaderPkm.h) - other ES builds used to compile it as dead code
+		if(ANDROID OR NCINE_BUILD_ANDROID)
+			list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderPkm.h)
+			list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderPkm.cpp)
+		endif()
+	elseif(OPENGL_FOUND)
+		if(TARGET OpenGL::OpenGL)
+			target_link_libraries(${NCINE_APP} PRIVATE OpenGL::OpenGL)
+		else()
+			target_link_libraries(${NCINE_APP} PRIVATE OpenGL::GL)
+		endif()
+	elseif(NOT EMSCRIPTEN)
+		message(FATAL_ERROR "NCINE_RHI_GL_PROFILE=Core needs a desktop OpenGL library, which was not found. Install it, or build an ES profile against OpenGL|ES.")
+	endif()
+endif()
+
+if(GLEW_FOUND)
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_GLEW")
+	target_link_libraries(${NCINE_APP} PRIVATE GLEW::GLEW)
+endif()
+
+if(NCINE_PREFERRED_RHI STREQUAL "Software")
+	# Selects the CPU software backend in RhiFwd.h/Rhi.h instead of the default OpenGL family backend
+	message(STATUS "Rendering backend: Software (CPU rasterizer)")
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_SOFTWARE")
+elseif(NCINE_PREFERRED_RHI STREQUAL "GX")
+	# Selects the Nintendo GameCube/Wii fixed-function GX backend in RhiFwd.h/Rhi.h
+	message(STATUS "Rendering backend: GX (Nintendo GameCube/Wii)")
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_GX")
+elseif(NCINE_PREFERRED_RHI STREQUAL "PICA")
+	# Selects the Nintendo 3DS fixed-function PICA200 backend in RhiFwd.h/Rhi.h. The GPU is driven through
+	# citro3d, which is linked with the platform packaging below together with libctru itself
+	message(STATUS "Rendering backend: PICA200 (Nintendo 3DS)")
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_PICA")
+elseif(NCINE_PREFERRED_RHI STREQUAL "PVR")
+	# Selects the Sega Dreamcast fixed-function PowerVR backend in RhiFwd.h/Rhi.h - the KOS toolchain
+	# environment links the PVR/maple libraries itself
+	message(STATUS "Rendering backend: PowerVR (Sega Dreamcast)")
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_PVR")
+elseif(NCINE_PREFERRED_RHI STREQUAL "GS")
+	# Selects the PlayStation 2 fixed-function Graphics Synthesizer backend in RhiFwd.h/Rhi.h. The GS is
+	# driven by GIF packets built on the EE, so there is no graphics library to link - PS2SDK's kernel and
+	# DMA libraries come in with the platform packaging below
+	message(STATUS "Rendering backend: GS (PlayStation 2)")
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_GS")
+elseif(NCINE_PREFERRED_RHI STREQUAL "GU")
+	# Selects the PlayStation Portable fixed-function GE backend in RhiFwd.h/Rhi.h - the PSPSDK graphics
+	# libraries it calls into are linked with the platform packaging below
+	message(STATUS "Rendering backend: GU (PlayStation Portable)")
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_GU")
+elseif(NCINE_PREFERRED_RHI STREQUAL "RDP")
+	# Selects the Nintendo 64 fixed-function RDP backend in RhiFwd.h/Rhi.h. The RDP is driven through
+	# libdragon's rdpq command queue (the RSP assembles and feeds the display list), so the graphics
+	# stack is libdragon itself, linked with the platform packaging below
+	message(STATUS "Rendering backend: RDP (Nintendo 64)")
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_RDP")
+elseif(NCINE_PREFERRED_RHI STREQUAL "GXM")
+	# Selects the PS Vita's native sceGxm backend in RhiFwd.h/Rhi.h. Unlike the other console backends this
+	# is a SHADER backend - the Vita's PowerVR SGX has no fixed-function pipeline - so it keeps the whole
+	# post-processing chain; what it drops is the OpenGL translation layer (vitaGL) between the engine and
+	# sceGxm. Its shaders are the baked Cg sources compiled on the console by SceShaccCg through vitashark
+	# (the stubs are linked with the Vita packaging below, next to vitaGL's).
+	message(STATUS "Rendering backend: GXM (PS Vita, native sceGxm)")
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_GXM")
+elseif(NCINE_PREFERRED_RHI STREQUAL "RSX")
+	# Selects the PlayStation 3's native RSX backend in RhiFwd.h/Rhi.h. Like GXM above - and unlike the
+	# fixed-function PVR/GX/GU/GS tier - the RSX is a programmable part (an NV47), so this is a full shader
+	# backend that keeps the whole post-processing chain. Its shaders are the same Cg the emitter produces
+	# for the Vita, but compiled to NV40 microcode OFFLINE by cgcomp (there is no runtime shader compiler on
+	# the console) and embedded per program-variant, which is what the RSX shader generation below does.
+	# PSL1GHT's librsx/libgcm_sys come in with the platform packaging further down.
+	message(STATUS "Rendering backend: RSX (PlayStation 3, native libgcm)")
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_RSX")
+elseif(NCINE_PREFERRED_RHI STREQUAL "LegacyGL")
+	# Selects the fixed-function OpenGL 1.x backend in RhiFwd.h/Rhi.h. Its client library is a plain
+	# desktop GL where one exists, MiniGL on AmigaOS 4 and TinyGL on MorphOS - on both of those it has
+	# to follow SDL2 on the link line, which is what the two arms below arrange.
+	message(STATUS "Rendering backend: Legacy OpenGL (fixed-function 1.x)")
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_LEGACYGL")
+	if(PLATFORM_AMIGAOS4)
+		# MiniGL, the SDK's fixed-function OpenGL over Warp3D. Its stub library has to follow SDL2 on the
+		# link line (SDL2's OS4 video driver calls into it to create the context), which is what listing
+		# it here rather than as an interface dependency of the imported target does - the SDL2 target is
+		# already on the line by the time this is appended.
+		target_link_libraries(${NCINE_APP} PRIVATE GL)
+	elseif(PLATFORM_MORPHOS)
+		# Asks for the SDK's TinyGL initializer by name. It is what opens tinygl.library into the
+		# `TinyGLBase` the call macros read, but nothing references it: SDL2's static glue declares that
+		# same global as a common symbol, which satisfies every reference without pulling the initializer's
+		# object out of libGL.a - and the program would then call through a null library base. An
+		# undefined symbol on the link line is what makes the linker take that object (see
+		# Sources/nCine/Backends/MorphOS/MorphOSTinyGl.cpp).
+		target_link_options(${NCINE_APP} PRIVATE "-u" "_CSTP_init_TinyGLBase")
+	else()
+		if(TARGET OpenGL::OpenGL)
+			target_link_libraries(${NCINE_APP} PRIVATE OpenGL::OpenGL)
+		elseif(TARGET OpenGL::GL)
+			target_link_libraries(${NCINE_APP} PRIVATE OpenGL::GL)
+		else()
+			message(FATAL_ERROR "NCINE_PREFERRED_RHI=LegacyGL needs a desktop OpenGL library, which was not found")
+		endif()
+	endif()
+elseif(NCINE_PREFERRED_RHI STREQUAL "D3D11")
+	# Selects the Direct3D 11 backend in RhiFwd.h/Rhi.h instead of the default OpenGL family backend
+	message(STATUS "Rendering backend: Direct3D 11")
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_D3D11")
+	# Direct3D 11 device/swap chain, DXGI and the HLSL compiler
+	target_link_libraries(${NCINE_APP} PRIVATE d3d11 dxgi d3dcompiler)
+elseif(NCINE_PREFERRED_RHI STREQUAL "Vulkan")
+	# Selects the Vulkan backend in RhiFwd.h/Rhi.h instead of the default OpenGL family backend
+	message(STATUS "Rendering backend: Vulkan")
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_VULKAN")
+	# Header-only Khronos Vulkan-Headers (fetched in ncine_imported_targets.cmake). No vulkan-1.lib is linked:
+	# the loader binds the runtime vulkan-1.dll (shipped with GPU drivers) dynamically through SDL at startup.
+	target_include_directories(${NCINE_APP} PRIVATE "${VULKAN_HEADERS_INCLUDE_DIR}")
+elseif(NCINE_PREFERRED_RHI STREQUAL "Metal")
+	# Selects the Metal backend in RhiFwd.h/Rhi.h instead of the default OpenGL family backend (macOS and iOS
+	# share it: metal-cpp and the CAMetalLayer bridge compile against both SDKs, the few macOS-only calls -
+	# managed storage, display sync, the low-power query - are gated in the backend itself)
+	message(STATUS "Rendering backend: Metal")
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_METAL")
+	# Header-only Apple metal-cpp (fetched in ncine_imported_targets.cmake) over the system frameworks
+	target_include_directories(${NCINE_APP} PRIVATE "${METAL_CPP_INCLUDE_DIR}")
+	target_link_libraries(${NCINE_APP} PRIVATE "-framework Metal" "-framework QuartzCore" "-framework Foundation")
+	# The CAMetalLayer bridge is the backend's one Objective-C++ file (the language itself is enabled in the top-level
+	# CMakeLists.txt, before the dependencies - see there for why). It manages the objects it hands to the C++
+	# side by hand (an explicit retain the C++ side releases through metal-cpp), so ARC stays off for it.
+	set_source_files_properties("${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Metal/MetalLayerBridge.mm"
+		PROPERTIES COMPILE_OPTIONS "-fno-objc-arc")
+else()
+	# OpenGL/WebGL is the default rendering backend
+	if(NCINE_RHI_GL_PROFILE STREQUAL "ES2")
+		set(_NCINE_RHI_SUMMARY "OpenGL|ES 2.0 profile (ESSL 100, no UBOs)")
+	elseif(NCINE_RHI_GL_PROFILE STREQUAL "ES3")
+		set(_NCINE_RHI_SUMMARY "OpenGL|ES 3.0 profile")
+	else()
+		set(_NCINE_RHI_SUMMARY "OpenGL 3.3 core profile")
+	endif()
+	if(ANGLE_FOUND)
+		string(APPEND _NCINE_RHI_SUMMARY ", ANGLE")
+	elseif(EMSCRIPTEN)
+		string(APPEND _NCINE_RHI_SUMMARY ", WebGL")
+	elseif(VITA)
+		string(APPEND _NCINE_RHI_SUMMARY ", vitaGL")
+	endif()
+	if(GLEW_FOUND)
+		string(APPEND _NCINE_RHI_SUMMARY ", GLEW loader")
+	elseif(TARGET OpenGL::OpenGL)
+		string(APPEND _NCINE_RHI_SUMMARY ", GLVND")
+	endif()
+	message(STATUS "Rendering backend: ${_NCINE_RHI_SUMMARY}")
+
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RHI_GL")
+endif()
+
+# Optional 16-bit (RGB565) screen framebuffer, honored by the software and OpenGL backends (see the option's
+# comment in ncine_options.cmake). Defined after the backend selection so both read the same single macro.
+if(NCINE_RHI_USE_FB16)
+	message(STATUS "Screen framebuffer: RGB565 (16-bit)")
+	target_compile_definitions(${NCINE_APP} PRIVATE "RHI_USE_FB16")
+endif()
+
+if(NOT DEDICATED_SERVER AND NOT NCINE_BUILD_LIBRETRO)
+	if(VITA AND WITH_ONLINE_MULTIPLAYER)
+		# The Vita reaches the display and the input devices through SDL2 and vitaGL, so it has no backend
+		# of its own - this is one library function VitaSDK does implement, but not to the contract its
+		# callers rely on (see the file; it is what makes HTTPS verify and ENet parse an address)
+		list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Backends/Vita/VitaLibcCompat.cpp)
+	endif()
+
+	if(PLATFORM_MORPHOS)
+		# MorphOS reaches the display and the input devices through SDL2, so it has no backend of its own -
+		# this is only the handful of library functions its C runtime declares but does not implement
+		list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Backends/MorphOS/MorphOSLibcCompat.cpp)
+		if(NCINE_PREFERRED_RHI STREQUAL "LegacyGL")
+			# ... plus the two TinyGL globals an application has to fill in itself (see the file)
+			list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Backends/MorphOS/MorphOSTinyGl.cpp)
+		endif()
+	endif()
+
+	if(PLATFORM_AMIGA)
+		# Intuition/CyberGraphX window/input backend (no SDL/GLFW: the 68k SDL2 ports are nascent, and the
+		# whole job here is opening one RTG screen and copying the Software RHI's framebuffer into it - see
+		# AmigaGfxDevice). The OS libraries (intuition, graphics, cybergraphics, lowlevel, ahi.device) are
+		# opened at run time, so nothing is linked beyond what -mcrt already brings in.
+		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_AMIGA")
+		list(APPEND HEADERS
+			${NCINE_SOURCE_DIR}/nCine/Backends/Amiga/AmigaPlatform.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Amiga/AmigaInputManager.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Amiga/AmigaGfxDevice.h
+		)
+		list(APPEND SOURCES
+			${NCINE_SOURCE_DIR}/nCine/Backends/Amiga/AmigaPlatform.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Amiga/AmigaInputManager.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Amiga/AmigaGfxDevice.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Amiga/AmigaLibcCompat.c
+		)
+
+		# AMMX scanline kernels for the Apollo 68080 (Vampire), runtime-gated so the binary stays
+		# 68060-safe. binutils' assembler does not know AMMX, so the module is assembled by vasm,
+		# which the m68k-amigaos-gcc release ships in its own bin directory.
+		find_program(VASM_EXECUTABLE vasmm68k_mot HINTS "$ENV{AMIGA_INST}/bin")
+		if(VASM_EXECUTABLE)
+			# A subdirectory of its own, so the object cannot collide with anything else assembled into the
+			# build root, and vasm itself is a dependency - a toolchain swap re-assembles the module
+			set(_ammxObject "${CMAKE_CURRENT_BINARY_DIR}/Amiga/AmigaAmmxOps.o")
+			add_custom_command(OUTPUT "${_ammxObject}"
+				COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/Amiga"
+				COMMAND "${VASM_EXECUTABLE}" -quiet -m68080 -Fhunk
+					-o "${_ammxObject}" "${NCINE_SOURCE_DIR}/nCine/Backends/Amiga/AmigaAmmxOps.s"
+				DEPENDS "${NCINE_SOURCE_DIR}/nCine/Backends/Amiga/AmigaAmmxOps.s" "${VASM_EXECUTABLE}"
+				COMMENT "Assembling AMMX scanline kernels (vasm)"
+				VERBATIM)
+			set_source_files_properties("${_ammxObject}" PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+			target_sources(${NCINE_APP} PRIVATE "${_ammxObject}")
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_AMMX")
+			list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Software/SwAmmxOps.h)
+			message(STATUS "AMMX scanline kernels enabled (vasm: ${VASM_EXECUTABLE})")
+		else()
+			message(STATUS "vasm not found, AMMX scanline kernels will not be built")
+		endif()
+	elseif(PLATFORM_N64)
+		# libdragon window/input backend (no SDL/GLFW: libdragon ships neither, and the console's video
+		# output is a VI framebuffer configured through display_init rather than anything a windowing
+		# library would wrap). The rdpq libraries the rendering backend calls into come in with libdragon
+		# itself, linked with the platform packaging below.
+		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_N64")
+		list(APPEND HEADERS
+			${NCINE_SOURCE_DIR}/nCine/Backends/N64/N64InputManager.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/N64/N64GfxDevice.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/N64/N64FullMotionVideo.h
+		)
+		list(APPEND SOURCES
+			${NCINE_SOURCE_DIR}/nCine/Backends/N64/N64InputManager.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/N64/N64GfxDevice.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/N64/N64FullMotionVideo.cpp
+			${NCINE_SOURCE_DIR}/nCine/Base/LibmOverrides.cpp
+		)
+
+		if(NCINE_N64_SIZE_OPTIMIZATION)
+			# Code that never runs per frame in a level is built for size on the N64: the whole program lives
+			# in the same 8 MB as the level data, and every 100 KB of code is 100 KB less heap. Measured: -Os
+			# over the whole tree saved 511 KB of .text but cost 20% of the level frame rate, so it is applied
+			# only to the menus, the JSON parser (metadata is read at load time), the event spawner and the
+			# application bootstrap - never to the renderer, the actors, the tile map or the importers' decoders
+			# that level loads spend their time in. Per-source options come after the target's -O2, so they win.
+			file(GLOB_RECURSE _n64ColdSources CONFIGURE_DEPENDS
+				"${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/*.cpp"
+				"${NCINE_SOURCE_DIR}/Dependencies/jsoncpp/*.cpp")
+			list(APPEND _n64ColdSources
+				"${NCINE_SOURCE_DIR}/Main.cpp"
+				"${NCINE_SOURCE_DIR}/Jazz2/Events/EventSpawner.cpp"
+				"${NCINE_SOURCE_DIR}/Jazz2/UI/Cinematics.cpp"
+				"${NCINE_SOURCE_DIR}/Jazz2/Input/ControlScheme.cpp"
+				"${NCINE_SOURCE_DIR}/nCine/Application.cpp"
+				"${NCINE_SOURCE_DIR}/nCine/AppConfiguration.cpp"
+				"${NCINE_SOURCE_DIR}/nCine/MainApplication.cpp")
+			set_source_files_properties(${_n64ColdSources} TARGET_DIRECTORY ${NCINE_APP}
+				PROPERTIES COMPILE_OPTIONS "$<$<CONFIG:Release>:-Os>")
+		endif()
+	elseif(NINTENDO_WII OR NINTENDO_GAMECUBE)
+		# libogc window/input backend (no SDL/GLFW on these consoles); GX is linked by the
+		# devkitPro toolchain's standard libraries (ogc), listed with the platform packaging below
+		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_OGC")
+		list(APPEND HEADERS
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ogc/OgcInputManager.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ogc/OgcGfxDevice.h
+		)
+		list(APPEND SOURCES
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ogc/OgcInputManager.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ogc/OgcGfxDevice.cpp
+		)
+		if(NINTENDO_WII)
+			target_link_libraries(${NCINE_APP} PRIVATE wiiuse bte fat ogc m)
+		else()
+			# The GameCube also runs from its own disc, which it reads itself, and saves to a memory card when it
+			# does (see OgcDvd.h and OgcMemoryCard.h); OgcStorage mounts the SD cards and records where the
+			# executable was started from, for ContentResolver to choose between them
+			list(APPEND HEADERS
+				${NCINE_SOURCE_DIR}/nCine/Backends/Ogc/OgcDvd.h
+				${NCINE_SOURCE_DIR}/nCine/Backends/Ogc/OgcMemoryCard.h
+				${NCINE_SOURCE_DIR}/nCine/Backends/Ogc/OgcStorage.h
+			)
+			list(APPEND SOURCES
+				${NCINE_SOURCE_DIR}/nCine/Backends/Ogc/OgcDvd.cpp
+				${NCINE_SOURCE_DIR}/nCine/Backends/Ogc/OgcMemoryCard.cpp
+				${NCINE_SOURCE_DIR}/nCine/Backends/Ogc/OgcStorage.cpp
+			)
+			target_link_libraries(${NCINE_APP} PRIVATE fat ogc m)
+
+			# The game ID of the disc the build makes (see the packaging below and ncine_options.cmake), which is
+			# also how the game recognizes that disc and the code its memory card saves are created under
+			target_compile_definitions(${NCINE_APP} PRIVATE "NCINE_GAMECUBE_GAME_ID=\"${GAMECUBE_GAME_ID}\"")
+
+			# The icon a memory card save is listed with - the same one the Dreamcast lists its saves with,
+			# converted to the GameCube's format at run time (see OgcMemoryCard.cpp)
+			include("${CMAKE_SOURCE_DIR}/cmake/ncine_dreamcast_icon.cmake")
+			ncine_generate_dreamcast_icon(_gameCubeIconHeader)
+			list(APPEND HEADERS ${_gameCubeIconHeader})
+			target_include_directories(${NCINE_APP} PRIVATE "${CMAKE_BINARY_DIR}/Generated")
+		endif()
+	elseif(NINTENDO_3DS)
+		# libctru window/input backend. devkitPro does package an SDL for the 3DS, but it is SDL 1.2 (and a
+		# software-rendered one), and the whole job here is presenting the PICA backend's frame on the top
+		# screen and reading one built-in pad, which libctru does directly. citro3d is the graphics stack the
+		# rendering backend calls into; libctru is on the toolchain's own link line already (-lctru -lm in
+		# CTR_STANDARD_LIBRARIES), so only citro3d has to be named, and it has to precede libctru.
+		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_CTR")
+		list(APPEND HEADERS
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ctr/CtrInputManager.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ctr/CtrGfxDevice.h
+		)
+		# CtrLibcCompat.cpp is the one library function the engine calls that the toolchain declares but does not
+		# implement (see the file)
+		list(APPEND SOURCES
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ctr/CtrInputManager.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ctr/CtrGfxDevice.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ctr/CtrPlatform.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ctr/CtrLibcCompat.cpp
+		)
+		target_link_libraries(${NCINE_APP} PRIVATE citro3d)
+	elseif(PLATFORM_DREAMCAST)
+		# KallistiOS window/input backend (no SDL/GLFW); the KOS toolchain links its own libraries
+		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_DC")
+		list(APPEND HEADERS
+			${NCINE_SOURCE_DIR}/nCine/Backends/Dc/DcInputManager.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Dc/DcGfxDevice.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Dc/DcPlatform.h
+		)
+		list(APPEND SOURCES
+			${NCINE_SOURCE_DIR}/nCine/Backends/Dc/DcInputManager.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Dc/DcGfxDevice.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Dc/DcPlatform.cpp
+			${NCINE_SOURCE_DIR}/nCine/Base/LibmOverrides.cpp
+		)
+
+		# Double-precision `pow()` and `log()` switch the FPU's precision mode around every operation and the
+		# module player calls them on every tick of every channel, and `ceilf()` is a library routine the textured
+		# background calls for every band it draws; the definitions that take them over are in LibmOverrides.cpp.
+		# Not `floorf()`: newlib's is already cheaper on the SH-4 than the replacement.
+		target_link_options(${NCINE_APP} PRIVATE "-Wl,--wrap=pow,--wrap=log,--wrap=ceilf")
+
+		# The icon a save is listed with in the console's file manager, converted from the .ico it is drawn
+		# in (see PreferencesCache::DescribeNextMemoryCardFile). The include path is set here rather than
+		# left to ncine_generated_sources.cmake, which only adds it if the directory already exists.
+		include("${CMAKE_SOURCE_DIR}/cmake/ncine_dreamcast_icon.cmake")
+		ncine_generate_dreamcast_icon(_dreamcastIconHeader)
+		list(APPEND HEADERS ${_dreamcastIconHeader})
+		target_include_directories(${NCINE_APP} PRIVATE "${CMAKE_BINARY_DIR}/Generated")
+	elseif(PLATFORM_PSP)
+		# PSPSDK window/input backend (no SDL/GLFW); the PSP libraries are linked with the packaging below
+		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_PSP")
+		list(APPEND HEADERS
+			${NCINE_SOURCE_DIR}/nCine/Backends/Psp/PspInputManager.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Psp/PspGfxDevice.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Psp/PspNetwork.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Psp/PspPower.h
+		)
+		list(APPEND SOURCES
+			${NCINE_SOURCE_DIR}/nCine/Backends/Psp/PspInputManager.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Psp/PspGfxDevice.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Psp/PspLibcCompat.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Psp/PspNetwork.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Psp/PspPower.cpp
+			${NCINE_SOURCE_DIR}/nCine/Base/LibmOverrides.cpp
+		)
+	elseif(PLATFORM_PS2)
+		# PS2SDK window/input backend. PS2SDK does package an SDL2, and the configure would otherwise pick it,
+		# but the shared SdlGfxDevice code passes `std::int32_t*` into SDL's `int*` parameters and
+		# `std::int32_t` is `long` on the Emotion Engine - so it cannot compile there without changing
+		# signatures every other platform depends on. A bespoke backend is the conventional answer on this
+		# tier anyway (see the Dc/Ogc/Psp arms above). The PS2 libraries are linked with the packaging below.
+		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_PS2")
+
+		# The IOP modules the console cannot reach a device without are linked into the executable rather
+		# than staged on the disc: the MX4SIO driver is the only way to read the SD card it is loaded FROM,
+		# and a build booted from that card has no disc to read audsrv off either (see Ps2Modules.h)
+		include("${CMAKE_SOURCE_DIR}/cmake/ncine_ps2_embed_irx.cmake")
+		ncine_ps2_embed_irx_modules(PS2_EMBEDDED_MODULES_SOURCE
+			"Audsrv=audsrv.irx"
+			"Bdm=bdm.irx"
+			"BdmfsFatfs=bdmfs_fatfs.irx"
+			"Mx4sioBd=mx4sio_bd.irx"
+			"Usbd=usbd.irx"
+			"UsbmassBd=usbmass_bd.irx")
+
+		list(APPEND HEADERS
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ps2/Ps2InputManager.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ps2/Ps2GfxDevice.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ps2/Ps2Modules.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ps2/Ps2Storage.h
+		)
+		list(APPEND SOURCES
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ps2/Ps2InputManager.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ps2/Ps2GfxDevice.cpp
+			${NCINE_SOURCE_DIR}/nCine/Base/LibmOverrides.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ps2/Ps2Modules.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ps2/Ps2Storage.cpp
+			${PS2_EMBEDDED_MODULES_SOURCE}
+		)
+		# The R5900 has no load-linked/store-conditional for sub-word sizes, so GCC lowers the engine's
+		# `std::atomic<bool>`/`<std::uint8_t>` operations to libatomic calls rather than inline instructions
+		# `mc` is libmc: the memory card is read and written through ordinary POSIX paths (MCMAN registers
+		# with the same ioman the newlib port uses), but a slot has to be probed through libmc before MCMAN
+		# will answer for it at all - see the mcGetInfo() call in MainApplication
+		# `patches` is libpatches, the SBV patches that give the ROM's loadfile service the LoadModuleBuffer
+		# entry point it lacks - without it none of the modules embedded above can be started (see Ps2Modules.h)
+		# `-ldebug` is libdebug, the text console on the GS that shows the boot trace on the television until the
+		# renderer takes the display over - the only way to read a trace on hardware without a serial cable (see
+		# MainApplication::Run() and Application::OnTraceReceived()). Spelled as a flag because a bare `debug`
+		# here is CMake's own per-configuration keyword and silently applies to the NEXT item instead.
+		target_link_libraries(${NCINE_APP} PRIVATE draw graph dma packet pad mc cdvd patches -ldebug kernel atomic)
+
+		# Double-precision `pow()`, `log()` and division are soft-float on this console and the module player
+		# calls them on every tick of every channel, and `floorf()`/`ceilf()` are library routines the textured
+		# background calls for every band it draws; the definitions that take them over are in LibmOverrides.cpp
+		target_link_options(${NCINE_APP} PRIVATE "-Wl,--wrap=pow,--wrap=log,--wrap=__divdf3,--wrap=floorf,--wrap=ceilf")
+	elseif(PLATFORM_PS3)
+		# PSL1GHT window/input backend (no SDL/GLFW: PSL1GHT ships neither, and the console's video output is
+		# configured through sysutil rather than through anything a windowing library would wrap). The RSX
+		# libraries the rendering backend calls into are linked with the platform packaging below.
+		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_PS3")
+		list(APPEND HEADERS
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ps3/Ps3InputManager.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ps3/Ps3GfxDevice.h
+		)
+		list(APPEND SOURCES
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ps3/Ps3InputManager.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Ps3/Ps3GfxDevice.cpp
+		)
+	elseif(GLFW_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "GLFW")
+		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_GLFW")
+		target_link_libraries(${NCINE_APP} PRIVATE GLFW::GLFW)
+
+		list(APPEND HEADERS
+			${NCINE_SOURCE_DIR}/nCine/Backends/GlfwInputManager.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/GlfwGfxDevice.h
+		)
+		list(APPEND SOURCES
+			${NCINE_SOURCE_DIR}/nCine/Backends/GlfwInputManager.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/GlfwKeys.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/GlfwGfxDevice.cpp
+		)
+	elseif((SDL2_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "SDL2") OR (SDL3_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "SDL3"))
+		# Both SDL versions share the same backend sources (SDL2/SDL3 API differences are handled inline
+		# with WITH_SDL2 / WITH_SDL3 preprocessor forks), so only the compile definition and linked library differ
+		if(NCINE_PREFERRED_BACKEND STREQUAL "SDL3")
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_SDL3")
+			target_link_libraries(${NCINE_APP} PRIVATE SDL3::SDL3)
+		else()
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_SDL2")
+			target_link_libraries(${NCINE_APP} PRIVATE SDL2::SDL2)
+			if(IOS)
+				# SDL2main carries the real `main()` on iOS (it starts the UIApplication and calls the game's
+				# `SDL_main`, see Sources/Main.cpp); it is a separate static library of the source build
+				target_link_libraries(${NCINE_APP} PRIVATE SDL2::SDL2main)
+			endif()
+		endif()
+
+		list(APPEND HEADERS
+			${NCINE_SOURCE_DIR}/nCine/Backends/SdlInputManager.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/SdlGfxDevice.h
+		)
+		list(APPEND SOURCES
+			${NCINE_SOURCE_DIR}/nCine/Backends/SdlInputManager.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/SdlKeys.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/SdlGfxDevice.cpp
+		)
+	elseif(Qt5_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "QT5")
+		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_QT5")
+		target_link_libraries(${NCINE_APP} PUBLIC Qt5::Widgets)
+		if(Qt5Gamepad_FOUND)
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_QT5GAMEPAD")
+			target_link_libraries(${NCINE_APP} PRIVATE Qt5::Gamepad)
+		endif()
+
+		qt5_wrap_cpp(MOC_SOURCES ${NCINE_SOURCE_DIR}/nCine/Backends/Qt5Widget.h)
+
+		list(APPEND HEADERS
+			${NCINE_SOURCE_DIR}/nCine/Backends/Qt5Widget.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Qt5InputManager.h
+			${NCINE_SOURCE_DIR}/nCine/Backends/Qt5GfxDevice.h
+		)
+		list(APPEND SOURCES
+			${NCINE_SOURCE_DIR}/nCine/Backends/Qt5Widget.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Qt5InputManager.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Qt5Keys.cpp
+			${NCINE_SOURCE_DIR}/nCine/Backends/Qt5GfxDevice.cpp
+			${MOC_SOURCES}
+		)
+	endif()
+endif()
+
+if(NOT DEDICATED_SERVER)
+	if(OPENAL_FOUND OR ASND_FOUND OR AICA_FOUND OR N64AUDIO_FOUND OR PS3AUDIO_FOUND OR AHIAUDIO_FOUND OR SDLAUDIO_FOUND OR PSPAUDIO_FOUND OR NDSP_FOUND OR PS2AUDIO_FOUND)
+		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_AUDIO")
+
+		list(APPEND HEADERS
+			${NCINE_SOURCE_DIR}/nCine/Audio/AudioDeviceBase.h
+			${NCINE_SOURCE_DIR}/nCine/Audio/AudioMixerCommon.h
+			${NCINE_SOURCE_DIR}/nCine/Audio/AudioBufferPlayer.h
+			${NCINE_SOURCE_DIR}/nCine/Audio/AudioStreamPlayer.h
+		)
+
+		list(APPEND SOURCES
+			${NCINE_SOURCE_DIR}/nCine/Audio/AudioDeviceBase.cpp
+			${NCINE_SOURCE_DIR}/nCine/Audio/AudioBufferPlayer.cpp
+			${NCINE_SOURCE_DIR}/nCine/Audio/AudioStreamPlayer.cpp
+		)
+
+		if(PLATFORM_N64)
+			# The console plays every sound in libdragon's own formats and decodes none itself, so it has no
+			# use for the loaders (see NCINE_HAS_NATIVE_AUDIO in Main.h)
+			list(REMOVE_ITEM SOURCES "${NCINE_SOURCE_DIR}/nCine/Audio/IAudioLoader.cpp")
+		else()
+			list(APPEND HEADERS
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioLoaderWav.h
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioReaderWav.h
+			)
+			list(APPEND SOURCES
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioLoaderWav.cpp
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioReaderWav.cpp
+			)
+		endif()
+
+		# Exactly one audio backend is compiled into a binary, mirroring the rendering backends. Each
+		# one lives in "nCine/Audio/Backends/<backend>/" and implements IAudioDevice.
+		if(OPENAL_FOUND)
+			set(_NCINE_AUDIO_BACKEND "OpenAL")
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_OPENAL")
+			target_link_libraries(${NCINE_APP} PRIVATE OpenAL::OpenAL)
+
+			list(APPEND HEADERS
+				${NCINE_SOURCE_DIR}/nCine/Audio/Backends/AL/ALAudioDevice.h
+				${NCINE_SOURCE_DIR}/nCine/Audio/Backends/AL/ALDebug.h)
+			list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/AL/ALAudioDevice.cpp)
+		elseif(ASND_FOUND)
+			set(_NCINE_AUDIO_BACKEND "ASND (libogc DSP mixer)")
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_ASND")
+			target_link_libraries(${NCINE_APP} PRIVATE asnd)
+
+			list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/ASND/AsndAudioDevice.h)
+			list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/ASND/AsndAudioDevice.cpp)
+		elseif(AICA_FOUND)
+			set(_NCINE_AUDIO_BACKEND "AICA (KallistiOS sound driver)")
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_AICA")
+
+			list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/AICA/AicaAudioDevice.h)
+			list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/AICA/AicaAudioDevice.cpp)
+		elseif(N64AUDIO_FOUND)
+			set(_NCINE_AUDIO_BACKEND "N64 (libdragon AI DMA ring mixer)")
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_N64AUDIO")
+			# The AI is part of libdragon itself, which is linked with the platform packaging below
+
+			list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/N64/N64AudioDevice.h)
+			list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/N64/N64AudioDevice.cpp)
+		elseif(AHIAUDIO_FOUND)
+			set(_NCINE_AUDIO_BACKEND "AHI (ahi.device software mixer)")
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_AHIAUDIO")
+			# ahi.device is opened at run time through exec, nothing to link
+
+			list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/Amiga/AmigaAudioDevice.h)
+			list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/Amiga/AmigaAudioDevice.cpp)
+		elseif(SDLAUDIO_FOUND)
+			set(_NCINE_AUDIO_BACKEND "SDL (software mixer into SDL's audio queue)")
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_SDLAUDIO")
+			# SDL itself is already linked as the window backend
+
+			list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/SDL/SdlAudioDevice.h)
+			list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/SDL/SdlAudioDevice.cpp)
+		elseif(PSPAUDIO_FOUND)
+			set(_NCINE_AUDIO_BACKEND "sceAudio (software mixer into a PSP hardware channel)")
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_PSPAUDIO")
+			# The audio stubs are linked with the platform packaging below
+
+			list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/Psp/PspAudioDevice.h)
+			list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/Psp/PspAudioDevice.cpp)
+		elseif(NDSP_FOUND)
+			set(_NCINE_AUDIO_BACKEND "NDSP (software mixer into a 3DS DSP channel)")
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_NDSP")
+			# NDSP is part of libctru, which the toolchain links itself
+
+			list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/Ndsp/NdspAudioDevice.h)
+			list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/Ndsp/NdspAudioDevice.cpp)
+		elseif(PS2AUDIO_FOUND)
+			set(_NCINE_AUDIO_BACKEND "audsrv (software mixer into the PS2 SPU2 stream)")
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_PS2AUDIO")
+			# The EE side of audsrv is `libaudsrv`; the IRX itself is embedded in the executable by the
+			# PLATFORM_PS2 arm above, because a build booted from an SD card has no disc to read it from
+			target_link_libraries(${NCINE_APP} PRIVATE audsrv)
+
+			list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/Ps2/Ps2AudioDevice.h)
+			list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/Ps2/Ps2AudioDevice.cpp)
+		elseif(PS3AUDIO_FOUND)
+			set(_NCINE_AUDIO_BACKEND "PS3 (PSL1GHT libaudio mixer)")
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_PS3AUDIO")
+			# libaudio is the lv2 audio port itself; libsysmodule loads the SYSMODULE_AUDIO PRX it needs
+			target_link_libraries(${NCINE_APP} PRIVATE audio sysmodule)
+
+			list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/PS3/Ps3AudioDevice.h)
+			list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Audio/Backends/PS3/Ps3AudioDevice.cpp)
+		endif()
+		message(STATUS "Audio backend: ${_NCINE_AUDIO_BACKEND}")
+
+		if(VORBIS_FOUND)
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_VORBIS")
+			if(VORBIS_DYNAMIC_LINK)
+				target_compile_definitions(${NCINE_APP} PRIVATE "WITH_VORBIS_DYNAMIC")
+				target_include_directories(${NCINE_APP} PRIVATE "${EXTERNAL_INCLUDES_DIR}")
+			else()
+				target_link_libraries(${NCINE_APP} PRIVATE Vorbis::Vorbisfile)
+			endif()
+			
+			list(APPEND HEADERS
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioLoaderOgg.h
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioReaderOgg.h)
+
+			list(APPEND SOURCES
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioLoaderOgg.cpp
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioReaderOgg.cpp)
+		endif()
+		
+		if(OPENMPT_FOUND)
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_OPENMPT")
+			if(OPENMPT_DYNAMIC_LINK)
+				target_compile_definitions(${NCINE_APP} PRIVATE "WITH_OPENMPT_DYNAMIC")
+				target_include_directories(${NCINE_APP} PRIVATE "${EXTERNAL_INCLUDES_DIR}/libopenmpt/")
+				target_link_libraries(${NCINE_APP} PRIVATE ${CMAKE_DL_LIBS})
+			else()
+				target_link_libraries(${NCINE_APP} PRIVATE libopenmpt::libopenmpt)
+			endif()
+			
+			list(APPEND HEADERS
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioLoaderMpt.h
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioReaderMpt.h)
+
+			list(APPEND SOURCES
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioLoaderMpt.cpp
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioReaderMpt.cpp)
+		elseif(NCINE_WITH_XMP)
+			# libxmp, the lightweight tracker player for platforms where libopenmpt is not real-time-viable
+			# (today: the classic Amiga). Downloaded and built by cmake/Findlibxmp.cmake - the full library
+			# rather than libxmp-lite, because the lite build drops the Galaxy Music System loaders that
+			# read the game's original ".j2b" modules.
+			target_compile_definitions(${NCINE_APP} PRIVATE "WITH_XMP")
+			target_link_libraries(${NCINE_APP} PRIVATE Libxmp)
+
+			list(APPEND HEADERS
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioLoaderXmp.h
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioReaderXmp.h)
+
+			list(APPEND SOURCES
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioLoaderXmp.cpp
+				${NCINE_SOURCE_DIR}/nCine/Audio/AudioReaderXmp.cpp)
+		endif()
+	elseif(NOT NCINE_BUILD_ANDROID)
+		message(STATUS "Cannot find any audio backend library")
+	endif()
+endif()
+
+#if(PNG_FOUND)
+#	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_PNG")
+#	target_link_libraries(${NCINE_APP} PRIVATE PNG::PNG)
+
+#	list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Graphics/TextureSaverPng.h)
+#	list(APPEND PRIVATE_HEADERS ${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderPng.h)
+#	list(APPEND SOURCES
+#		${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderPng.cpp
+#		${NCINE_SOURCE_DIR}/nCine/Graphics/TextureSaverPng.cpp)
+#endif()
+#if(WEBP_FOUND)
+#	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_WEBP")
+#	target_link_libraries(${NCINE_APP} PRIVATE WebP::WebP)
+
+#	list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Graphics/TextureSaverWebP.h)
+#	list(APPEND PRIVATE_HEADERS ${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderWebP.h)
+#	list(APPEND SOURCES
+#		${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderWebP.cpp
+#		${NCINE_SOURCE_DIR}/nCine/Graphics/TextureSaverWebP.cpp)
+#endif()
+
+if(Threads_FOUND AND NCINE_WITH_THREADS)
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_THREADS")
+	target_link_libraries(${NCINE_APP} PRIVATE Threads::Threads)
+
+	if(WIN32)
+		list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Threading/WindowsThreadSync.cpp)
+	else()
+		list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Threading/PosixThreadSync.cpp)
+	endif()
+
+	list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Threading/ThreadPool.h)
+	list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Threading/ThreadPool.cpp)
+endif()
+
+#if(LUA_FOUND)
+#	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_LUA")
+#	target_link_libraries(${NCINE_APP} PRIVATE Lua::Lua)
+
+#	list(APPEND HEADERS
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaTypes.h
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaStateManager.h
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaUtils.h
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaDebug.h
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaRectUtils.h
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaVector2Utils.h
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaVector3Utils.h
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaColorUtils.h
+#	)
+
+#	list(APPEND PRIVATE_HEADERS
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaNames.h
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaStatistics.h
+#	)
+
+#	list(APPEND SOURCES
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaStateManager.cpp
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaUtils.cpp
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaDebug.cpp
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaStatistics.cpp
+#		${NCINE_SOURCE_DIR}/nCine/Scripting/LuaColorUtils.cpp
+#	)
+
+#	if(NCINE_WITH_SCRIPTING_API)
+#		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_SCRIPTING_API")
+
+#		list(APPEND HEADERS
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaUntrackedUserData.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaIAppEventHandler.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaIInputEventHandler.h
+#		)
+
+#		list(APPEND PRIVATE_HEADERS
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaClassTracker.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaILogger.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaRect.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaVector2.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaVector3.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaColor.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaIInputManager.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaMouseEvents.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaKeys.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaKeyboardEvents.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaJoystickEvents.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaTouchEvents.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaTimeStamp.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaFileSystem.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaApplication.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaAppConfiguration.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaSceneNode.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaDrawableNode.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaTexture.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaBaseSprite.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaSprite.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaMeshSprite.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaRectAnimation.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaAnimatedSprite.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaFont.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaTextNode.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaParticleSystem.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaViewport.h
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaCamera.h
+#		)
+
+#		list(APPEND SOURCES
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaIAppEventHandler.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaILogger.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaColor.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaIInputManager.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaIInputEventHandler.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaMouseEvents.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaKeys.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaKeyboardEvents.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaJoystickEvents.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaTouchEvents.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaTimeStamp.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaFileSystem.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaApplication.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaAppConfiguration.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaSceneNode.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaDrawableNode.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaTexture.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaBaseSprite.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaSprite.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaMeshSprite.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaRectAnimation.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaAnimatedSprite.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaFont.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaTextNode.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaParticleSystem.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaViewport.cpp
+#			${NCINE_SOURCE_DIR}/nCine/Scripting/LuaCamera.cpp
+#		)
+
+#		if(OPENAL_FOUND)
+#			list(APPEND PRIVATE_HEADERS
+#				${NCINE_SOURCE_DIR}/nCine/Scripting/LuaIAudioDevice.h
+#				${NCINE_SOURCE_DIR}/nCine/Scripting/LuaIAudioPlayer.h
+#				${NCINE_SOURCE_DIR}/nCine/Scripting/LuaAudioStreamPlayer.h
+#				${NCINE_SOURCE_DIR}/nCine/Scripting/LuaAudioBuffer.h
+#				${NCINE_SOURCE_DIR}/nCine/Scripting/LuaAudioBufferPlayer.h
+#			)
+
+#			list(APPEND SOURCES
+#				${NCINE_SOURCE_DIR}/nCine/Scripting/LuaIAudioDevice.cpp
+#				${NCINE_SOURCE_DIR}/nCine/Scripting/LuaIAudioPlayer.cpp
+#				${NCINE_SOURCE_DIR}/nCine/Scripting/LuaAudioStreamPlayer.cpp
+#				${NCINE_SOURCE_DIR}/nCine/Scripting/LuaAudioBuffer.cpp
+#				${NCINE_SOURCE_DIR}/nCine/Scripting/LuaAudioBufferPlayer.cpp
+#			)
+#		endif()
+
+#		if(NOT ANDROID)
+#			list(APPEND PRIVATE_HEADERS ${NCINE_SOURCE_DIR}/nCine/Scripting/LuaEventHandler.h)
+#			list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Scripting/LuaEventHandler.cpp)
+#		endif()
+#	endif()
+#endif()
+
+#if(NCINE_WITH_ALLOCATORS)
+#	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_ALLOCATORS")
+#
+#	list(APPEND HEADERS
+#		${NCINE_ROOT}/include/nctl/AllocManager.h
+#		${NCINE_ROOT}/include/nctl/IAllocator.h
+#		${NCINE_ROOT}/include/nctl/MallocAllocator.h
+#		${NCINE_ROOT}/include/nctl/LinearAllocator.h
+#		${NCINE_ROOT}/include/nctl/StackAllocator.h
+#		${NCINE_ROOT}/include/nctl/PoolAllocator.h
+#		${NCINE_ROOT}/include/nctl/FreeListAllocator.h
+#		${NCINE_ROOT}/include/nctl/ProxyAllocator.h
+#	)
+#
+#	list(APPEND SOURCES
+#		${NCINE_ROOT}/src/base/AllocManager.cpp
+#		${NCINE_ROOT}/src/base/IAllocator.cpp
+#		${NCINE_ROOT}/src/base/MallocAllocator.cpp
+#		${NCINE_ROOT}/src/base/LinearAllocator.cpp
+#		${NCINE_ROOT}/src/base/StackAllocator.cpp
+#		${NCINE_ROOT}/src/base/PoolAllocator.cpp
+#		${NCINE_ROOT}/src/base/FreeListAllocator.cpp
+#		${NCINE_ROOT}/src/base/ProxyAllocator.cpp
+#	)
+#endif()
+
+if(ANGELSCRIPT_FOUND)
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_ANGELSCRIPT")
+	target_link_libraries(${NCINE_APP} PRIVATE Angelscript)
+endif()
+
+if(NCINE_WITH_IMGUI AND NOT DEDICATED_SERVER)
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_IMGUI")
+
+	# For external projects compiling using an nCine build directory
+	set(IMGUI_INCLUDE_ONLY_DIR ${IMGUI_SOURCE_DIR}/include_only)
+	file(COPY ${IMGUI_SOURCE_DIR}/imgui.h DESTINATION ${IMGUI_INCLUDE_ONLY_DIR})
+	file(COPY ${IMGUI_SOURCE_DIR}/imconfig.h DESTINATION ${IMGUI_INCLUDE_ONLY_DIR})
+
+	list(APPEND HEADERS
+		${IMGUI_INCLUDE_ONLY_DIR}/imgui.h
+		${IMGUI_INCLUDE_ONLY_DIR}/imconfig.h
+		${IMGUI_SOURCE_DIR}/imgui_internal.h
+		${IMGUI_SOURCE_DIR}/imstb_rectpack.h
+		${IMGUI_SOURCE_DIR}/imstb_textedit.h
+		${IMGUI_SOURCE_DIR}/imstb_truetype.h
+		${NCINE_SOURCE_DIR}/nCine/Graphics/ImGuiDrawing.h
+		${NCINE_SOURCE_DIR}/nCine/Input/ImGuiJoyMappedInput.h
+	)
+
+	list(APPEND SOURCES
+		${IMGUI_SOURCE_DIR}/imgui.cpp
+		${IMGUI_SOURCE_DIR}/imgui_demo.cpp
+		${IMGUI_SOURCE_DIR}/imgui_draw.cpp
+		${IMGUI_SOURCE_DIR}/imgui_tables.cpp
+		${IMGUI_SOURCE_DIR}/imgui_widgets.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/ImGuiDrawing.cpp
+		${NCINE_SOURCE_DIR}/nCine/Input/ImGuiJoyMappedInput.cpp
+	)
+
+	if(GLFW_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "GLFW")
+		list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Backends/ImGuiGlfwInput.h)
+		list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Backends/ImGuiGlfwInput.cpp)
+	elseif((SDL2_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "SDL2") OR (SDL3_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "SDL3"))
+		list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Backends/ImGuiSdlInput.h)
+		list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Backends/ImGuiSdlInput.cpp)
+	elseif(Qt5_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "QT5")
+		list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Backends/ImGuiQt5Input.h)
+		list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Backends/ImGuiQt5Input.cpp)
+	elseif(ANDROID)
+		list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Backends/Android/ImGuiAndroidInput.h)
+		list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Backends/Android/ImGuiAndroidInput.cpp)
+	endif()
+
+	list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Graphics/ImGuiDebugOverlay.h)
+	list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Graphics/ImGuiDebugOverlay.cpp)
+
+	target_include_directories(${NCINE_APP}
+		INTERFACE $<BUILD_INTERFACE:${IMGUI_INCLUDE_ONLY_DIR}>
+		PRIVATE $<BUILD_INTERFACE:${IMGUI_INCLUDE_ONLY_DIR}>)
+
+	if(MINGW)
+		target_link_libraries(${NCINE_APP} PRIVATE imm32 dwmapi)
+	endif()
+endif()
+
+if(NCINE_WITH_TRACY)
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_TRACY")
+	if(NOT ANDROID AND NOT APPLE AND NOT EMSCRIPTEN)
+		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_TRACY_OPENGL")
+	endif()
+	target_compile_definitions(${NCINE_APP} PUBLIC "TRACY_ENABLE")
+	target_compile_definitions(${NCINE_APP} PRIVATE "TRACY_DELAYED_INIT")
+
+	# For external projects compiling using an nCine build directory
+	set(TRACY_INCLUDE_ONLY_DIR ${TRACY_SOURCE_DIR}/include_only)
+	file(GLOB TRACY_ROOT_HPP "${TRACY_SOURCE_DIR}/public/tracy/*.hpp" "${TRACY_SOURCE_DIR}/public/tracy/*.h")
+	file(COPY ${TRACY_ROOT_HPP} DESTINATION ${TRACY_INCLUDE_ONLY_DIR}/tracy/tracy)
+	file(GLOB TRACY_COMMON_HPP "${TRACY_SOURCE_DIR}/public/common/*.hpp" "${TRACY_SOURCE_DIR}/public/common/*.h")
+	file(COPY ${TRACY_COMMON_HPP} DESTINATION ${TRACY_INCLUDE_ONLY_DIR}/tracy/common)
+	file(COPY "${TRACY_SOURCE_DIR}/public/common/TracySystem.cpp" DESTINATION ${TRACY_INCLUDE_ONLY_DIR}/tracy/common)
+	file(GLOB TRACY_CLIENT_HPP "${TRACY_SOURCE_DIR}/public/client/*.hpp" "${TRACY_SOURCE_DIR}/public/client/*.h")
+	file(COPY ${TRACY_CLIENT_HPP} DESTINATION ${TRACY_INCLUDE_ONLY_DIR}/tracy/client)
+	#file(COPY "${TRACY_SOURCE_DIR}/LICENSE" DESTINATION ${TRACY_INCLUDE_ONLY_DIR}/tracy)
+
+	list(APPEND HEADERS
+		${NCINE_SOURCE_DIR}/nCine/tracy.h
+		${NCINE_SOURCE_DIR}/nCine/tracy_opengl.h
+	)
+
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/tracy_memory.cpp
+		${TRACY_SOURCE_DIR}/public/TracyClient.cpp
+	)
+
+	target_include_directories(${NCINE_APP}
+		PUBLIC $<BUILD_INTERFACE:${TRACY_INCLUDE_ONLY_DIR}/tracy>
+		PUBLIC $<INSTALL_INTERFACE:include/tracy>)
+endif()
+
+#if(NCINE_WITH_RENDERDOC AND NOT APPLE)
+#	find_file(RENDERDOC_API_H
+#		NAMES renderdoc.h renderdoc_app.h
+#		PATHS "$ENV{ProgramW6432}/RenderDoc"
+#			"$ENV{ProgramFiles}/RenderDoc"
+#			"$ENV{ProgramFiles\(x86\)}/RenderDoc"
+#			${RENDERDOC_DIR}
+#		PATH_SUFFIXES "include"
+#		DOC "Path to the RenderDoc header file")
+#
+#	if(NOT EXISTS ${RENDERDOC_API_H})
+#		message(FATAL_ERROR "RenderDoc header file not found")
+#	endif()
+#
+#	get_filename_component(RENDERDOC_INCLUDE_DIR ${RENDERDOC_API_H} DIRECTORY)
+#	target_include_directories(${NCINE_APP} PRIVATE ${RENDERDOC_INCLUDE_DIR})
+#
+#	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_RENDERDOC")
+#	if(UNIX)
+#		target_link_libraries(${NCINE_APP} PRIVATE dl)
+#	endif()
+#
+#	list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Graphics/RenderDocCapture.h ${RENDERDOC_API_H})
+#	list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Graphics/RenderDocCapture.cpp)
+#endif()
+
+if(NOT CURL_FOUND AND NOT WIN32)
+	# `WebRequest` needs an HTTP backend: WinHTTP on Windows, libcurl everywhere else. Without one
+	# it cannot be compiled at all, so it's excluded together with everything that depends on it
+	# (the update check and the online server list, see `WITH_ONLINE_MULTIPLAYER`).
+	list(REMOVE_ITEM SOURCES "${NCINE_SOURCE_DIR}/Shared/IO/WebRequest.cpp")
+endif()
+
+if(CURL_FOUND)
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_CURL")
+	target_link_libraries(${NCINE_APP} PRIVATE CURL::libcurl)
+endif()
+
+if(ZLIB_FOUND)
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_ZLIB")
+	target_link_libraries(${NCINE_APP} PRIVATE ZLIB::ZLIB)
+endif()
+
+if(LZ4_FOUND AND TARGET Lz4)
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_LZ4")
+	target_link_libraries(${NCINE_APP} PRIVATE Lz4)
+endif()
+
+if(ZSTD_FOUND AND TARGET Zstd)
+	target_compile_definitions(${NCINE_APP} PRIVATE "WITH_ZSTD")
+	target_link_libraries(${NCINE_APP} PRIVATE Zstd)
+endif()
+
+if(NCINE_BUILD_ANDROID)
+	list(APPEND HEADERS
+		${NCINE_SOURCE_DIR}/nCine/Backends/Android/AndroidApplication.h
+	)
+endif()
+
+if(ANDROID)
+	list(APPEND HEADERS
+		${NCINE_SOURCE_DIR}/nCine/Backends/Android/AndroidInputManager.h
+		${NCINE_SOURCE_DIR}/nCine/Backends/Android/AndroidJniHelper.h
+		${NCINE_SOURCE_DIR}/nCine/Backends/Android/EglGfxDevice.h
+		${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderPkm.h
+	)
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Backends/Android/AndroidApplication.cpp
+		${NCINE_SOURCE_DIR}/nCine/Backends/Android/AndroidInputManager.cpp
+		${NCINE_SOURCE_DIR}/nCine/Backends/Android/AndroidJniHelper.cpp
+		${NCINE_SOURCE_DIR}/nCine/Backends/Android/AndroidKeys.cpp
+		${NCINE_SOURCE_DIR}/nCine/Backends/Android/EglGfxDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderPkm.cpp
+	)
+elseif(WINDOWS_PHONE OR WINDOWS_STORE)
+	list(APPEND HEADERS
+		${NCINE_SOURCE_DIR}/nCine/Backends/Uwp/UwpApplication.h
+		${NCINE_SOURCE_DIR}/nCine/Backends/Uwp/UwpGfxDevice.h
+		${NCINE_SOURCE_DIR}/nCine/Backends/Uwp/UwpInputManager.h
+	)
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Backends/Uwp/UwpApplication.cpp
+		${NCINE_SOURCE_DIR}/nCine/Backends/Uwp/UwpGfxDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Backends/Uwp/UwpInputManager.cpp
+	)
+	
+	set(UWP_ASSETS
+		${NCINE_SOURCE_DIR}/Icons/Logo.png
+		${NCINE_SOURCE_DIR}/Icons/SmallLogo.png
+		${NCINE_SOURCE_DIR}/Icons/SplashScreen.png
+		${NCINE_SOURCE_DIR}/Icons/StoreLogo.png
+	)
+		
+	target_sources(${NCINE_APP} PRIVATE ${UWP_ASSETS})
+	set_property(SOURCE ${UWP_ASSETS} PROPERTY VS_DEPLOYMENT_CONTENT 1)
+	set_property(SOURCE ${UWP_ASSETS} PROPERTY VS_DEPLOYMENT_LOCATION "Assets")
+	source_group("Assets" FILES ${UWP_ASSETS})
+
+	set(PACKAGE_VERSION_MAJOR ${NCINE_VERSION_MAJOR})
+	set(PACKAGE_VERSION_MINOR ${NCINE_VERSION_MINOR})
+	set(PACKAGE_VERSION_PATCH ${NCINE_VERSION_PATCH})
+	if(NCINE_VERSION_FROM_GIT AND GIT_NO_TAG)
+		if(DEFINED NCINE_VERSION_PATCH_LAST)
+			set(PACKAGE_VERSION_PATCH ${NCINE_VERSION_PATCH_LAST})
+		else()
+			set(PACKAGE_VERSION_PATCH "0")
+		endif()
+	endif()
+	set(PACKAGE_VERSION_REV "0")
+	if(DEFINED GIT_REV_COUNT)
+		set(PACKAGE_VERSION_REV ${GIT_REV_COUNT})
+	endif()
+	
+	set(PACKAGE_VERSION "${PACKAGE_VERSION_MAJOR}.${PACKAGE_VERSION_MINOR}.${PACKAGE_VERSION_PATCH}.${PACKAGE_VERSION_REV}")
+	set(PACKAGE_GUID "a7153bb5-7dc8-4985-9f9c-3853f96034c9")
+	configure_file(${NCINE_SOURCE_DIR}/Package.appxmanifest.in ${CMAKE_CURRENT_BINARY_DIR}/Package.appxmanifest @ONLY)
+	list(APPEND GENERATED_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/Package.appxmanifest)
+	
+	# Include dependencies in UWP package
+	set(UWP_DEPENDENCIES
+		"${MSVC_WINRT_BINDIR}/msvcp140.dll"
+		"${MSVC_WINRT_BINDIR}/vcruntime140.dll"
+		"${MSVC_WINRT_BINDIR}/vcruntime140_1.dll"
+	)
+	
+	if(NCINE_PREFERRED_RHI STREQUAL "D3D11")
+		# Direct3D 11 renders through the DXGI CoreWindow swap chain; d3d11.dll / dxgi.dll / d3dcompiler_47.dll
+		# are inbox OS components on UWP (Windows Store / Xbox), so no EGL / OpenGL|ES runtime DLLs are packaged.
+	elseif(NCINE_WITH_ANGLE)
+		list(APPEND UWP_DEPENDENCIES
+			"${MSVC_WINRT_BINDIR}/libEGL.dll"
+			"${MSVC_WINRT_BINDIR}/libGLESv2.dll")
+	else()
+		message(STATUS "Using Mesa as OpenGL|ES backend (Experimental)")
+
+		list(APPEND UWP_DEPENDENCIES
+			"${MSVC_WINRT_BINDIR}/Mesa/dxil.dll"
+			"${MSVC_WINRT_BINDIR}/Mesa/libEGL.dll"
+			"${MSVC_WINRT_BINDIR}/Mesa/libgallium_wgl.dll"
+			"${MSVC_WINRT_BINDIR}/Mesa/libglapi.dll"
+			"${MSVC_WINRT_BINDIR}/Mesa/libGLESv2.dll"
+			"${MSVC_WINRT_BINDIR}/Mesa/z-1.dll")
+	endif()
+		
+	if(ZLIB_FOUND)
+		list(APPEND UWP_DEPENDENCIES "${MSVC_BINDIR}/zlib.dll")
+	endif()
+
+	if(NCINE_WITH_WEBP AND WEBP_FOUND)
+		list(APPEND UWP_DEPENDENCIES "${MSVC_BINDIR}/libwebp.dll")
+	endif()
+
+	if(NCINE_WITH_AUDIO AND OPENAL_FOUND)
+		list(APPEND UWP_DEPENDENCIES "${MSVC_BINDIR}/OpenAL32.dll")
+
+		if(NCINE_WITH_VORBIS AND VORBIS_FOUND AND NOT VORBIS_DYNAMIC_LINK)
+			list(APPEND UWP_DEPENDENCIES "${MSVC_BINDIR}/libogg.dll" "${MSVC_BINDIR}/libvorbis.dll" "${MSVC_BINDIR}/libvorbisfile.dll")
+		endif()
+		
+		if(NCINE_WITH_OPENMPT AND OPENMPT_FOUND AND NOT OPENMPT_DYNAMIC_LINK)
+			list(APPEND UWP_DEPENDENCIES "${MSVC_BINDIR}/libopenmpt.dll" "${MSVC_BINDIR}/openmpt-mpg123.dll" "${MSVC_BINDIR}/openmpt-ogg.dll" "${MSVC_BINDIR}/openmpt-vorbis.dll" "${MSVC_BINDIR}/openmpt-zlib.dll")
+		endif()
+	endif()
+
+	ncine_deploy_runtime_dependencies(${UWP_DEPENDENCIES})
+
+	# Include `Content` directory
+	file(GLOB_RECURSE PACKAGE_CONTENT_FILES "${NCINE_CONTENT_DIR}/*")
+	foreach(CONTENT_FILE ${PACKAGE_CONTENT_FILES})
+		# Preserving directory structure
+		file(RELATIVE_PATH CONTENT_FILE_RELPATH ${NCINE_CONTENT_DIR} ${CONTENT_FILE})
+		get_filename_component(CONTENT_FILE_RELPATH ${CONTENT_FILE_RELPATH} DIRECTORY)
+		
+		target_sources(${NCINE_APP} PRIVATE ${CONTENT_FILE})
+		set_property(SOURCE ${CONTENT_FILE} PROPERTY VS_DEPLOYMENT_CONTENT 1)
+		set_property(SOURCE ${CONTENT_FILE} PROPERTY VS_DEPLOYMENT_LOCATION "Content/${CONTENT_FILE_RELPATH}")
+		source_group("Content/${CONTENT_FILE_RELPATH}" FILES ${CONTENT_FILE})
+	endforeach()
+else()
+	if(NCINE_BUILD_LIBRETRO)
+		# The libretro entry point replaces MainApplication (the frontend drives the game loop)
+		target_compile_definitions(${NCINE_APP} PRIVATE "WITH_LIBRETRO")
+		list(APPEND HEADERS ${NCINE_SOURCE_DIR}/Dependencies/libretro/libretro.h)
+		list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Backends/Libretro/LibretroApplication.h)
+		list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Backends/Libretro/LibretroGfxDevice.h)
+		list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/Backends/Libretro/LibretroInputManager.h)
+		list(APPEND SOURCES ${NCINE_SOURCE_DIR}/libretro.cpp)
+		list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Backends/Libretro/LibretroApplication.cpp)
+		list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Backends/Libretro/LibretroGfxDevice.cpp)
+		list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/Backends/Libretro/LibretroInputManager.cpp)
+	else()
+		list(APPEND HEADERS ${NCINE_SOURCE_DIR}/nCine/MainApplication.h)
+		list(APPEND SOURCES ${NCINE_SOURCE_DIR}/nCine/MainApplication.cpp)
+	endif()
+
+	if(NINTENDO_SWITCH)
+		nx_generate_nacp(${NCINE_APP}.nacp
+			NAME "${NCINE_APP_NAME}"
+			AUTHOR "${NCINE_APP_VENDOR}"
+			VERSION "${NCINE_VERSION}"
+		)
+
+		nx_create_nro(${NCINE_APP}
+			NACP "${NCINE_APP}.nacp"
+			ICON "${NCINE_SOURCE_DIR}/Icons/256px.png"
+			ROMFS "${NCINE_CONTENT_DIR}"
+		)
+	elseif(NINTENDO_WII OR NINTENDO_GAMECUBE)
+		# Converts the ELF to the .dol format loadable by Swiss/Homebrew Channel/Dolphin
+		ogc_create_dol(${NCINE_APP})
+
+		# Stage the SD card layout expected by ContentResolver ("sd:/apps/Jazz2/" on Wii, which is
+		# the standard Homebrew Channel layout, and "Jazz2/" on any SD card on GameCube) into "sd/" in the
+		# build directory, so its contents can be copied directly to a (virtual) SD card. The staged content
+		# is removed first: `copy_directory` never deletes anything, so files a previous content tree had
+		# and the current one does not - an old "Source.pak" next to the "Prebaked.pak", which the game
+		# would mount as well - would otherwise stay on every card made from here.
+		if(NINTENDO_WII)
+			set(OGC_SD_APP_DIR "${CMAKE_BINARY_DIR}/sd/apps/Jazz2")
+			set(OGC_SD_DOL_NAME "boot.dol")
+		else()
+			set(OGC_SD_APP_DIR "${CMAKE_BINARY_DIR}/sd/Jazz2")
+			set(OGC_SD_DOL_NAME "Jazz2.dol")
+		endif()
+		add_custom_command(TARGET ${NCINE_APP} POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${OGC_SD_APP_DIR}"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/${NCINE_APP}.dol" "${OGC_SD_APP_DIR}/${OGC_SD_DOL_NAME}"
+			COMMAND ${CMAKE_COMMAND} -E remove_directory "${OGC_SD_APP_DIR}/Content"
+			COMMAND ${CMAKE_COMMAND} -E copy_directory "${NCINE_CONTENT_DIR}" "${OGC_SD_APP_DIR}/Content"
+			COMMENT "Staging SD card layout with game content"
+			VERBATIM)
+
+		if(NINTENDO_GAMECUBE)
+			# A bootable disc image as well ("jazz2.iso"), which is what Dolphin runs - it has no SD adapter for
+			# the GameCube - and what an optical drive emulator (GCLoader, CubeODE, FlippyDrive) or a burned disc
+			# boots on a console. It is an ISO 9660 volume with the executable and "Content" in it, whose system
+			# area holds the GameCube disc header and the apploader - the small program the boot ROM loads from
+			# every disc and runs to bring the executable into memory, built here from source with the bare
+			# compiler, because none ships with the toolchain (see GameCubeApploader.c). No image authoring tool
+			# knows that header, so the image is made by AssetPacker, a host tool of this repository, which can
+			# also replace its content later without rebuilding anything (`swap-content`).
+			set(_gameCubeApploaderSource "${NCINE_SOURCE_DIR}/nCine/Backends/Ogc/GameCubeApploader.c")
+			set(_gameCubeApploaderScript "${NCINE_SOURCE_DIR}/nCine/Backends/Ogc/GameCubeApploader.ld")
+			set(_gameCubeApploaderElf "${CMAKE_BINARY_DIR}/GameCubeApploader.elf")
+			set(GAMECUBE_APPLOADER "${CMAKE_BINARY_DIR}/GameCubeApploader.img")
+			# No libogc, no C library and no startup code, and nothing addressed relative to r2 or r13, which
+			# hold whatever the boot ROM left in them when it calls in
+			add_custom_command(OUTPUT "${GAMECUBE_APPLOADER}"
+				COMMAND "${CMAKE_C_COMPILER}" -O2 -mcpu=750 -meabi -mhard-float -msdata=none -G0 -fno-pic
+					-ffreestanding -fno-builtin -nostdlib -nostartfiles -Wl,--gc-sections -T "${_gameCubeApploaderScript}"
+					-o "${_gameCubeApploaderElf}" "${_gameCubeApploaderSource}"
+				COMMAND "${CMAKE_OBJCOPY}" -O binary "${_gameCubeApploaderElf}" "${GAMECUBE_APPLOADER}"
+				DEPENDS "${_gameCubeApploaderSource}" "${_gameCubeApploaderScript}"
+				COMMENT "Building the GameCube apploader"
+				VERBATIM)
+			add_custom_target(${NCINE_APP}_apploader DEPENDS "${GAMECUBE_APPLOADER}")
+			add_dependencies(${NCINE_APP} ${NCINE_APP}_apploader)
+
+			find_program(GAMECUBE_ASSETPACKER_EXECUTABLE NAMES AssetPacker
+				DOC "Host build of AssetPacker, which makes the GameCube disc image")
+			if(GAMECUBE_ASSETPACKER_EXECUTABLE)
+				# The executable is taken from the staged SD layout above, so it is called "Jazz2.dol" on the
+				# disc as well
+				add_custom_command(TARGET ${NCINE_APP} POST_BUILD
+					COMMAND "${GAMECUBE_ASSETPACKER_EXECUTABLE}" create-image "${OGC_SD_APP_DIR}/${OGC_SD_DOL_NAME}"
+						"${CMAKE_BINARY_DIR}/${NCINE_APP}.iso" --target=gamecube "--content=${NCINE_CONTENT_DIR}"
+						"--apploader=${GAMECUBE_APPLOADER}" "--game-id=${GAMECUBE_GAME_ID}" "--title=${NCINE_APP_NAME}"
+					COMMENT "Creating bootable GameCube disc image with game content"
+					VERBATIM)
+			else()
+				# Not fatal: the SD card layout above is complete without it
+				message(STATUS "AssetPacker not found, the GameCube disc image will not be created - build it for "
+					"the host and point GAMECUBE_ASSETPACKER_EXECUTABLE at it")
+			endif()
+		endif()
+	elseif(NINTENDO_3DS)
+		# The one vertex program the PICA backend needs (Sources/Shaders/Pica/Sprite.v.pica, a passthrough of
+		# screen-space vertices under an orthographic matrix) is assembled by picasso - the shader assembler
+		# that ships with the toolchain, so unlike the PS3's cgcomp it is always there - into a .shbin, which
+		# bin2s then wraps into an object the device translation unit links (`Sprite_shbin`, `Sprite_shbin_size`
+		# from the generated "Sprite_shbin.h"). Both helpers are devkitPro's own (3DS.cmake).
+		ctr_add_shader_library(jazz2_pica_shaders "${NCINE_SOURCE_DIR}/Shaders/Pica/Sprite.v.pica" OUTPUT "${CMAKE_BINARY_DIR}/Sprite.shbin")
+		dkp_add_embedded_binary_library(jazz2_pica_shaders_bin jazz2_pica_shaders)
+		target_link_libraries(${NCINE_APP} PRIVATE jazz2_pica_shaders_bin)
+
+		# Package a .3dsx with its SMDH (the icon and the titles the Homebrew Launcher lists it under) into the
+		# standard homebrew layout ("sdmc:/3ds/Jazz2/"), staged under "sdmc/" in the build directory together
+		# with the game content, so its contents can be copied straight onto the SD card (or into the folder
+		# Azahar serves as the virtual SD card). The content sits next to the executable in "Content", which is
+		# where the 3DS branch of ContentResolver::GetContentPath() looks for it.
+		set(CTR_SDMC_APP_DIR "${CMAKE_BINARY_DIR}/sdmc/3ds/Jazz2")
+		file(MAKE_DIRECTORY "${CTR_SDMC_APP_DIR}")
+		# The SMDH holds a 48x48 icon; smdhtool scales what it is given, so the existing 48px icon is reused
+		ctr_generate_smdh(OUTPUT "${CMAKE_BINARY_DIR}/${NCINE_APP}.smdh"
+			NAME "${NCINE_APP_NAME}"
+			DESCRIPTION "${NCINE_APP_DESCRIPTION}"
+			AUTHOR "${NCINE_APP_VENDOR}"
+			ICON "${NCINE_SOURCE_DIR}/Icons/48px.png")
+		ctr_create_3dsx(${NCINE_APP} SMDH "${CMAKE_BINARY_DIR}/${NCINE_APP}.smdh" OUTPUT "${CMAKE_BINARY_DIR}/${NCINE_APP}.3dsx")
+		add_custom_command(TARGET ${NCINE_APP}_3dsx POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/${NCINE_APP}.3dsx" "${CTR_SDMC_APP_DIR}/Jazz2.3dsx"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/${NCINE_APP}.smdh" "${CTR_SDMC_APP_DIR}/Jazz2.smdh"
+			COMMAND ${CMAKE_COMMAND} -E copy_directory "${NCINE_CONTENT_DIR}" "${CTR_SDMC_APP_DIR}/Content"
+			COMMENT "Staging SD card layout with game content"
+			VERBATIM)
+
+		if(CURL_FOUND)
+			# devkitPro's libcurl is an autotools build with no CMake config of its own, so CMake's FindCURL knows
+			# the library but not what it is built on - mbedTLS, three archives - and libcurl.pc, which does list
+			# them, is only mined for hints. Named here, after CURL::libcurl on the link line (that one is added
+			# where the module is found); zlib is linked already.
+			target_link_libraries(${NCINE_APP} PRIVATE mbedtls mbedx509 mbedcrypto)
+
+			# The CA bundle every HTTPS request is verified against, for the PSP's reason (see that arm and the
+			# longer note in the PS Vita one): this libcurl is built on mbedTLS with a Unix default path that
+			# exists nowhere on an SD card, and the console's own trust store is not readable by a homebrew
+			# title. PlatformWebRequest.h points libcurl at the copy staged next to the content.
+			set(_ctrCaCert "${CMAKE_BINARY_DIR}/cacert.pem")
+			if(NOT EXISTS "${_ctrCaCert}")
+				message(STATUS "Downloading the CA certificate bundle for HTTPS support")
+				file(DOWNLOAD "https://curl.se/ca/cacert.pem" "${_ctrCaCert}"
+					INACTIVITY_TIMEOUT 30 TIMEOUT 120 TLS_VERIFY ON STATUS _ctrCaCertStatus)
+				list(GET _ctrCaCertStatus 0 _ctrCaCertResult)
+				if(NOT _ctrCaCertResult EQUAL 0)
+					list(GET _ctrCaCertStatus 1 _ctrCaCertError)
+					message(WARNING "Cannot download the CA certificate bundle (${_ctrCaCertError}), so HTTPS "
+						"requests will fail to verify - put a PEM bundle at \"${_ctrCaCert}\" and configure again")
+					file(REMOVE "${_ctrCaCert}")
+				endif()
+			endif()
+			if(EXISTS "${_ctrCaCert}")
+				add_custom_command(TARGET ${NCINE_APP}_3dsx POST_BUILD
+					COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_ctrCaCert}" "${CTR_SDMC_APP_DIR}/Content/cacert.pem"
+					COMMENT "Staging the CA certificate bundle"
+					VERBATIM)
+			endif()
+		endif()
+	elseif(PLATFORM_DREAMCAST)
+		# Package a bootable CDI image with the game content included ("/cd/Content/"), so it can be
+		# started directly in an emulator (Flycast) or burned to a disc; requires mkdcdisc
+		find_program(MKDCDISC_EXECUTABLE mkdcdisc)
+		if(MKDCDISC_EXECUTABLE)
+			# The content is staged as "cd/Content" first, so the directory on the disc is always named
+			# "Content" regardless of the source directory name (e.g. "ContentEmscripten" for the demo)
+			add_custom_command(TARGET ${NCINE_APP} POST_BUILD
+				COMMAND ${CMAKE_COMMAND} -E copy_directory "${NCINE_CONTENT_DIR}" "${CMAKE_BINARY_DIR}/cd/Content"
+				COMMAND "${MKDCDISC_EXECUTABLE}" -e "$<TARGET_FILE:${NCINE_APP}>" -d "${CMAKE_BINARY_DIR}/cd/Content" -n "Jazz2 Resurrection" -o "${CMAKE_BINARY_DIR}/${NCINE_APP}.cdi"
+				COMMENT "Creating bootable CDI image with game content"
+				VERBATIM)
+		else()
+			message(STATUS "mkdcdisc not found, bootable CDI image will not be created")
+		endif()
+	elseif(PLATFORM_AMIGA)
+		# libnix ships the math functions in a separate libm; the driver does not add it on its own.
+		# pthread satisfies the thread-id the trace header stamps on every line (the game itself is
+		# single-threaded here); atomic covers the exchange/fetch forms the 68060 has no inline
+		# sequence for, the same reason the PS2 links it.
+		target_link_libraries(${NCINE_APP} PRIVATE m pthread atomic)
+
+		# Stage a ready-to-run game directory ("dist/") with the executable next to "Content/", the
+		# layout ContentResolver's relative paths expect. The directory can be copied straight onto an
+		# Amiga hard disk or mounted as an emulator directory-hard-drive.
+		add_custom_command(TARGET ${NCINE_APP} POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dist"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${NCINE_APP}>" "${CMAKE_BINARY_DIR}/dist/Jazz2"
+			COMMAND ${CMAKE_COMMAND} -E copy_directory "${NCINE_CONTENT_DIR}" "${CMAKE_BINARY_DIR}/dist/Content"
+			COMMENT "Staging Amiga game directory with game content"
+			VERBATIM)
+	elseif(PLATFORM_AMIGAOS4 OR PLATFORM_MORPHOS)
+		# Same staged layout as the classic Amiga above - the executable next to "Content/" - copied to
+		# a PowerPC Amiga machine as it is. The binary is stripped on the way: these toolchains leave the
+		# DWARF in even in Release, which is two thirds of its size and of no use on the target.
+		add_custom_command(TARGET ${NCINE_APP} POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/dist"
+			COMMAND "${CMAKE_STRIP}" -o "${CMAKE_BINARY_DIR}/dist/Jazz2" "$<TARGET_FILE:${NCINE_APP}>"
+			COMMAND ${CMAKE_COMMAND} -E copy_directory "${NCINE_CONTENT_DIR}" "${CMAKE_BINARY_DIR}/dist/Content"
+			COMMENT "Staging game directory with game content"
+			VERBATIM)
+	elseif(PLATFORM_N64)
+		# The n64.cmake toolchain file leaves the executable suffix empty; name it like the other console
+		# targets do, so the intermediate ELF is recognizable next to the ROM that is packed from it
+		set_target_properties(${NCINE_APP} PROPERTIES SUFFIX ".elf")
+
+		# The libdragon libraries the engine calls into, in one link group with libc and libstdc++: the
+		# toolchain's GCC ships an EMPTY `*lib:` spec - the driver never adds -lc on its own (n64.mk
+		# passes it explicitly for the same reason) - and the dependencies are circular anyway (libc's
+		# reentrant syscalls resolve from libdragonsys, libdragon calls back into libc).
+		target_link_libraries(${NCINE_APP} PRIVATE "-Wl,--start-group" dragon m dragonsys c stdc++ "-Wl,--end-group")
+
+		# `floorf()` and `ceilf()` are library routines on this CPU, and the textured background calls them for
+		# every band it draws; the definitions that take them over are in LibmOverrides.cpp
+		target_link_options(${NCINE_APP} PRIVATE "-Wl,--wrap=floorf,--wrap=ceilf")
+
+		# The hottest code goes to the start of the executable in a fixed order, so that its loops do not evict each
+		# other's lines from the direct-mapped instruction cache (see cmake/n64_text_order.ld). Binutils 2.43 added
+		# the option; an older linker builds the same executable in plain link order.
+		execute_process(COMMAND "${CMAKE_LINKER}" --help OUTPUT_VARIABLE _n64LinkerHelp ERROR_QUIET)
+		if(_n64LinkerHelp MATCHES "--section-ordering-file")
+			target_link_options(${NCINE_APP} PRIVATE "-Wl,--section-ordering-file=${CMAKE_SOURCE_DIR}/cmake/n64_text_order.ld")
+			set_property(TARGET ${NCINE_APP} APPEND PROPERTY LINK_DEPENDS "${CMAKE_SOURCE_DIR}/cmake/n64_text_order.ld")
+		else()
+			message(STATUS "The linker does not support --section-ordering-file, the hot code of the N64 build is placed in link order")
+		endif()
+
+		# Package a bootable .z64 ROM, reproducing libdragon's n64.mk "%.z64" rule: the symbol table for
+		# on-console backtraces, the stripped+compressed ELF, and a DragonFS image with the game content
+		# ("rom:/Content/", where the N64 branch of ContentResolver::GetContentPath() looks for it) are
+		# concatenated by n64tool behind a table of contents.
+		#
+		# The content is staged as "dfs/Content" first, so the directory in the image is always named "Content"
+		# regardless of the source directory name (mirrors the Dreamcast arm above). The staging leaves out what
+		# the console cannot play - see cmake/n64_stage_content.cmake. A tree prepared with
+		# `AssetPacker convert --target=n64` has nothing to leave out: its music, sound effects and cinematics are
+		# already in libdragon's formats, which is also what lets the whole soundtrack and both cinematics fit
+		# under the 64 MB cartridge ceiling.
+		#
+		# ed64romconfig marks the ROM header (the advanced homebrew header) with what flashcarts and emulators
+		# should provide: the EEPROM the preferences are stored on, and a Rumble Pak in the first controller -
+		# rumble is implemented (N64InputManager), and emulators only attach one when the header asks for it.
+		# The real-time clock is deliberately NOT declared: an EverDrive cannot provide EEPROM and an RTC at the
+		# same time, and nothing needs one - the random seed comes from libdragon's entropy source, and
+		# rtc_init() still uses a clock where the hardware has one anyway.
+		add_custom_command(TARGET ${NCINE_APP} POST_BUILD
+			COMMAND ${CMAKE_COMMAND} "-DSOURCE=${NCINE_CONTENT_DIR}" "-DDESTINATION=${CMAKE_BINARY_DIR}/dfs/Content"
+				-P "${CMAKE_SOURCE_DIR}/cmake/n64_stage_content.cmake"
+			COMMAND "${N64_MKDFS}" "${CMAKE_BINARY_DIR}/${NCINE_APP}.dfs" "${CMAKE_BINARY_DIR}/dfs"
+			COMMAND "${N64_SYM}" --all "$<TARGET_FILE:${NCINE_APP}>" "${CMAKE_BINARY_DIR}/${NCINE_APP}.elf.sym"
+			COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:${NCINE_APP}>" "${CMAKE_BINARY_DIR}/${NCINE_APP}.elf.stripped"
+			COMMAND "${CMAKE_STRIP}" -s "${CMAKE_BINARY_DIR}/${NCINE_APP}.elf.stripped"
+			COMMAND "${N64_ELFCOMPRESS}" -o "${CMAKE_BINARY_DIR}" -c 1 "${CMAKE_BINARY_DIR}/${NCINE_APP}.elf.stripped"
+			COMMAND "${N64_TOOL}" --toc --title "Jazz2 Resurrection" --output "${CMAKE_BINARY_DIR}/${NCINE_APP}.z64"
+				--align 256 "${CMAKE_BINARY_DIR}/${NCINE_APP}.elf.stripped"
+				"${CMAKE_BINARY_DIR}/${NCINE_APP}.elf.sym"
+				--align 16 "${CMAKE_BINARY_DIR}/${NCINE_APP}.dfs"
+			COMMAND "${N64_ED64ROMCONFIG}" --savetype eeprom16k --regionfree --controller1 n64,pak=rumble "${CMAKE_BINARY_DIR}/${NCINE_APP}.z64"
+			COMMAND ${CMAKE_COMMAND} "-DN64_ROM=${CMAKE_BINARY_DIR}/${NCINE_APP}.z64" -P "${CMAKE_SOURCE_DIR}/cmake/n64_check_rom_size.cmake"
+			COMMENT "Creating bootable Z64 ROM image with game content"
+			VERBATIM)
+	elseif(PLATFORM_PS2)
+		# The ps2dev toolchain leaves the executable suffix empty; name it like the other console targets do
+		set_target_properties(${NCINE_APP} PROPERTIES SUFFIX ".elf")
+
+		# ISO9660 names are uppercase, and the boot stanza, the staged file and the volume label all have to
+		# agree - so they are all derived from the target name rather than written out three times.
+		string(TOUPPER "${NCINE_APP}" _ps2DiscName)
+		# A PlayStation 2 disc is plain ISO9660 whose root carries a SYSTEM.CNF naming the executable to
+		# boot, so no format-specific tool is needed - any ISO author will do. `VMODE = NTSC` matches the
+		# 640x448 mode Ps2GfxDevice sets up; a PAL console runs an NTSC disc through its 60 Hz path, which is
+		# what the fixed display geometry in GsVram's layout assumes. `VER` is nominally the disc revision
+		# rather than the application version, but there is no separate source for it and the BIOS does not
+		# interpret it, so the project version is the honest thing to publish.
+		# Written outside the staging directory and copied in below: "cd/" is a build artifact, so anything
+		# generated straight into it at configure time silently goes missing if it is cleaned and only the
+		# build is re-run - which yields an ISO with no boot stanza that the BIOS refuses without a word.
+		file(WRITE "${CMAKE_BINARY_DIR}/ps2/SYSTEM.CNF"
+			"BOOT2 = cdrom0:\\${_ps2DiscName}.ELF;1\nVER = ${NCINE_VERSION_MAJOR}.${NCINE_VERSION_MINOR}\nVMODE = NTSC\n")
+
+		# The I/O stack the newlib port needs to see the disc as a filesystem. cdfs registers a "cdfs:" device
+		# with the original `ioman`, which is the I/O manager newlib's POSIX calls reach; it does not live in
+		# ROM, so it rides on the disc and is loaded by SifLoadModule() at startup - which reaches it through
+		# the IOP's own loadfile service, a different path from the POSIX open() that cannot resolve it.
+		#
+		# audsrv rides along for the same reason and is loaded the same way. It is also linked into the
+		# executable (see Ps2Modules.h), because a boot from an SD card has no disc to read it from - but
+		# that path needs a patch written into a running ROM service, and a disc boot has no reason to go
+		# anywhere near it. Staging the file here is what lets the disc boot stay on the mechanism that has
+		# always worked.
+		add_custom_command(TARGET ${NCINE_APP} PRE_LINK
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"${CMAKE_BINARY_DIR}/ps2/SYSTEM.CNF" "${CMAKE_BINARY_DIR}/cd/SYSTEM.CNF"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"$ENV{PS2SDK}/iop/irx/cdfs.irx" "${CMAKE_BINARY_DIR}/cd/CDFS.IRX"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"$ENV{PS2SDK}/iop/irx/audsrv.irx" "${CMAKE_BINARY_DIR}/cd/AUDSRV.IRX"
+			COMMENT "Staging SYSTEM.CNF, cdfs.irx and audsrv.irx onto the disc image"
+			VERBATIM)
+
+		# Prefer xorrisofs, fall back to the older mkisofs/genisoimage; all three take the same options here.
+		# "-J" is not decoration: plain ISO 9660 spells names in upper case out of A-Z, 0-9 and "_" only, so
+		# the tilesets and music the game names with a space or a dash - "xmas 1 feaw.j2t",
+		# "christmas-x-core_jj2.it", 42 files in all - land on the disc as "XMAS_1_FEAW.J2T" and the game
+		# then cannot open them. The real names are what a Joliet hierarchy carries, and that is the one
+		# ps2sdk's "cdfs.irx" reads whenever a disc has one (it recognizes the supplementary descriptor and
+		# takes every second byte of the UCS-2 names). Rock Ridge, which these tools write by default and
+		# which also carries the real names, that driver does not read at all.
+		find_program(PS2_MKISOFS_EXECUTABLE NAMES xorrisofs mkisofs genisoimage)
+		if(PS2_MKISOFS_EXECUTABLE)
+			# The content is staged as "cd/Content" first, so the directory on the disc is always named
+			# "Content" regardless of the source directory name (mirrors the Dreamcast arm above)
+			set(_ps2MarkPrebakedCommand "")
+			if(EXISTS "${NCINE_CONTENT_DIR}/Source.pak")
+				set(_ps2MarkPrebakedCommand COMMAND ${CMAKE_COMMAND} -E rename
+					"${CMAKE_BINARY_DIR}/cd/Content/Source.pak" "${CMAKE_BINARY_DIR}/cd/Content/Prebaked.pak")
+			else()
+				message(STATUS "No \"Source.pak\" in \"${NCINE_CONTENT_DIR}\", the disc image will not be marked as prebaked")
+			endif()
+
+			# The staged copy is stripped here rather than relying on the global strip step, which cannot be
+			# relied on: that one is a POST_BUILD command of its own added from "ncine_strip_binaries.cmake",
+			# which CMakeLists.txt includes AFTER this file - and POST_BUILD commands run in the order they
+			# were added, so the copy below would take the executable as it is at that moment, which is
+			# before it has been stripped. The disc was carrying a 15.5 MB executable of which 11 MB was
+			# debug sections. The BIOS only reads the loadable segments and did not care, but a loader that
+			# reads the whole file does - and reading eleven unnecessary megabytes over an MX4SIO adapter is
+			# ten seconds of black screen before a single instruction of the game runs.
+			set(_ps2StripStagedElf "")
+			if(NCINE_STRIP_BINARIES AND NOT NCINE_DEBUG_SYMBOLS_FILE AND CMAKE_BUILD_TYPE MATCHES "Release" AND EXISTS ${CMAKE_STRIP})
+				set(_ps2StripStagedElf COMMAND "${CMAKE_STRIP}" --strip-all "${CMAKE_BINARY_DIR}/cd/${_ps2DiscName}.ELF")
+			endif()
+
+			add_custom_command(TARGET ${NCINE_APP} POST_BUILD
+				COMMAND ${CMAKE_COMMAND} -E copy_directory "${NCINE_CONTENT_DIR}" "${CMAKE_BINARY_DIR}/cd/Content"
+				${_ps2MarkPrebakedCommand}
+				COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${NCINE_APP}>" "${CMAKE_BINARY_DIR}/cd/${_ps2DiscName}.ELF"
+				${_ps2StripStagedElf}
+				COMMAND "${PS2_MKISOFS_EXECUTABLE}" -quiet -iso-level 2 -l -J -V "${_ps2DiscName}" -o "${CMAKE_BINARY_DIR}/${NCINE_APP}.iso" "${CMAKE_BINARY_DIR}/cd"
+				COMMENT "Creating bootable ISO image with game content"
+				VERBATIM)
+		else()
+			# Not fatal: PCSX2 boots a bare ELF with `-elf`, which is enough for development
+			message(STATUS "xorrisofs/mkisofs not found, bootable ISO image will not be created")
+		endif()
+	elseif(PLATFORM_PS3)
+		# The ps3toolchain leaves the executable suffix empty; name it like the other console targets do, so
+		# the intermediate ELF is recognizable next to the SELF and the package built from it
+		set_target_properties(${NCINE_APP} PROPERTIES SUFFIX ".elf")
+
+		# The PSL1GHT libraries the engine calls into. librsx and libgcm_sys are the RSX backend's whole
+		# graphics stack (command FIFO plus the lv2 side of the GPU); libio is the pad/keyboard/mouse layer
+		# the input backend reads; libsysutil brings the video-mode configuration and the XMB event queue the
+		# window backend drives; libsysmodule loads the PRXs those need. librt is PSL1GHT's newlib syscall
+		# layer (open/read/stat and the heap), so it has to come after everything that calls into libc.
+		target_link_libraries(${NCINE_APP} PRIVATE
+			rsx
+			gcm_sys
+			io
+			sysutil
+			sysmodule
+			simdmath
+			rt
+			lv2
+			m
+		)
+
+		# Package layout. A PS3 title is a directory tree whose USRDIR holds the boot executable, so unlike
+		# the disc-image consoles above there is nothing to author - the tree is the deliverable. It is staged
+		# under "pkg/" in the build directory and additionally wrapped into a .pkg, which is what a real
+		# console installs; RPCS3 boots either the staged EBOOT.BIN directly or the installed package.
+		#
+		# APPID has to be exactly 9 characters (4 letters + 5 digits) or the firmware rejects PARAM.SFO, so
+		# it is derived from the application name the same way the PS Vita title ID is: padded with zeroes
+		# to the required length, and additionally uppercased because the PS3 accepts no lowercase. Appending
+		# the padding before taking the first 9 characters also truncates a name that is longer. Everything
+		# that has to agree on the ID - CONTENTID, PARAM.SFO and the writable path the game uses at runtime -
+		# is derived from this one value; set it explicitly to override the derivation.
+		if(NOT PS3_APPID)
+			string(TOUPPER "${NCINE_APP}" PS3_APPID)
+			string(SUBSTRING "${PS3_APPID}000000000" 0 9 PS3_APPID)
+		endif()
+		# Spelled out rather than using bounded repetition, which CMake's regex flavour does not support
+		if(NOT PS3_APPID MATCHES "^[A-Z][A-Z][A-Z][A-Z][0-9][0-9][0-9][0-9][0-9]$")
+			message(FATAL_ERROR "PS3_APPID \"${PS3_APPID}\" is not 4 letters followed by 5 digits, "
+				"which the firmware requires - set it explicitly to a conforming ID")
+		endif()
+		set(PS3_CONTENTID "UP0001-${PS3_APPID}_00-0000000000000000")
+		# The cache is the one thing that cannot go through the "/app_home" alias the content uses, because
+		# that alias is read-only; it has to name the title's own game-data directory, so the ID reaches the
+		# runtime rather than being written out a second time in ContentResolver
+		target_compile_definitions(${NCINE_APP} PRIVATE "PS3_APPID=\"${PS3_APPID}\"")
+		set(PS3_PKG_DIR "${CMAKE_BINARY_DIR}/pkg")
+		file(MAKE_DIRECTORY "${PS3_PKG_DIR}/USRDIR")
+
+		if(EXISTS "${NCINE_SOURCE_DIR}/Icons/128px.png")
+			# The XMB scales whatever it is given (nominally 320x176), so the existing square icon is reused
+			# instead of adding a PS3-shaped copy of it to the repository - the same trade the PSP arm makes
+			set(_ps3Icon "${NCINE_SOURCE_DIR}/Icons/128px.png")
+		else()
+			set(_ps3Icon "${PS3_ICON0}")
+		endif()
+
+		# The content is staged as "Content" next to the EBOOT, which is where the PS3 branch of
+		# ContentResolver::GetContentPath() looks for it
+		set(_ps3MarkPrebakedCommand "")
+		if(EXISTS "${NCINE_CONTENT_DIR}/Source.pak")
+			set(_ps3MarkPrebakedCommand COMMAND ${CMAKE_COMMAND} -E rename
+				"${PS3_PKG_DIR}/USRDIR/Content/Source.pak" "${PS3_PKG_DIR}/USRDIR/Content/Prebaked.pak")
+		else()
+			message(STATUS "No \"Source.pak\" in \"${NCINE_CONTENT_DIR}\", the package will not be marked as prebaked")
+		endif()
+
+		# sprxlinker rewrites the PRX import stubs the SDK's libraries left in the ELF into the form the lv2
+		# loader resolves; make_self_npdrm then wraps the result as the EBOOT.BIN a package boots from, and
+		# fself produces the unsigned SELF that RPCS3 and a CFW console will also run straight from disk.
+		add_custom_command(TARGET ${NCINE_APP} POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:${NCINE_APP}>" "${CMAKE_BINARY_DIR}/${NCINE_APP}.stripped.elf"
+			COMMAND "${CMAKE_STRIP}" "${CMAKE_BINARY_DIR}/${NCINE_APP}.stripped.elf"
+			COMMAND "${PS3_SPRXLINKER}" "${CMAKE_BINARY_DIR}/${NCINE_APP}.stripped.elf"
+			COMMAND "${PS3_SELF_NPDRM}" "${CMAKE_BINARY_DIR}/${NCINE_APP}.stripped.elf" "${PS3_PKG_DIR}/USRDIR/EBOOT.BIN" "${PS3_CONTENTID}"
+			COMMAND "${PS3_FSELF}" "${CMAKE_BINARY_DIR}/${NCINE_APP}.stripped.elf" "${CMAKE_BINARY_DIR}/${NCINE_APP}.self"
+			COMMAND "${PS3_SFO}" --title "${NCINE_APP_NAME}" --appid "${PS3_APPID}" -f "${PS3_SFO_XML}" "${PS3_PKG_DIR}/PARAM.SFO"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_ps3Icon}" "${PS3_PKG_DIR}/ICON0.PNG"
+			COMMAND ${CMAKE_COMMAND} -E copy_directory "${NCINE_CONTENT_DIR}" "${PS3_PKG_DIR}/USRDIR/Content"
+			${_ps3MarkPrebakedCommand}
+			COMMAND "${PS3_PKG}" --contentid "${PS3_CONTENTID}" "${PS3_PKG_DIR}/" "${CMAKE_BINARY_DIR}/${NCINE_APP}.pkg"
+			COMMENT "Packaging EBOOT.BIN, SELF and NPDRM package with game content"
+			VERBATIM)
+	elseif(PLATFORM_PSP)
+		# The pspdev toolchain leaves the executable suffix empty; name it like the other console targets do,
+		# so the intermediate ELF is recognizable next to the EBOOT that is packed from it
+		set_target_properties(${NCINE_APP} PROPERTIES SUFFIX ".elf")
+
+		# The PSPSDK libraries the engine calls into. None of them are on psp-gcc's own link line, whose
+		# `*lib` spec ends with "-lm --start-group -lpthreadglue -lpthread -lcglue -lc --end-group
+		# -lpsputility -lpsprtc -lpspnet_inet -lpspnet_resolver -lpspsdk -lpspmodinfo -lpspuser";
+		# anything that is in that spec must not be repeated here, see the note below.
+		target_link_libraries(${NCINE_APP} PRIVATE
+			pspgum
+			pspgu
+			pspge
+			pspdisplay
+			pspctrl
+			psppower
+			pspdebug
+			# The ad hoc (local wireless) transport of the multiplayer: PDP sockets, group control and the
+			# WLAN's own MAC address. None of the three is in the spec's list, so each is scanned once.
+			pspnet_adhoc
+			pspnet_adhocctl
+			pspwlan
+			# Only for `kuKernelGetModel()`, which names the hardware revision in the startup banner. The
+			# model is a kernel export (`sceKernelGetModel()`) that a user-mode module cannot call, and
+			# kubridge is the relay every custom firmware provides for exactly that - which also means this
+			# is a dependency on kubridge.prx being loaded, so the module fails to start without it. That
+			# is not a new constraint in practice (nothing runs unsigned homebrew without a CFW, and every
+			# one of them ships kubridge), but it is the reason to keep the import to this single call.
+			pspkubridge
+		)
+
+		# Double-precision `pow()`, `log()` and division are soft-float on this console and the module player
+		# calls them on every tick of every channel, and `floorf()`/`ceilf()` are library routines the textured
+		# background calls for every band it draws; the definitions that take them over are in LibmOverrides.cpp
+		target_link_options(${NCINE_APP} PRIVATE "-Wl,--wrap=pow,--wrap=log,--wrap=__divdf3,--wrap=floorf,--wrap=ceilf")
+
+		if(CURL_FOUND)
+			# The console has no socket stack at boot, so MainApplication brings one up for `WebRequest`
+			# (see PspNetworkInitialize); libcurl on top of it only needs the BSD sockets newlib wraps.
+			#
+			# `pspnet_inet`, `pspnet_resolver` and `psputility` are deliberately not listed, even though
+			# MainApplication calls into all three: the spec above appends them at the very end anyway,
+			# and an archive scanned at two points of the link line has its stubs extracted in two chunks
+			# - the engine's calls here, and the rest where libcglue's socket()/gethostbyname() pull them
+			# in from the spec's copy. psp-fixup-imports needs each module's stubs contiguous to write the
+			# stub and NID counts into its import table ("could not fixup imports, stubs out of order" is
+			# it giving up), and wrong counts make one module's table overlap the next one's stubs, so the
+			# loader patches syscalls into each other's slots. `pspnet` and `pspnet_apctl` are not in the
+			# spec and nothing but the engine imports them, so their single scan here is contiguous.
+			#
+			# `atomic` is libatomic, for the same reason as on the PlayStation 2 (see that arm): the
+			# Allegrex has no 64-bit atomic instruction, so the `std::atomic<std::int64_t>` byte counters
+			# `WebRequest` keeps per request are lowered to __atomic_*_8 calls. It is scoped to this arm
+			# because nothing else on this console needs 64-bit atomics.
+			target_link_libraries(${NCINE_APP} PRIVATE
+				pspnet
+				pspnet_apctl
+				atomic
+			)
+		endif()
+
+		if(PSPAUDIO_FOUND)
+			# The engine's own backend drives sceAudioOutputPannedBlocking() from a thread of its own (see
+			# PspAudioDevice); the audio stubs are not in the toolchain's default set
+			target_link_libraries(${NCINE_APP} PRIVATE pspaudio)
+		elseif(OPENAL_FOUND)
+			# pspdev's OpenAL is an OpenAL Soft whose only output backend ("src/Alc/psp.c") drives
+			# sceAudioOutputBlocking() from a thread of its own, so the audio stubs it imports have to be
+			# linked here - the toolchain's default set does not include them. psphprm comes with it because
+			# the same backend also implements capture and probes for the headset microphone.
+			target_link_libraries(${NCINE_APP} PRIVATE
+				pspaudio
+				psphprm
+			)
+		endif()
+
+		# Package an EBOOT.PBP into the standard homebrew layout ("ms0:/PSP/GAME/Jazz2/"), staged under
+		# "ms0/" in the build directory together with the game content, so its contents can be copied
+		# straight onto a memory stick (or handed to PPSSPP, which mounts a directory as the memory stick).
+		# create_pbp_file() runs psp-strip / psp-fixup-imports / mksfoex / pack-pbp on the built ELF - see
+		# "$PSPDEV/psp/share/CreatePBP.cmake", included by the toolchain file.
+		set(PSP_EBOOT_DIR "${CMAKE_BINARY_DIR}/ms0/PSP/GAME/Jazz2")
+		file(MAKE_DIRECTORY "${PSP_EBOOT_DIR}")
+		# The title is what the firmware's game list and Adrenaline show under the icon. PARAM.SFO carries it
+		# as UTF-8, so the superscript in the project's name survives - the PS Vita packaging a few hundred
+		# lines below hands `vita_create_vpk()` the very same string.
+		create_pbp_file(
+			TARGET ${NCINE_APP}
+			TITLE "${NCINE_APP_NAME}"
+			#VERSION "${NCINE_VERSION}"
+			VERSION "01.00"
+			# ICON0 is nominally 144x82, the firmware (and PPSSPP) scale whatever they are given
+			ICON_PATH "${NCINE_SOURCE_DIR}/Icons/Psp/Icon.png"
+			# PIC1, the 480x272 backdrop the firmware's game list shows behind the icon when it is selected
+			BACKGROUND_PATH "${NCINE_SOURCE_DIR}/Icons/Psp/Background.png"
+			PREVIEW_PATH NULL
+			OUTPUT_DIR "${PSP_EBOOT_DIR}"
+			# MEMSIZE=1 asks the firmware for the extra memory of the 2000/3000 models (and is what PPSSPP
+			# emulates by default); without it a user-mode application is capped at the 24 MB of a PSP-1000
+			MEMSIZE 1
+		)
+		# The content is staged as "Content" next to the EBOOT, which is where the PSP branch of
+		# ContentResolver::GetContentPath() looks for it
+		add_custom_command(TARGET ${NCINE_APP} POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy_directory "${NCINE_CONTENT_DIR}" "${PSP_EBOOT_DIR}/Content"
+			COMMENT "Staging memory stick layout with game content"
+			VERBATIM)
+
+		if(CURL_FOUND)
+			# The CA bundle every HTTPS request is verified against, exactly as for the PS Vita below (see the
+			# longer note there): pspdev's libcurl is built on mbedTLS with a Unix default path that exists
+			# nowhere on a memory stick, so without a bundle of its own the server list, the update check and
+			# script web requests all fail to verify. PlatformWebRequest.h points libcurl at the copy staged
+			# next to the content. Fetched at configure time and cached in the build directory.
+			set(_pspCaCert "${CMAKE_BINARY_DIR}/cacert.pem")
+			if(NOT EXISTS "${_pspCaCert}")
+				message(STATUS "Downloading the CA certificate bundle for HTTPS support")
+				file(DOWNLOAD "https://curl.se/ca/cacert.pem" "${_pspCaCert}"
+					INACTIVITY_TIMEOUT 30 TIMEOUT 120 TLS_VERIFY ON STATUS _pspCaCertStatus)
+				list(GET _pspCaCertStatus 0 _pspCaCertResult)
+				if(NOT _pspCaCertResult EQUAL 0)
+					list(GET _pspCaCertStatus 1 _pspCaCertError)
+					message(WARNING "Cannot download the CA certificate bundle (${_pspCaCertError}), so HTTPS "
+						"requests will fail to verify - put a PEM bundle at \"${_pspCaCert}\" and configure again")
+					file(REMOVE "${_pspCaCert}")
+				endif()
+			endif()
+			if(EXISTS "${_pspCaCert}")
+				add_custom_command(TARGET ${NCINE_APP} POST_BUILD
+					COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_pspCaCert}" "${PSP_EBOOT_DIR}/Content/cacert.pem"
+					COMMENT "Staging the CA certificate bundle"
+					VERBATIM)
+			endif()
+		endif()
+	elseif(VITA)
+		include("${VITASDK}/share/vita.cmake" REQUIRED)
+
+		# Link to all required libraries and stubs
+		target_link_libraries(${NCINE_APP} PRIVATE
+			# Linked for **every** backend, not only NCINE_PREFERRED_RHI=OpenGL, and it is worth knowing why
+			# before anyone tries to drop it from a GXM build: nothing in this engine calls a `vgl*` function
+			# under GXM, but VitaSDK's SDL2 has exactly one Vita video driver and it is built against vitaGL.
+			# Its bootstrap table pulls `SDL_vitagles_vgl.c.obj` in whatever the renderer is, so the window
+			# backend needs vitaGL even when the renderer does not. Taking it off the line trades one link
+			# error for a page of undefined `vgl*` ones.
+			vitaGL
+			vitashark
+			SceShaccCgExt
+
+			mathneon
+
+			-Wl,--whole-archive # --whole-archive is required, otherwise all stubs are not linked properly
+
+			SceLibKernel_stub
+			SceAppMgr_stub
+			SceAppUtil_stub
+			SceAudio_stub
+			SceAudioIn_stub
+			SceCtrl_stub
+			SceCommonDialog_stub
+			SceDisplay_stub
+			SceGxm_stub
+			SceHid_stub
+			SceHttp_stub
+			# Not for anything this application asks for: SDL2's vitaGL video backend calls sceImeUpdate()
+			# from its SwapWindow, so every frame drawn needs it whether or not the on-screen keyboard is
+			# ever shown. It began failing to link when VitaSDK's SDL2 picked that call up.
+			SceIme_stub
+			SceKernelDmacMgr_stub
+			SceMotion_stub
+			SceNet_stub
+			SceNetCtl_stub
+			ScePower_stub
+			SceShaccCg_stub
+			SceSsl_stub
+			SceSysmodule_stub
+			SceTouch_stub
+			taihen_stub
+
+			-Wl,--no-whole-archive
+		)
+		string(REGEX MATCH "^([0-9]+)\\.([0-9]+)" _ ${NCINE_VERSION})
+		string(LENGTH ${CMAKE_MATCH_1} VITA_VERSION_MAJOR_LEN)
+		if(VITA_VERSION_MAJOR_LEN EQUAL 1)
+			set(VITA_VERSION "0${CMAKE_MATCH_1}")
+		else()
+			set(VITA_VERSION "${CMAKE_MATCH_1}")
+		endif()
+		string(LENGTH ${CMAKE_MATCH_2} VITA_VERSION_MINOR_LEN)
+		if(VITA_VERSION_MINOR_LEN EQUAL 1)
+			set(VITA_VERSION "${VITA_VERSION}.0${CMAKE_MATCH_2}")
+		else()
+			set(VITA_VERSION "${VITA_VERSION}.${CMAKE_MATCH_2}")
+		endif()
+		# The title id has to be exactly 9 characters, which is the width of the PARAM.SFO field and of the
+		# "ux0:/app/<titleid>/" directory the firmware installs into. Unlike the PlayStation 3 the Vita does
+		# not additionally require 4 letters followed by 5 digits - homebrew of the likes of VitaShell ships
+		# as nine letters - so only the length is enforced here. Appending the padding before taking the
+		# first 9 characters pads a shorter name and truncates a longer one, which the SDK does not check:
+		# `vita_create_vpk()` validates the version but passes the id straight to `vita-mksfoex`.
+		# Set it explicitly to override the derivation.
+		if(NOT VITA_TITLEID)
+			string(SUBSTRING "${NCINE_APP}000000000" 0 9 VITA_TITLEID)
+		endif()
+		# Upper case, always. Sony's own ids are (four letters, five digits) and every id the firmware writes
+		# or matches is upper case; a lower-case one installs and boots, but the shell does not treat it as the
+		# same id everywhere it looks - which is how this port ended up with a bubble whose LiveArea page was
+		# never picked up and which the uninstaller refused with C2-17770-2. Derived ids come from
+		# `NCINE_APP`, which is lower case, so this is the one place it can be corrected for everyone.
+		string(TOUPPER "${VITA_TITLEID}" VITA_TITLEID)
+		if(NOT VITA_TITLEID MATCHES "^[A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9][A-Za-z0-9]$")
+			message(FATAL_ERROR "VITA_TITLEID \"${VITA_TITLEID}\" is not 9 alphanumeric characters, "
+				"which the firmware requires - set it explicitly to a conforming id")
+		endif()
+		vita_create_self(${NCINE_APP}.self ${NCINE_APP})
+		# The game content travels inside the VPK, next to the executable, so it ends up in the
+		# application's own read-only directory ("ux0:/app/<titleid>/", mounted as "app0:") and needs
+		# no separate copy on the device.
+		# The LiveArea page - what the firmware shows when the game's bubble is selected, before the game
+		# starts. It is optional: without "template.xml" the firmware falls back to the default homebrew gate,
+		# so a tree that has not been given the artwork still produces a working VPK.
+		#
+		# The template's "style" names a layout the firmware owns - they are the ".rco" files in
+		# "vs0:/vsh/shell/livearea" (a1 through a5, ad0 through ad4, psmobile, pspemu, ps1emu, ...) - and it,
+		# not anything in the template, decides where the gate and any frames sit. "psmobile" is what homebrew
+		# uses. Two things about that file are worth knowing because getting either wrong fails silently, with
+		# the firmware showing the default gate as though no template had been shipped at all: the shell's
+		# parser wants the root element straight after the XML declaration (an XML comment in between, legal
+		# as it is, is enough), and "content-rev" has to go up when the page's content changes, or an already
+		# installed copy keeps what the shell cached. Both images are packaged under the names the template
+		# gives them, at sizes the firmware will not rescale: 840x500 and 280x158.
+		set(_vitaLiveAreaDir "${NCINE_SOURCE_DIR}/Icons/Vita")
+		set(VITA_LIVEAREA_FILES "")
+		if(EXISTS "${_vitaLiveAreaDir}/Template.xml")
+			set(_vitaLiveAreaComplete TRUE)
+			foreach(_liveAreaImage Background.png Startup.png)
+				if(NOT EXISTS "${_vitaLiveAreaDir}/${_liveAreaImage}")
+					message(WARNING "LiveArea artwork \"${_liveAreaImage}\" is missing from \"${_vitaLiveAreaDir}\", "
+						"so the default homebrew gate is packaged instead (Background.png is 840x500, "
+						"Startup.png is 280x158)")
+					set(_vitaLiveAreaComplete FALSE)
+				endif()
+			endforeach()
+			if(_vitaLiveAreaComplete)
+				list(APPEND VITA_LIVEAREA_FILES
+					FILE "${_vitaLiveAreaDir}/Template.xml" "sce_sys/livearea/contents/template.xml"
+					FILE "${_vitaLiveAreaDir}/Background.png" "sce_sys/livearea/contents/bg0.png"
+					FILE "${_vitaLiveAreaDir}/Startup.png" "sce_sys/livearea/contents/startup.png")
+				message(STATUS "Packaging a custom PS Vita LiveArea page")
+			endif()
+		endif()
+
+		# The CA bundle every HTTPS request is verified against. VitaSDK's libcurl defaults CURLOPT_CAINFO to
+		# the firmware's own store under "vs0:", which an application cannot open at all - the mount point is
+		# not in its sandbox, so the call fails with ENOENT rather than a permission error (see WebRequest.cpp)
+		# - and the TLS stack linked into the executable is not the system one that iTLS-Enso and friends
+		# patch, so nothing installed on the console can supply it either. It is fetched at configure time
+		# rather than committed: a trust store goes stale, and a copy in the repository would be a second
+		# thing to remember to update. The download is cached in the build directory, so it happens once.
+		set(VITA_CACERT_FILES "")
+		set(_vitaCaCert "${CMAKE_BINARY_DIR}/cacert.pem")
+		if(NOT EXISTS "${_vitaCaCert}")
+			message(STATUS "Downloading the CA certificate bundle for HTTPS support")
+			file(DOWNLOAD "https://curl.se/ca/cacert.pem" "${_vitaCaCert}"
+				INACTIVITY_TIMEOUT 30 TIMEOUT 120 TLS_VERIFY ON STATUS _vitaCaCertStatus)
+			list(GET _vitaCaCertStatus 0 _vitaCaCertResult)
+			if(NOT _vitaCaCertResult EQUAL 0)
+				list(GET _vitaCaCertStatus 1 _vitaCaCertError)
+				# Not fatal: the build is still perfectly good, it just cannot verify a certificate until a
+				# bundle is there, so this reports what is missing instead of stopping the build
+				message(WARNING "Cannot download the CA certificate bundle (${_vitaCaCertError}), so HTTPS "
+					"requests will fail to verify - put a PEM bundle at \"${_vitaCaCert}\" and configure again")
+				file(REMOVE "${_vitaCaCert}")
+			endif()
+		endif()
+		if(EXISTS "${_vitaCaCert}")
+			list(APPEND VITA_CACERT_FILES FILE "${_vitaCaCert}" "Content/cacert.pem")
+		endif()
+
+		# Compiled GXP shader binaries, so a fresh install does not have to run the on-console Cg compiler
+		# for every stage before the first frame (that cost 3.3 s of the 6.8 s startup). The pack is
+		# produced BY the console - there is no offline sceGxm shader compiler - so it is pulled back from
+		# "ux0:/data/jazz2/Cache/Shaders/" after a run and committed here; see the directory's README.md.
+		#
+		# It is packaged only for this platform, hence a directory of its own rather than a file under
+		# "Content": a GXP is Vita machine code and would be dead weight in every other build. The path it
+		# lands on is the one GxmShaderCache::PrebakedPath reads, and nothing has to match beyond that -
+		# entries are keyed by a hash of the Cg source they were compiled from, so a pack that predates a
+		# shader change is not wrong, only incomplete (the changed stages miss and are recompiled), and one
+		# built by a different "libshacccg.suprx" is rejected wholesale by its fingerprint. A missing pack
+		# is simply the old behaviour, which is why this is not an error.
+		set(VITA_SHADERCACHE_FILES "")
+		set(_vitaShaderCache "${NCINE_SOURCE_DIR}/Shaders/Prebaked/Vita/ShadersGxm.bin")
+		if(EXISTS "${_vitaShaderCache}")
+			list(APPEND VITA_SHADERCACHE_FILES FILE "${_vitaShaderCache}" "Content/Shaders/ShadersGxm.bin")
+			message(STATUS "Packaging the prebaked GXP shader cache")
+		else()
+			message(WARNING "The prebaked GXP shader cache is missing from \"${_vitaShaderCache}\", so a "
+				"fresh install will compile every shader on the console at its first start (about 3 s). See "
+				"that directory's README.md for how to regenerate it.")
+		endif()
+
+		vita_create_vpk(${NCINE_APP}.vpk ${VITA_TITLEID} ${NCINE_APP}.self
+			VERSION ${VITA_VERSION} NAME ${NCINE_APP_NAME}
+			FILE "${NCINE_SOURCE_DIR}/Icons/Vita/Icon.png" "sce_sys/icon0.png"
+			${VITA_LIVEAREA_FILES}
+			${VITA_CACERT_FILES}
+			${VITA_SHADERCACHE_FILES}
+			FILE "${NCINE_CONTENT_DIR}" "Content")
+	elseif(WIN32 AND NCINE_COPY_DEPENDENCIES)
+		set(WIN32_DEPENDENCIES "")
+		
+		if(ZLIB_FOUND)
+			list(APPEND WIN32_DEPENDENCIES "${MSVC_BINDIR}/zlib.dll")
+		endif()
+		
+		if(NCINE_WITH_ANGLE AND ANGLE_FOUND)
+			list(APPEND WIN32_DEPENDENCIES "${MSVC_BINDIR}/libEGL.dll" "${MSVC_BINDIR}/libGLESv2.dll")
+		elseif(GLEW_FOUND)
+			list(APPEND WIN32_DEPENDENCIES "${MSVC_BINDIR}/glew32.dll")
+		endif()
+		
+		if(NOT DEDICATED_SERVER)
+			if(NCINE_PREFERRED_BACKEND STREQUAL "GLFW" AND GLFW_FOUND)
+				list(APPEND WIN32_DEPENDENCIES "${MSVC_BINDIR}/glfw3.dll")
+			endif()
+			if(NCINE_PREFERRED_BACKEND STREQUAL "SDL2" AND SDL2_FOUND)
+				list(APPEND WIN32_DEPENDENCIES "${MSVC_BINDIR}/SDL2.dll")
+			endif()
+			if(NCINE_PREFERRED_BACKEND STREQUAL "SDL3" AND SDL3_FOUND AND EXISTS "${MSVC_BINDIR}/SDL3.dll")
+				list(APPEND WIN32_DEPENDENCIES "${MSVC_BINDIR}/SDL3.dll")
+			endif()
+
+			if(NCINE_WITH_AUDIO AND OPENAL_FOUND)
+				list(APPEND WIN32_DEPENDENCIES "${MSVC_BINDIR}/OpenAL32.dll")
+
+				if(NCINE_WITH_VORBIS AND VORBIS_FOUND AND NOT VORBIS_DYNAMIC_LINK)
+					list(APPEND WIN32_DEPENDENCIES "${MSVC_BINDIR}/libogg.dll" "${MSVC_BINDIR}/libvorbis.dll" "${MSVC_BINDIR}/libvorbisfile.dll")
+				endif()
+			
+				if(NCINE_WITH_OPENMPT AND OPENMPT_FOUND AND NOT OPENMPT_DYNAMIC_LINK)
+					list(APPEND WIN32_DEPENDENCIES "${MSVC_BINDIR}/libopenmpt.dll" "${MSVC_BINDIR}/openmpt-mpg123.dll" "${MSVC_BINDIR}/openmpt-ogg.dll" "${MSVC_BINDIR}/openmpt-vorbis.dll" "${MSVC_BINDIR}/openmpt-zlib.dll")
+				endif()
+			endif()
+		endif()
+		
+		if(NCINE_WITH_WEBP AND WEBP_FOUND)
+			list(APPEND WIN32_DEPENDENCIES "${MSVC_BINDIR}/libwebp.dll")
+		endif()
+		
+		ncine_deploy_runtime_dependencies(${WIN32_DEPENDENCIES})
+	endif()
+	
+	if(NCINE_CREATE_CONTENT_SYMLINK)
+		add_custom_command(TARGET ${NCINE_APP} POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E create_symlink "${NCINE_CONTENT_DIR}" "$<TARGET_FILE_DIR:${NCINE_APP}>/Content"
+			COMMENT "Creating symbolic link to \"${NCINE_CONTENT_DIR}\"")
+	endif()
+endif()
+
+# Jazz² Resurrection options
+if(SHAREWARE_DEMO_ONLY)
+	message(STATUS "Building the game only with Shareware Demo episode")
+	target_compile_definitions(${NCINE_APP} PUBLIC "SHAREWARE_DEMO_ONLY")
+
+	if(WITH_MULTIPLAYER AND SHAREWARE_DEMO_ALLOW_MULTIPLAYER)
+		target_compile_definitions(${NCINE_APP} PUBLIC "SHAREWARE_DEMO_ALLOW_MULTIPLAYER")
+	endif()
+endif()
+
+if(DISABLE_RESCALE_SHADERS)
+	message(STATUS "Building the game with disabled rescaling options")
+	target_compile_definitions(${NCINE_APP} PUBLIC "DISABLE_RESCALE_SHADERS")
+endif()
+
+if(TILEMAP_USE_SINGLE_DRAW)
+	message(STATUS "Building the game with tilemap layer draw call aggregation")
+	target_compile_definitions(${NCINE_APP} PUBLIC "TILEMAP_USE_SINGLE_DRAW")
+endif()
+
+if(WITH_PHYSICS_PROBE)
+	message(STATUS "Building the game with the movement trajectory probe")
+	target_compile_definitions(${NCINE_APP} PUBLIC "WITH_PHYSICS_PROBE")
+
+	list(APPEND HEADERS
+		${NCINE_SOURCE_DIR}/Jazz2/Tests/PhysicsProbe.h
+	)
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/Jazz2/Tests/PhysicsProbe.cpp
+	)
+endif()
+
+if(WITH_EDITOR)
+	message(STATUS "Building the game with the level editor")
+	target_compile_definitions(${NCINE_APP} PUBLIC "WITH_EDITOR")
+
+	list(APPEND HEADERS
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/Annotations.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/CommandHistory.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/Commands.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/DocumentChanges.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/DocumentSnapshot.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/DocumentViewState.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/LevelDocument.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/TerrainSplines.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/EditorInitialization.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/EditorSelfTest.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/EditorSession.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Events/EventCatalog.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Events/EventGizmos.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Events/EventPreviewResolver.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Events/EventPreviews.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Files/AutosaveService.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Files/ContentTileSetLibrary.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Files/EditorSettings.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Files/WebFileBridge.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/AccentColor.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/LevelThumbnail.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/PaletteFile.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/PaletteMatch.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/PngCodec.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/Quantizer.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/TileImages.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Input/ActionRegistry.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Input/TouchGestures.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/EditorCamera.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/EditorLevelHandler.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/MaskOverlay.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/PlayTest.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/PlayTestLevelHandler.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/PlayTestMpLevelHandler.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/PlayTransition.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/RuntimeSync.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/TileLod.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/EditorShell.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/EventPanels.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/FindReplaceDialog.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/FxTileGenerator.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/HelpDialogs.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/LayerDialogs.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/LevelDialogs.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/LevelCheck.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/LevelStatistics.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/Navigator.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/PaletteDialog.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/PrefabsDialog.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/ShellPanels.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/SmartFill.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/TerrainRulesDialog.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/TileEditor.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/TileSetApplyDialog.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/TileSetImportDialog.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/TileSetLayoutDialog.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/TileSetsDialog.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Smart/RulesFile.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Smart/SmartTileModel.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Smart/TerrainRules.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Smart/TilePrefabs.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Smart/TileShapes.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/EditorTool.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/EventTools.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/GroundLineTool.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/MeasureTool.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/PathTool.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/SmartBrushTool.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/TilePixelTool.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/TileStamp.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/TileTools.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/EditorIcons.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiColors.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiDialogs.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiDock.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiElement.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiKeyboard.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiMenu.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiPainter.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiRadialMenu.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiSkin.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiSurface.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiTheme.h
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiWidgets.h
+	)
+
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/Annotations.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/CommandHistory.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/Commands.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/DocumentChanges.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/DocumentSnapshot.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/DocumentViewState.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/LevelDocument.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Document/TerrainSplines.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/EditorSelfTest.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/EditorSession.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Events/EventCatalog.Area.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Events/EventCatalog.Basic.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Events/EventCatalog.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Events/EventCatalog.Enemy.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Events/EventCatalog.Environment.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Events/EventCatalog.Items.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Events/EventGizmos.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Events/EventPreviewResolver.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Events/EventPreviews.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Files/AutosaveService.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Files/ContentTileSetLibrary.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Files/EditorSettings.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Files/WebFileBridge.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/AccentColor.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/LevelThumbnail.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/PaletteFile.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/PaletteMatch.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/PngCodec.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/Quantizer.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Imaging/TileImages.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Input/ActionRegistry.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Input/TouchGestures.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/EditorCamera.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/EditorLevelHandler.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/MaskOverlay.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/PlayTest.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/PlayTestLevelHandler.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/PlayTestMpLevelHandler.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/PlayTransition.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/RuntimeSync.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Runtime/TileLod.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/EditorShell.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/EventPanels.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/FindReplaceDialog.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/FxTileGenerator.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/HelpDialogs.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/LayerDialogs.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/LevelDialogs.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/LevelCheck.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/LevelStatistics.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/Navigator.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/PaletteDialog.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/PrefabsDialog.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/ShellPanels.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/SmartFill.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/TerrainRulesDialog.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/TileEditor.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/TileSetApplyDialog.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/TileSetImportDialog.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/TileSetLayoutDialog.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Shell/TileSetsDialog.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Smart/RulesFile.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Smart/SmartTileModel.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Smart/TerrainRules.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Smart/TilePrefabs.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Smart/TileShapes.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/EventTools.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/GroundLineTool.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/MeasureTool.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/PathTool.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/SmartBrushTool.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/TilePixelTool.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/TileStamp.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/Tools/TileTools.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/EditorIcons.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiColors.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiDialogs.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiDock.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiElement.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiKeyboard.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiMenu.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiPainter.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiRadialMenu.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiSkin.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiSurface.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Editor/UI/UiWidgets.cpp
+	)
+endif()
+
+if(WITH_MULTIPLAYER)
+	target_compile_definitions(${NCINE_APP} PUBLIC "WITH_MULTIPLAYER")
+
+	list(APPEND HEADERS
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/CtfBase.h
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/Flag.h
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/LocalPlayerOnServer.h
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/MpPlayer.h
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/PlayerOnServer.h
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/RemotablePlayer.h
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/RemoteActor.h
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/RemoteElectroShot.h
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/RemoteThunderbolt.h
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/RemotePlayerOnServer.h
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/StateInterpolationBuffer.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/ConnectionResult.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/INetworkHandler.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/MpGameMode.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/MpLevelHandler.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/NetworkManager.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/NetworkManagerBase.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/PacketTypes.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/Peer.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/PeerDescriptor.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/RaceRouteGenerator.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/Reason.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/ServerDiscovery.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/ServerInitialization.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/Teams.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/WebhookClient.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/MpPlayerState.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/IGameMode.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/GameModeFactory.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/CooperationMode.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/BattleMode.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/TeamBattleMode.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/RaceMode.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/TeamRaceMode.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/TreasureHuntMode.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/TeamTreasureHuntMode.h
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/CaptureTheFlagMode.h
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/CreateLocalGameOptionsSection.h
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/CreateServerOptionsSection.h
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/MultiplayerGameModeSelectSection.h
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/PlayMultiplayerSection.h
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/ScoreboardSection.h
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/ServerSelectSection.h
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Multiplayer/MpHUD.h
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Multiplayer/MpInGameCanvasLayer.h
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Multiplayer/MpInGameLobby.h
+	)
+
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/CtfBase.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/Flag.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/LocalPlayerOnServer.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/MpPlayer.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/PlayerOnServer.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/RemotablePlayer.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/RemoteActor.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/RemoteElectroShot.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/RemoteThunderbolt.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Actors/Multiplayer/RemotePlayerOnServer.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/ConnectionResult.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/MpLevelHandler.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/GameModeFactory.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/CooperationMode.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/BattleMode.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/TeamBattleMode.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/RaceMode.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/TreasureHuntMode.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/GameModes/CaptureTheFlagMode.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/NetworkManager.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/NetworkManagerBase.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/Peer.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/RaceRouteGenerator.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/ServerDiscovery.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/Multiplayer/WebhookClient.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/CreateLocalGameOptionsSection.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/CreateServerOptionsSection.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/MultiplayerGameModeSelectSection.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/PlayMultiplayerSection.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/ScoreboardSection.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/ServerSelectSection.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Multiplayer/MpHUD.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Multiplayer/MpInGameCanvasLayer.cpp
+		${NCINE_SOURCE_DIR}/Jazz2/UI/Multiplayer/MpInGameLobby.cpp
+	)
+	
+	if(WITH_ONLINE_MULTIPLAYER)
+		target_compile_definitions(${NCINE_APP} PUBLIC "WITH_ONLINE_MULTIPLAYER")
+		if(DEDICATED_SERVER)
+			message(STATUS "Building the game with online multiplayer support as dedicated server")
+			target_compile_definitions(${NCINE_APP} PUBLIC "DEDICATED_SERVER")
+		else()
+			message(STATUS "Building the game with online multiplayer support")
+		endif()
+		
+		if(NINTENDO_SWITCH OR NINTENDO_3DS OR PLATFORM_PSP OR VITA)
+			# None of these four stacks has IPv6 in it - sceNetInet on the two Sony handhelds has no address
+			# family for it at all, and libctru's <netinet/in.h> declares no in6_addr - so ENet is built on
+			# its IPv4 arm
+			target_compile_definitions(${NCINE_APP} PUBLIC "ENET_IPV6=0")
+		elseif(WIN32)
+			# Link to IP Helper API library and Windows Sockets 2 library (only the enet transport needs them)
+			target_link_libraries(${NCINE_APP} PRIVATE iphlpapi ws2_32)
+		endif()
+		
+		if(NOT EMSCRIPTEN)
+			list(APPEND HEADERS
+				${NCINE_SOURCE_DIR}/Dependencies/enet/enet.h
+				${NCINE_SOURCE_DIR}/Dependencies/enet/ifaddrs-android.h
+			)
+		endif()
+		
+		if(WITH_WEBSOCKET OR EMSCRIPTEN) # Emscripten always uses the browser's native WebSocket
+			message(STATUS "Building the game with WebSocket transport support")
+			target_compile_definitions(${NCINE_APP} PUBLIC "WITH_WEBSOCKET")
+
+			if(EMSCRIPTEN)
+				# Emscripten uses the browser's native WebSocket via <emscripten/websocket.h>
+				message(STATUS "Using Emscripten native WebSocket API")
+				target_link_options(${NCINE_APP} PUBLIC -sFETCH=1)
+			else()
+				# IXWebSocket library for all other platforms
+				if(WITH_WEBSOCKET_TLS_BACKEND STREQUAL "SecureTransport" AND APPLE)
+					message(STATUS "WebSocket TLS: Using SecureTransport")
+					set(USE_TLS ON CACHE BOOL "" FORCE)
+					set(USE_SECURE_TRANSPORT ON CACHE BOOL "" FORCE)
+					set(USE_SCHANNEL OFF CACHE BOOL "" FORCE)
+					set(USE_OPEN_SSL OFF CACHE BOOL "" FORCE)
+					set(USE_MBED_TLS OFF CACHE BOOL "" FORCE)
+					target_compile_definitions(${NCINE_APP} PUBLIC "WITH_WEBSOCKET_TLS")
+				elseif(WITH_WEBSOCKET_TLS_BACKEND STREQUAL "Schannel" AND WIN32)
+					message(STATUS "WebSocket TLS: Using Schannel")
+					set(USE_TLS ON CACHE BOOL "" FORCE)
+					set(USE_SCHANNEL ON CACHE BOOL "" FORCE)
+					set(USE_SECURE_TRANSPORT OFF CACHE BOOL "" FORCE)
+					set(USE_OPEN_SSL OFF CACHE BOOL "" FORCE)
+					set(USE_MBED_TLS OFF CACHE BOOL "" FORCE)
+					target_compile_definitions(${NCINE_APP} PUBLIC "WITH_WEBSOCKET_TLS")
+				elseif(WITH_WEBSOCKET_TLS_BACKEND STREQUAL "OpenSSL")
+					find_package(OpenSSL QUIET)
+					if(OPENSSL_FOUND)
+						message(STATUS "WebSocket TLS: Using OpenSSL")
+						set(USE_TLS ON CACHE BOOL "" FORCE)
+						set(USE_OPEN_SSL ON CACHE BOOL "" FORCE)
+						set(USE_SCHANNEL OFF CACHE BOOL "" FORCE)
+						set(USE_MBED_TLS OFF CACHE BOOL "" FORCE)
+						target_compile_definitions(${NCINE_APP} PUBLIC "WITH_WEBSOCKET_TLS")
+
+						# `NCINE_COPY_DEPENDENCIES` doesn't exist on UWP, which always deploys its dependencies
+						if(WIN32 AND NOT OPENSSL_USE_STATIC_LIBS AND (NCINE_COPY_DEPENDENCIES OR WINDOWS_PHONE OR WINDOWS_STORE))
+							# A dynamically linked OpenSSL needs its runtime libraries next to the executable, but
+							# `FindOpenSSL` reports only the import libraries, so the DLLs have to be looked up
+							set(OPENSSL_DLL_HINTS "")
+
+							# The include directory is the most reliable anchor, because it's always directly in the
+							# installation root, while the import libraries can be nested arbitrarily deep in it
+							# (the official Windows builds put them in `lib/VC/x64/MD`, vcpkg in just `lib`)
+							if(OPENSSL_INCLUDE_DIR)
+								get_filename_component(OPENSSL_INSTALL_DIR "${OPENSSL_INCLUDE_DIR}" DIRECTORY)
+								list(APPEND OPENSSL_DLL_HINTS "${OPENSSL_INSTALL_DIR}/bin" "${OPENSSL_INSTALL_DIR}")
+							endif()
+							if(OPENSSL_ROOT_DIR)
+								list(APPEND OPENSSL_DLL_HINTS "${OPENSSL_ROOT_DIR}/bin" "${OPENSSL_ROOT_DIR}")
+							endif()
+
+							# Otherwise walk up from the import libraries, looking for a `bin` directory on the way
+							foreach(OPENSSL_LIBRARY ${OPENSSL_SSL_LIBRARY} ${OPENSSL_CRYPTO_LIBRARY} ${OPENSSL_LIBRARIES})
+								# Skip the `optimized` and `debug` keywords of a per-configuration library list
+								if(OPENSSL_LIBRARY MATCHES "\\.(lib|a|dll)$")
+									get_filename_component(OPENSSL_LIBDIR "${OPENSSL_LIBRARY}" DIRECTORY)
+									foreach(OPENSSL_ANCESTOR "" "/.." "/../.." "/../../.." "/../../../..")
+										list(APPEND OPENSSL_DLL_HINTS
+											"${OPENSSL_LIBDIR}${OPENSSL_ANCESTOR}" "${OPENSSL_LIBDIR}${OPENSSL_ANCESTOR}/bin")
+									endforeach()
+								endif()
+							endforeach()
+
+							# Finally, the libraries can also be dropped in with the other bundled dependencies
+							if(MSVC_BINDIR)
+								list(APPEND OPENSSL_DLL_HINTS "${MSVC_BINDIR}")
+							endif()
+							list(REMOVE_DUPLICATES OPENSSL_DLL_HINTS)
+
+							# The official Windows builds append the architecture to the file name
+							if(CMAKE_SYSTEM_PROCESSOR MATCHES "[Aa][Rr][Mm]|[Aa][Aa][Rr][Cc][Hh]")
+								if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+									set(OPENSSL_DLL_SUFFIX "-arm64")
+								else()
+									set(OPENSSL_DLL_SUFFIX "-arm")
+								endif()
+							elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
+								set(OPENSSL_DLL_SUFFIX "-x64")
+							else()
+								set(OPENSSL_DLL_SUFFIX "")
+							endif()
+
+							# Only the directories of the found OpenSSL are searched, a DLL from an unrelated
+							# installation in `PATH` (e.g. the one bundled with Git) wouldn't match the import libraries
+							find_file(OPENSSL_SSL_DLL
+								NAMES "libssl-3${OPENSSL_DLL_SUFFIX}.dll" "libssl-3.dll"
+									"libssl-1_1${OPENSSL_DLL_SUFFIX}.dll" "libssl-1_1.dll" "libssl.dll" "ssleay32.dll"
+								PATHS ${OPENSSL_DLL_HINTS} NO_DEFAULT_PATH)
+							find_file(OPENSSL_CRYPTO_DLL
+								NAMES "libcrypto-3${OPENSSL_DLL_SUFFIX}.dll" "libcrypto-3.dll"
+									"libcrypto-1_1${OPENSSL_DLL_SUFFIX}.dll" "libcrypto-1_1.dll" "libcrypto.dll" "libeay32.dll"
+								PATHS ${OPENSSL_DLL_HINTS} NO_DEFAULT_PATH)
+							mark_as_advanced(OPENSSL_SSL_DLL OPENSSL_CRYPTO_DLL)
+
+							if(OPENSSL_SSL_DLL AND OPENSSL_CRYPTO_DLL)
+								message(STATUS "OpenSSL runtime libraries: ${OPENSSL_SSL_DLL}, ${OPENSSL_CRYPTO_DLL}")
+								# On UWP the libraries have to come from a UWP build of OpenSSL to be deployable
+								ncine_deploy_runtime_dependencies(${OPENSSL_SSL_DLL} ${OPENSSL_CRYPTO_DLL})
+							else()
+								string(REPLACE ";" "\n  " OPENSSL_SEARCHED_DIRS "${OPENSSL_DLL_HINTS}")
+								message(WARNING "OpenSSL runtime libraries not found, set OPENSSL_SSL_DLL and "
+									"OPENSSL_CRYPTO_DLL manually or copy them next to the executable. Searched in:\n  "
+									"${OPENSSL_SEARCHED_DIRS}")
+							endif()
+						endif()
+					else()
+						message(WARNING "OpenSSL not found, building WebSocket without TLS support")
+						set(USE_TLS OFF CACHE BOOL "" FORCE)
+					endif()
+				elseif(WITH_WEBSOCKET_TLS_BACKEND STREQUAL "mbedTLS")
+					find_package(MbedTLS QUIET)
+					if(MbedTLS_FOUND OR MBEDTLS_FOUND)
+						message(STATUS "WebSocket TLS: Using mbedTLS")
+						set(USE_TLS ON CACHE BOOL "" FORCE)
+						set(USE_OPEN_SSL OFF CACHE BOOL "" FORCE)
+						set(USE_SCHANNEL OFF CACHE BOOL "" FORCE)
+						set(USE_MBED_TLS ON CACHE BOOL "" FORCE)
+						target_compile_definitions(${NCINE_APP} PUBLIC "WITH_WEBSOCKET_TLS")
+					else()
+						message(WARNING "mbedTLS not found, building WebSocket without TLS support")
+						set(USE_TLS OFF CACHE BOOL "" FORCE)
+					endif()
+				else()
+					message(STATUS "WebSocket TLS: Disabled")
+					set(USE_TLS OFF CACHE BOOL "" FORCE)
+				endif()
+
+				find_package(IXWebSocket REQUIRED)
+				target_link_libraries(${NCINE_APP} PRIVATE IXWebSocket)
+			endif()
+		endif()
+	else()
+		message(STATUS "Building the game with local multiplayer support")
+	endif()
+else()
+	message(STATUS "Building the game without multiplayer support")
+endif()

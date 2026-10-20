@@ -1,0 +1,3911 @@
+﻿#include "ContentResolver.h"
+#if defined(DEATH_TARGET_N64)
+#	include <n64sys.h>
+#endif
+#include "../Shaders/Generated/ShadersGen.h"
+#include "Compatibility/JJ2Anims.Palettes.h"
+#include "Formats/LevelFile.h"
+#include "Formats/TileSetFile.h"
+#include "LevelHandler.h"
+#include "Tiles/TileSet.h"
+#include "Compatibility/AssetConverter.h"
+#include "Compatibility/JJ2Anims.h"
+
+#include "../nCine/Application.h"
+#include "../nCine/AppConfiguration.h"
+#include "../nCine/ServiceLocator.h"
+#include "../nCine/tracy.h"
+#include "../nCine/Graphics/ITextureLoader.h"
+#include "../nCine/Graphics/RenderResources.h"
+#include "../nCine/Graphics/RenderCommand.h"
+#include "../nCine/Base/Random.h"
+#if defined(WITH_OGC) && defined(DEATH_TARGET_GAMECUBE)
+#	include "../nCine/Backends/Ogc/OgcDvd.h"
+#	include "../nCine/Backends/Ogc/OgcStorage.h"
+#endif
+#if defined(WITH_PS2)
+// Brings removable storage up, so InitializePaths() below can look for the content on it.
+// Guarded on WITH_PS2, not DEATH_TARGET_PS2: the header's own contents are, and it is the narrower of
+// the two (a dedicated-server or libretro configure targets the PS2 without building its backend)
+#	include "../nCine/Backends/Ps2/Ps2Storage.h"
+#endif
+
+#if defined(DEATH_TARGET_ANDROID)
+#	include "../nCine/Backends/Android/AndroidJniHelper.h"
+#	include <IO/AndroidAssetStream.h>
+#elif defined(DEATH_TARGET_WINDOWS_RT)
+#	include <Environment.h>
+#endif
+
+#include <cmath>
+#include <cstdlib>
+
+#include <Containers/StringConcatenable.h>
+#include <Containers/StringStlView.h>
+#include <IO/MemoryStream.h>
+#include <IO/Compression/DeflateStream.h>
+
+#include <jsoncpp/json.h>
+#include <new>
+
+using namespace Death::IO::Compression;
+using namespace Jazz2::Tiles;
+
+static Vector2i GetVector2iFromJson(const Json::Value& value, Vector2i defaultValue = Vector2i::Zero)
+{
+	if (value.isArray()) {
+		std::int64_t x = 0, y = 0;
+		if (value[0].get(x) == Json::SUCCESS && value[1].get(y) == Json::SUCCESS) {
+			return Vector2i((std::int32_t)x, (std::int32_t)y);
+		}
+	}
+	return defaultValue;
+}
+
+namespace Jazz2
+{
+	namespace
+	{
+		/**
+			@brief Whether a metadata's sound samples are read on demand rather than when it is parsed
+
+			A level declares far more sounds than it plays. On the Nintendo 64 each of them is a `.wav64` file the
+			audio device opens on the cartridge - a directory lookup and a few small reads - and holds open for as
+			long as it is kept, at a few hundred bytes of heap each (the samples themselves stay on the cartridge,
+			see `NCINE_HAS_NATIVE_AUDIO`). Opening a sound when something first plays it - and closing it again
+			at every load boundary - keeps both the level load and the heap to the sounds a level actually uses.
+			The cost is a cartridge read in the frame that first plays each sound, which is why the platforms that
+			decode their samples into memory keep doing that up front.
+		*/
+#if defined(DEATH_TARGET_N64)
+		constexpr bool DeferSounds = true;
+#else
+		constexpr bool DeferSounds = false;
+#endif
+
+		/**
+			@brief Whether a level's caption tile is cut out of its tileset
+
+			The caption tile only feeds the RGB keyboard lighting on PC (HUD::UpdateRgbLights); the consoles
+			never read it, so they do not spend the decode and the 3 KB per level on it.
+		*/
+#if defined(DEATH_TARGET_N64) || defined(DEATH_TARGET_PSP) || defined(DEATH_TARGET_DREAMCAST) || defined(DEATH_TARGET_WII) || \
+		defined(DEATH_TARGET_GAMECUBE) || defined(DEATH_TARGET_PS2) || defined(DEATH_TARGET_3DS) || defined(DEATH_TARGET_AMIGA) || \
+		defined(DEATH_TARGET_MORPHOS) || defined(DEATH_TARGET_AMIGAOS4)
+		constexpr bool KeepCaptionTiles = false;
+#else
+		constexpr bool KeepCaptionTiles = true;
+#endif
+
+#if defined(DEATH_TARGET_N64)
+		/**
+			@brief Bytes of heap that must remain free for a deferred resource to be read in
+
+			Resolving an animation is a fresh allocation of tens of kilobytes made while the game is running,
+			and this platform builds without exceptions: an allocation that cannot be satisfied does not
+			throw, it aborts the process. So the ceiling is enforced before the allocation rather than
+			discovered by it - below this floor the resource is simply not loaded, which costs a sprite that
+			does not appear. That is recoverable; a halt is not. Sounds need no such floor here, the device
+			streams them from the cartridge and nothing of them is held decoded.
+		*/
+		constexpr std::int32_t MinFreeHeapToResolve = 192 * 1024;
+
+		/**
+			@brief Returns whether there is room to read another deferred resource
+
+			Also traces the low-water mark, in 64 KB steps, because a halt with no diagnosis is the worst
+			failure mode this platform has: the last line before a freeze names how close it was running.
+		*/
+		bool HasHeadroomToResolve(const char* what, StringView path)
+		{
+			heap_stats_t stats;
+			sys_get_heap_stats(&stats);
+
+			static std::int32_t lowWaterStep = INT32_MAX;
+			const std::int32_t step = stats.free / (64 * 1024);
+			if (step < lowWaterStep) {
+				lowWaterStep = step;
+				LOGW("Heap low-water mark: {} bytes free ({} of them in holes)", stats.free, stats.fragmented);
+			}
+
+			if (stats.free >= MinFreeHeapToResolve) {
+				return true;
+			}
+
+			LOGE("Not enough memory to load {} \"{}\": {} bytes free, {} have to remain", what, path,
+				stats.free, MinFreeHeapToResolve);
+			return false;
+		}
+#endif
+	}
+
+	// Cache-busting version of the precompiled shader set - bump whenever any ".shader" source in
+	// "Sources/Shaders/" or the ShaderCompiler artifact format changes, so stale binary program caches
+	// are invalidated (12 = the switch from embedded sources to ShaderCompiler-generated artifacts)
+	static constexpr std::uint64_t ShadersVersion = 15;
+
+	ContentResolver& ContentResolver::Get()
+	{
+		static ContentResolver current;
+		return current;
+	}
+
+	ContentResolver::ContentResolver()
+		: _isHeadless(false), _isLoading(false), _isContentPrebaked(false), _cachedMetadata(64), _cachedGraphics(256),
+#if defined(WITH_AUDIO)
+			_cachedSounds(192),
+#endif
+			_palettes{}, _paletteDirtyFirstRow(0), _paletteDirtyLastRow(PaletteCount - 1), _paletteRowRefCount{},
+			_paletteRowColor{}, _paletteRowScheme{}
+	{
+		InitializePaths();
+	}
+
+	ContentResolver::~ContentResolver()
+	{
+	}
+
+	void ContentResolver::Release()
+	{
+		_cachedMetadata.clear();
+		_cachedGraphics.clear();
+#if defined(WITH_AUDIO)
+		_cachedSounds.clear();
+#endif
+
+		for (std::int32_t i = 0; i < (std::int32_t)FontType::Count; i++) {
+			_fonts[i] = nullptr;
+		}
+
+		for (std::int32_t i = 0; i < (std::int32_t)PrecompiledShader::Count; i++) {
+			_precompiledShaders[i] = nullptr;
+		}
+	}
+
+#if defined(DEATH_TARGET_PS2) || defined(DEATH_TARGET_GAMECUBE)
+	StringView ContentResolver::GetWritablePath() const
+	{
+		return StringView(_writablePath);
+	}
+#endif
+
+	StringView ContentResolver::GetContentPath() const
+	{
+#if defined(DEATH_TARGET_UNIX) || defined(DEATH_TARGET_IOS) || defined(DEATH_TARGET_WINDOWS_RT)
+		return _contentPath;
+#elif defined(DEATH_TARGET_ANDROID)
+		return "assets:/"_s;
+#elif defined(DEATH_TARGET_SWITCH)
+		return "romfs:/"_s;
+#elif defined(DEATH_TARGET_N64)
+		// DragonFS image appended to the ROM, mounted read-only at "rom:/", the packaging
+		// stages the tree under "Content/" inside it
+		return "rom:/Content/"_s;
+#elif defined(DEATH_TARGET_WII)
+		return "sd:/apps/Jazz2/Content/"_s;
+#elif defined(DEATH_TARGET_GAMECUBE)
+		// Not a constant on this console either: the disc or an SD card, decided in InitializePaths() below
+		return (_contentPath.empty() ? "carda:/Jazz2/Content/"_s : StringView(_contentPath));
+#elif defined(DEATH_TARGET_3DS)
+		// Next to the .3dsx in the standard Homebrew Launcher layout ("sdmc:/3ds/<application>/"). The SD card is
+		// mounted as "sdmc:" by libctru before main() runs, so ContentResolver can open files while the application
+		// is still being constructed; the absolute form is what shows up in the trace log when a file is missing
+		return "sdmc:/3ds/Jazz2/Content/"_s;
+#elif defined(DEATH_TARGET_DREAMCAST)
+		return "/cd/Content/"_s;
+#elif defined(DEATH_TARGET_PS2)
+		// Not a constant on this console: the game boots either from a disc, where the content is under
+		// "cdfs:/" (see SYSTEM.CNF in the PS2 packaging), or from an SD card in an MX4SIO adapter. Which of
+		// the two it was is decided once, in InitializePaths() below.
+		return (_contentPath.empty() ? "cdfs:/Content/"_s : StringView(_contentPath));
+#elif defined(DEATH_TARGET_PS3)
+		// Next to the EBOOT inside the package. "/app_home" is the alias the loader maps the running
+		// executable's OWN directory to - which is USRDIR, not the package root - so the content sits
+		// directly under it rather than under a second "USRDIR". That one path covers both ways the game
+		// is started: an installed package under "/dev_hdd0/game/<APPID>/USRDIR/", and the staged package
+		// directory booted straight from disk during development (which is how RPCS3 runs the build tree).
+		// Going through the alias rather than the title's real path also means the APPID can change without
+		// this string following it.
+		return "/app_home/Content/"_s;
+#elif defined(DEATH_TARGET_PSP)
+		// Next to the EBOOT in the standard homebrew layout. Relative paths would work as well (the
+		// firmware makes the EBOOT's directory the current one), but the absolute form is what shows up in
+		// the trace log when a file is missing, and it also survives a loader that does not set it.
+		return "ms0:/PSP/GAME/Jazz2/Content/"_s;
+#elif defined(DEATH_TARGET_VITA)
+		// Packed inside the VPK, so it's part of the application's own read-only directory
+		// ("ux0:/app/<titleid>/", which the firmware mounts as "app0:")
+		return "app0:/Content/"_s;
+#elif defined(DEATH_TARGET_WINDOWS)
+		return "Content\\"_s;
+#else
+		return "Content/"_s;
+#endif
+	}
+
+	StringView ContentResolver::GetUserContentPath() const
+	{
+#if defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_UNIX) || defined(DEATH_TARGET_WINDOWS_RT) || \
+		defined(DEATH_TARGET_SWITCH) || defined(DEATH_TARGET_VITA)
+		return _userContentPath;
+#else
+		// "Content" is already where the user can reach it, or nothing next to it is writable
+		return {};
+#endif
+	}
+
+	String ContentResolver::FindContentFile(StringView path) const
+	{
+		String fullPath;
+		StringView userContentPath = GetUserContentPath();
+		if (!userContentPath.empty()) {
+			fullPath = fs::CombinePath(userContentPath, path);
+			if (fs::IsReadableFile(fullPath)) {
+				return fullPath;
+			}
+		}
+
+		fullPath = fs::CombinePath(GetContentPath(), path);
+		if (fs::IsReadableFile(fullPath)) {
+			return fullPath;
+		}
+
+		fullPath = fs::CombinePath(GetCachePath(), path);
+		if (fs::IsReadableFile(fullPath)) {
+			return fullPath;
+		}
+
+		return {};
+	}
+
+	StringView ContentResolver::GetCachePath() const
+	{
+#if defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_UNIX) || defined(DEATH_TARGET_WINDOWS_RT)
+		return _cachePath;
+#elif defined(DEATH_TARGET_SWITCH)
+		// Switch has some issues with UTF-8 characters, so use "Jazz2" instead
+		return "sdmc:/Games/Jazz2/Cache/"_s;
+#elif defined(DEATH_TARGET_N64)
+		// Read-only like the content path - the cache is prebaked into the DragonFS image
+		return "rom:/Cache/"_s;
+#elif defined(DEATH_TARGET_WII)
+		return "sd:/apps/Jazz2/Cache/"_s;
+#elif defined(DEATH_TARGET_GAMECUBE)
+		// Read-only on the disc, writable on an SD card
+		return (_cachePath.empty() ? "carda:/Jazz2/Cache/"_s : StringView(_cachePath));
+#elif defined(DEATH_TARGET_3DS)
+		return "sdmc:/3ds/Jazz2/Cache/"_s;
+#elif defined(DEATH_TARGET_DREAMCAST)
+		return "/cd/Cache/"_s;
+#elif defined(DEATH_TARGET_PS2)
+		// Read-only on a disc, writable when the game runs from an SD card
+		return (_cachePath.empty() ? "cdfs:/Cache/"_s : StringView(_cachePath));
+#elif defined(DEATH_TARGET_PS3)
+		// Unlike the read-only trees the other consoles ship, the PS3 has a writable hard disk, so the cache
+		// goes to the title's own game-data directory rather than next to the (read-only) package content.
+		// "/dev_hdd0/game/<APPID>/USRDIR" is the one location a title may write to without a save-data API,
+		// so unlike the content path this one cannot avoid naming the ID - the build passes it in, because
+		// a copy that disagreed with the package would send the cache to a directory no title owns.
+		return "/dev_hdd0/game/" PS3_APPID "/USRDIR/Cache/"_s;
+#elif defined(DEATH_TARGET_PSP)
+		return "ms0:/PSP/GAME/Jazz2/Cache/"_s;
+#elif defined(DEATH_TARGET_VITA)
+		return "ux0:/data/jazz2/Cache/"_s;
+#elif defined(DEATH_TARGET_WINDOWS)
+		return "Cache\\"_s;
+#else
+		return "Cache/"_s;
+#endif
+	}
+
+	StringView ContentResolver::GetSourcePath() const
+	{
+#if defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_UNIX) || defined(DEATH_TARGET_WINDOWS_RT)
+		return _sourcePath;
+#elif defined(DEATH_TARGET_SWITCH)
+		// Switch has some issues with UTF-8 characters, so use "Jazz2" instead
+		return "sdmc:/Games/Jazz2/Source/"_s;
+#elif defined(DEATH_TARGET_N64)
+		return "rom:/Source/"_s;
+#elif defined(DEATH_TARGET_WII)
+		return "sd:/apps/Jazz2/Source/"_s;
+#elif defined(DEATH_TARGET_GAMECUBE)
+		return (_sourcePath.empty() ? "carda:/Jazz2/Source/"_s : StringView(_sourcePath));
+#elif defined(DEATH_TARGET_3DS)
+		return "sdmc:/3ds/Jazz2/Source/"_s;
+#elif defined(DEATH_TARGET_DREAMCAST)
+		return "/cd/Source/"_s;
+#elif defined(DEATH_TARGET_PS2)
+		return (_sourcePath.empty() ? "cdfs:/Source/"_s : StringView(_sourcePath));
+#elif defined(DEATH_TARGET_PS3)
+		return "/app_home/Source/"_s;
+#elif defined(DEATH_TARGET_PSP)
+		return "ms0:/PSP/GAME/Jazz2/Source/"_s;
+#elif defined(DEATH_TARGET_VITA)
+		return "ux0:/data/jazz2/Source/"_s;
+#elif defined(DEATH_TARGET_WINDOWS)
+		return "Source\\"_s;
+#else
+		return "Source/"_s;
+#endif
+	}
+
+	bool ContentResolver::IsHeadless() const
+	{
+		return _isHeadless;
+	}
+
+	void ContentResolver::SetHeadless(bool value)
+	{
+		_isHeadless = value;
+	}
+
+	bool ContentResolver::IsContentPrebaked() const
+	{
+		return _isContentPrebaked;
+	}
+
+#if defined(WITH_LIBRETRO)
+	void ContentResolver::OverridePaths(StringView contentPath, StringView sourcePath, StringView cachePath)
+	{
+		_contentPath = contentPath;
+		_sourcePath = sourcePath;
+		_cachePath = cachePath;
+		DetectPrebakedContent();
+		DetectUserContent();
+		// The constructor already mounted .paks from the default paths, remount from the new ones
+		RemountPaks();
+	}
+#endif
+
+	void ContentResolver::InitializePaths()
+	{
+#if defined(DEATH_TARGET_ANDROID)
+		// If `MANAGE_EXTERNAL_STORAGE` permission is granted, try to use also alternative paths
+		if (Backends::AndroidJniWrap_Activity::hasExternalStoragePermission()) {
+			constexpr StringView ExternalPaths[] = {
+				"Games/Jazz² Resurrection/"_s,
+				"Games/Jazz2 Resurrection/"_s,
+				"Download/Jazz² Resurrection/"_s,
+				"Download/Jazz2 Resurrection/"_s
+			};
+
+			bool found = false;
+			String externalStorage = fs::GetExternalStorage();
+			for (std::size_t i = 0; i < arraySize(ExternalPaths); i++) {
+				String externalPath = fs::CombinePath(externalStorage, ExternalPaths[i]);
+				_sourcePath = fs::CombinePath(externalPath, "Source/"_s);
+				if (fs::DirectoryExists(_sourcePath)) {
+					_cachePath = fs::CombinePath(externalPath, "Cache/"_s);
+					found = true;
+					break;
+				}
+			}
+
+			if (!found) {
+				String deviceBrand = Backends::AndroidJniClass_Version::deviceBrand();
+				String deviceModel = Backends::AndroidJniClass_Version::deviceModel();
+				if (deviceBrand == "Windows"_s && deviceModel == "Subsystem for Android(TM)"_s) {
+					// Set special paths if Windows Subsystem for Android™ is used
+					String externalStorageWindows = fs::CombinePath(externalStorage, "Windows/Saved Games/"_s);
+					if (fs::DirectoryExists(externalStorageWindows)) {
+						if (fs::DirectoryExists(fs::CombinePath(externalStorageWindows, "Jazz2 Resurrection/Source/"_s)) &&
+							!fs::DirectoryExists(fs::CombinePath(externalStorageWindows, "Jazz² Resurrection/Source/"_s))) {
+							_sourcePath = fs::CombinePath(externalStorageWindows, "Jazz2 Resurrection/Source/"_s);
+							_cachePath = fs::CombinePath(externalStorageWindows, "Jazz2 Resurrection/Cache/"_s);
+						} else {
+							_sourcePath = fs::CombinePath(externalStorageWindows, "Jazz² Resurrection/Source/"_s);
+							_cachePath = fs::CombinePath(externalStorageWindows, "Jazz² Resurrection/Cache/"_s);
+						}
+						found = true;
+					}
+				}
+
+				if (!found) {
+					String externalPath = fs::CombinePath(externalStorage, ExternalPaths[0]);
+					_sourcePath = fs::CombinePath(externalPath, "Source/"_s);
+					_cachePath = fs::CombinePath(externalPath, "Cache/"_s);
+				}
+			}
+		} else {
+			StringView dataPath = AndroidAssetStream::GetExternalDataPath();
+			_sourcePath = fs::CombinePath(dataPath, "Source/"_s);
+			_cachePath = fs::CombinePath(dataPath, "Cache/"_s);
+		}
+#elif defined(DEATH_TARGET_IOS)
+		// The application bundle is flat (no "Contents/Resources" as on macOS), so the content the build copied into
+		// it sits next to the executable. The original game files go to the app's "Documents" directory, the one
+		// place the user can reach: the Info.plist exposes it in the Files app (and in Finder/iTunes) through
+		// UIFileSharingEnabled, so "Source" is where the files are copied to, and the log is written next to it (see
+		// PreferencesCache). The cache is regenerable and large, so it goes to "Library/Caches", which iCloud backups
+		// skip and the system may purge under storage pressure - it is rebuilt on the next start then.
+		String executablePath = fs::GetExecutablePath();
+		_contentPath = fs::CombinePath(fs::GetDirectoryName(executablePath), "Content/"_s);
+		StringView home = ::getenv("HOME");
+		_sourcePath = fs::CombinePath({ home, "Documents"_s, "Source/"_s });
+		_cachePath = fs::CombinePath({ home, "Library/Caches"_s, "Cache/"_s });
+#elif defined(DEATH_TARGET_APPLE)
+		// Returns local application data directory on Apple
+		const String& appData = fs::GetSavePath("Jazz² Resurrection"_s);
+		_sourcePath = fs::CombinePath(appData, "Source/"_s);
+		_cachePath = fs::CombinePath(appData, "Cache/"_s);
+#elif defined(DEATH_TARGET_UNIX)
+#	if defined(NCINE_PACKAGED_CONTENT_PATH)
+		_contentPath = "Content/"_s;
+#	elif defined(NCINE_OVERRIDE_CONTENT_PATH)
+		_contentPath = NCINE_OVERRIDE_CONTENT_PATH;
+#	else
+		_contentPath = NCINE_INSTALL_PREFIX "/share/" NCINE_LINUX_PACKAGE "/Content/";
+#	endif
+#	if defined(NCINE_PACKAGED_CONTENT_PATH)
+		// If Content is packaged with binaries, prefer a local Source/ for portable use and
+		// fall back to standard XDG paths otherwise.
+		// AppRun cds into the AppImage mount point before launching, so CWD is useless —
+		// use dirname($APPIMAGE) to resolve paths relative to the .AppImage file itself.
+		String localBase;
+		StringView appImageEnv = ::getenv("APPIMAGE");
+		if (!appImageEnv.empty()) {
+			localBase = fs::GetDirectoryName(appImageEnv);
+		}
+
+		String localSourcePath = fs::CombinePath(localBase, "Source/"_s);
+		if (fs::FindPathCaseInsensitive(fs::CombinePath(localSourcePath, "Anims.j2a"_s)) ||
+			fs::FindPathCaseInsensitive(fs::CombinePath(localSourcePath, "AnimsSw.j2a"_s))) {
+			_sourcePath = std::move(localSourcePath);
+			_cachePath = fs::CombinePath(localBase, "Cache/"_s);
+		} else {
+			auto localStorage = fs::GetLocalStorage();
+			if (!localStorage.empty()) {
+				auto appData = fs::CombinePath(localStorage, NCINE_LINUX_PACKAGE);
+				_sourcePath = fs::CombinePath(appData, "Source/"_s);
+				_cachePath = fs::CombinePath(appData, "Cache/"_s);
+			} else {
+				_sourcePath = "Source/"_s;
+				_cachePath = "Cache/"_s;
+			}
+		}
+#	else
+		// The portable build and the DEB/RPM ship the very same executable, so the layout has to be told apart at run
+		// time: a `Content` directory next to it means an extracted portable copy, an installed package lives in
+		// "<prefix>/bin" and has none. Must be tested first, or a portable copy would use installed content instead.
+		String executablePath = fs::GetExecutablePath();
+		StringView localBase = fs::GetDirectoryName(executablePath);
+		String localContentPath = fs::CombinePath(localBase, "Content/"_s);
+		if (fs::DirectoryExists(localContentPath)) {
+			_contentPath = std::move(localContentPath);
+			_sourcePath = fs::CombinePath(localBase, "Source/"_s);
+			_cachePath = fs::CombinePath(localBase, "Cache/"_s);
+		} else if (fs::DirectoryExists(_contentPath)) {
+			// Shared Content exists, try to use standard XDG paths
+			auto localStorage = fs::GetLocalStorage();
+			if (!localStorage.empty()) {
+				// Use "$XDG_DATA_HOME/Jazz² Resurrection/" if exists (for backward compatibility), otherwise "$XDG_DATA_HOME/{NCINE_LINUX_PACKAGE}/"
+				_cachePath = fs::CombinePath(localStorage, "Jazz² Resurrection/Cache/"_s);
+				if (!fs::DirectoryExists(_cachePath)) {
+					auto appData = fs::CombinePath(localStorage, NCINE_LINUX_PACKAGE);
+					_cachePath = fs::CombinePath(appData, "Cache/"_s);
+				}
+			} else {
+				_cachePath = "Cache/"_s;
+			}
+
+			// Prefer system-wide Source only if it exists and the local one doesn't exist
+			_sourcePath = fs::CombinePath(fs::GetDirectoryName(_cachePath), "Source/"_s);
+			if (!fs::FindPathCaseInsensitive(fs::CombinePath(_sourcePath, "Anims.j2a"_s)) &&
+				!fs::FindPathCaseInsensitive(fs::CombinePath(_sourcePath, "AnimsSw.j2a"_s))) {
+				auto systemWideSource = NCINE_INSTALL_PREFIX "/share/" NCINE_LINUX_PACKAGE "/Source/";
+				if (fs::FindPathCaseInsensitive(fs::CombinePath(systemWideSource, "Anims.j2a"_s)) ||
+					fs::FindPathCaseInsensitive(fs::CombinePath(systemWideSource, "AnimsSw.j2a"_s))) {
+					_sourcePath = systemWideSource;
+				}
+			}
+		} else {
+			// Fallback to relative paths
+			_contentPath = "Content/"_s;
+			_sourcePath = "Source/"_s;
+			_cachePath = "Cache/"_s;
+		}
+#	endif
+#elif defined(DEATH_TARGET_WINDOWS_RT)
+		bool found = false;
+		if (Environment::CurrentDeviceType == DeviceType::Xbox) {
+			// Try to use external drives (D:, E:, F:) on Xbox, "\\?\" path prefix is required on Xbox
+			String PathTemplate1 = "\\\\?\\X:\\Games\\Jazz² Resurrection\\"_s;
+			String PathTemplate2 = "\\\\?\\X:\\Games\\Jazz2 Resurrection\\"_s;
+
+			for (char letter = 'D'; letter <= 'G'; letter++) {
+				PathTemplate1[4] = letter;
+				_sourcePath = fs::CombinePath(PathTemplate1, "Source\\"_s);
+				if (fs::DirectoryExists(_sourcePath)) {
+					_cachePath = fs::CombinePath(PathTemplate1, "Cache\\"_s);
+					found = true;
+					break;
+				}
+
+				PathTemplate2[4] = letter;
+				_sourcePath = fs::CombinePath(PathTemplate2, "Source\\"_s);
+				if (fs::DirectoryExists(_sourcePath)) {
+					_cachePath = fs::CombinePath(PathTemplate2, "Cache\\"_s);
+					found = true;
+					break;
+				}
+			}
+		}
+
+		if (!found) {
+			// Returns local application data directory on Windows RT
+			const String& appData = fs::GetSavePath("Jazz² Resurrection"_s);
+			_sourcePath = fs::CombinePath(appData, "Source\\"_s);
+			_cachePath = fs::CombinePath(appData, "Cache\\"_s);
+		}
+		_contentPath = "Content\\"_s;
+#elif defined(WITH_PS2)
+		// The game boots either from a disc or from removable storage - a USB stick, or an SD card in an
+		// MX4SIO adapter - which is how most of these consoles are loaded today. The disc is preferred and
+		// settles the question outright: looking anywhere else costs IOP module loads and a wait on hardware
+		// that may not be there, so a disc build pays nothing at all for a path it is not taking - and never
+		// silently picks up a stale tree from a card somebody left in the adapter. To run from removable
+		// storage, run the executable from removable storage.
+		//
+		// Leaving the three members empty is what selects the "cdfs:/" literals in the accessors above.
+		if (!fs::DirectoryExists("cdfs:/Content"_s)) {
+			nCine::Backends::Ps2Storage::Initialize();
+
+			// A "Content" directory next to the executable wins, because that is where the person who
+			// copied it there will have put it. It is also the only layout that works wherever the
+			// executable happens to live: a loader reads it off a device of its own choosing into a
+			// directory of the user's choosing, and the fixed path below can only ever guess at both.
+			// (Through Ps2Storage, because fs::DirectoryExists() cannot see a directory on a FAT volume at
+			// all and would report every device as carrying nothing - see the note on that function. The
+			// boot directory is not necessarily one of those volumes, but its `fioDopen()` answers for a
+			// memory card as readily as for a mounted unit.)
+			StringView bootDirectory = nCine::Backends::Ps2Storage::GetBootDirectory();
+			if (!bootDirectory.empty()) {
+				String contentPath = bootDirectory + "Content/"_s;
+				if (nCine::Backends::Ps2Storage::DirectoryExists(contentPath)) {
+					_contentPath = std::move(contentPath);
+					_cachePath = bootDirectory + "Cache/"_s;
+					_sourcePath = bootDirectory + "Source/"_s;
+					// Unlike a disc, this is somewhere the game can write - the level cache has somewhere
+					// to live, and PreferencesCache saves here instead of on a memory card
+					_writablePath = bootDirectory;
+					LOGI("Reading content from \"{}\" (next to the executable), which is also writable", _writablePath);
+				}
+			}
+
+			// Otherwise the fixed layout on each mounted unit. Such a device is shared storage - the whole
+			// point of one is that it holds everything the console runs, next to a loader's own "APPS",
+			// "DVD" and "CFG" - so the game lives under "Games/Jazz2/" rather than at the root, where
+			// "Content", "Cache" and "Source" would collide with whatever else is there. That is also the
+			// layout it already uses on the other machine where it is a guest on shared storage (the
+			// Switch, see GetContentPath()). The units are walked in order because a card partitioned more
+			// than once mounts as more than one, and the game may be on any of them.
+			if (_contentPath.empty()) {
+				for (StringView device : nCine::Backends::Ps2Storage::GetMountedDevices()) {
+					String root = device + "Games/Jazz2/"_s;
+					String contentPath = root + "Content/"_s;
+					if (nCine::Backends::Ps2Storage::DirectoryExists(contentPath)) {
+						_contentPath = std::move(contentPath);
+						_cachePath = root + "Cache/"_s;
+						_sourcePath = root + "Source/"_s;
+						_writablePath = std::move(root);
+						LOGI("Reading content from \"{}\" (removable storage), which is also writable", _writablePath);
+						break;
+					}
+				}
+			}
+			if (_contentPath.empty()) {
+				LOGW("No \"Content\" directory next to the executable, none under \"Games/Jazz2\" on any "
+					"removable storage, and no disc carrying one either");
+			}
+		}
+#elif defined(WITH_OGC) && defined(DEATH_TARGET_GAMECUBE)
+		// The game runs from the disc made for it (see AssetPacker's DiscImage::CreateGameCubeImage()) or from an
+		// SD card - in an SD Gecko in a memory-card slot or an SD2SP2 adapter under the console - which is how
+		// most of these consoles start anything today. Unlike the PlayStation 2, asking for the disc costs
+		// nothing when the console booted from it: the drive is spun up and the disc authenticated, so its
+		// header is simply read, and without a disc that read fails at once. So the order follows what the
+		// person who started the game most likely meant:
+		//
+		// - a "Content" directory next to the executable, where a loader that started it from an SD card says
+		//   it is, because that is where whoever copied it there put the content;
+		// - the disc, if it is this game's - never a stale tree from a card somebody left in the adapter;
+		// - "Jazz2/Content" on each SD card, the layout the build stages ("sd/" in the build directory);
+		// - the disc again, this time resetting and spinning up the drive, which takes more than a second and
+		//   is only worth it to a console that booted from something else and has its content on the disc.
+		//
+		// The disc is read-only, so a game read from it saves to a memory card (see PreferencesCache); an SD
+		// card is also where the settings go, and the level cache, as on the Wii.
+		{
+			using namespace nCine::Backends;
+
+			auto useWritableRoot = [this](StringView root, const char* where) {
+				_contentPath = root + "Content/"_s;
+				_cachePath = root + "Cache/"_s;
+				_sourcePath = root + "Source/"_s;
+				_writablePath = root;
+				LOGI("Reading content from \"{}\" ({}), which is also writable", _writablePath, where);
+			};
+			auto useDisc = [this]() {
+				if (!fs::DirectoryExists("dvd:/Content"_s)) {
+					LOGW("The disc carries no \"Content\" directory");
+					return false;
+				}
+				_contentPath = "dvd:/Content/"_s;
+				_cachePath = "dvd:/Cache/"_s;
+				_sourcePath = "dvd:/Source/"_s;
+				LOGI("Reading content from the disc");
+				return true;
+			};
+
+			StringView bootDirectory = OgcStorage::GetBootDirectory();
+			if (!bootDirectory.empty() && fs::DirectoryExists(String(bootDirectory + "Content"_s))) {
+				useWritableRoot(bootDirectory, "next to the executable");
+			}
+			if (_contentPath.empty() && OgcDvd::Mount(OgcStorage::GetGameId(), false)) {
+				useDisc();
+			}
+			if (_contentPath.empty()) {
+				for (StringView device : OgcStorage::GetMountedDevices()) {
+					String root = device + "Jazz2/"_s;
+					if (fs::DirectoryExists(String(root + "Content"_s))) {
+						useWritableRoot(root, "SD card");
+						break;
+					}
+				}
+			}
+			if (_contentPath.empty() && OgcDvd::Mount(OgcStorage::GetGameId(), true)) {
+				useDisc();
+			}
+			if (_contentPath.empty()) {
+				// The boot console is still on the screen, the renderer does not exist yet
+				OgcStorage::HaltWithMessage("  Cannot find the game files!\n\n"
+					"  Insert the game disc, or an SD card with the \"Jazz2\" folder\n"
+					"  into an SD Gecko or an SD2SP2 adapter.");
+			}
+		}
+#endif
+
+		DetectPrebakedContent();
+		DetectUserContent();
+
+		RemountPaks();
+	}
+
+	void ContentResolver::DetectPrebakedContent()
+	{
+		// The package of a prepared tree is named differently from the one the first-run conversion writes
+		// into `Cache` precisely so the two can be told apart --- see `AssetConverter::PrebakedPackage`
+		_isContentPrebaked = fs::FileExists(fs::CombinePath(GetContentPath(), Compatibility::AssetConverter::PrebakedPackage));
+		if (_isContentPrebaked) {
+			LOGI("Content in \"{}\" was prepared ahead of time", GetContentPath());
+		}
+	}
+
+	String ContentResolver::GetUserContentCandidate() const
+	{
+#if defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_UNIX) || defined(DEATH_TARGET_WINDOWS_RT) || \
+		defined(DEATH_TARGET_SWITCH) || defined(DEATH_TARGET_VITA)
+		// "Content" is packed inside the application on these platforms (APK assets, app bundle, AppImage mount, system
+		// prefix, UWP package, RomFS, VPK), so nothing can be added to it or replaced in it. The directory with "Cache"
+		// is the one place the user can always reach, so custom content goes to "Content" next to it, which then has
+		// priority over everything. Except on iOS, where "Cache" is in "Library/Caches", and "Documents" with "Source"
+		// is what the Files app exposes instead.
+#	if defined(DEATH_TARGET_IOS)
+		StringView userBase = fs::GetDirectoryName(GetSourcePath());
+#	else
+		StringView userBase = fs::GetDirectoryName(GetCachePath());
+#	endif
+#	if defined(DEATH_TARGET_WINDOWS_RT)
+		String userContentPath = fs::CombinePath(userBase, "Content\\"_s);
+#	else
+		String userContentPath = fs::CombinePath(userBase, "Content/"_s);
+#	endif
+		// A portable Linux copy (or relative fallback paths) already has "Content" next to "Cache", so it's the same one
+		if (userContentPath != GetContentPath()) {
+			return userContentPath;
+		}
+#endif
+		return {};
+	}
+
+	void ContentResolver::DetectUserContent()
+	{
+#if defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_UNIX) || defined(DEATH_TARGET_WINDOWS_RT) || \
+		defined(DEATH_TARGET_SWITCH) || defined(DEATH_TARGET_VITA)
+		String userContentPath = GetUserContentCandidate();
+		if (!userContentPath.empty() && fs::DirectoryExists(userContentPath)) {
+			LOGI("Using also user content from \"{}\"", userContentPath);
+			_userContentPath = Death::move(userContentPath);
+		} else {
+			_userContentPath = {};
+		}
+#endif
+	}
+
+	StringView ContentResolver::GetWritableContentPath(bool create)
+	{
+#if defined(DEATH_TARGET_EMSCRIPTEN)
+		// The file system of the web is gone with the page, a file is downloaded instead
+		static_cast<void>(create);
+		return {};
+#else
+#	if defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_UNIX) || defined(DEATH_TARGET_WINDOWS_RT) || \
+		defined(DEATH_TARGET_SWITCH) || defined(DEATH_TARGET_VITA)
+		if (!_userContentPath.empty()) {
+			return _userContentPath;
+		}
+		String userContentPath = GetUserContentCandidate();
+		if (create && !userContentPath.empty() && fs::CreateDirectories(userContentPath)) {
+			LOGI("Created user content directory \"{}\"", userContentPath);
+			_userContentPath = Death::move(userContentPath);
+			// Packages in it are now searched first as well
+			RemountPaks();
+			return _userContentPath;
+		}
+#	else
+		static_cast<void>(create);
+#	endif
+		// Where it's not part of the application package, the content itself can be written to, in a portable copy
+		StringView contentPath = GetContentPath();
+		if (fs::IsWritable(contentPath)) {
+			return contentPath;
+		}
+		return {};
+#endif
+	}
+
+	void ContentResolver::RemountPaks()
+	{
+		// Unload all already loaded .paks
+		_mountedPaks.clear();
+
+		// Load all .paks from user `Content`, `Content` and `Cache` directory, in order of priority
+		auto mountPaksIn = [this](StringView path) {
+			for (auto item : fs::Directory(path, fs::EnumerationOptions::SkipDirectories)) {
+				auto extension = fs::GetExtension(item);
+				if (extension != "pak"_s) {
+					continue;
+				}
+
+				auto& pak = _mountedPaks.emplace_back(std::make_unique<PakFile>(item));
+				if (pak->IsValid()) {
+					LOGI("File \"{}\" mounted successfully", item);
+				} else {
+					LOGE("Failed to mount file \"{}\"", item);
+					_mountedPaks.pop_back();
+				}
+			}
+		};
+
+		StringView userContentPath = GetUserContentPath();
+		if (!userContentPath.empty()) {
+			mountPaksIn(userContentPath);
+		}
+		_userPakCount = _mountedPaks.size();
+		mountPaksIn(GetContentPath());
+		mountPaksIn(GetCachePath());
+	}
+
+	std::unique_ptr<Stream> ContentResolver::OpenContentFile(StringView path, std::int32_t bufferSize)
+	{
+		// The user Content directory (its .paks, then its files) has priority over everything, so it can replace
+		// any shipped file. Then the remaining .paks are searched, then Content directory and Cache directory.
+		auto openFromPaks = [&](std::size_t from, std::size_t to) -> std::unique_ptr<Stream> {
+			for (std::size_t i = from; i < to; i++) {
+				auto mountPoint = _mountedPaks[i]->GetMountPoint();
+				if (path.hasPrefix(mountPoint)) {
+					auto packedFile = _mountedPaks[i]->OpenFile(path.exceptPrefix(mountPoint.size()), bufferSize);
+					if (packedFile != nullptr && packedFile->IsValid()) {
+						return packedFile;
+					}
+				}
+			}
+			return nullptr;
+		};
+
+		if (auto packedFile = openFromPaks(0, _userPakCount)) {
+			return packedFile;
+		}
+
+		String fullPath;
+		StringView userContentPath = GetUserContentPath();
+		if (!userContentPath.empty()) {
+			fullPath = fs::CombinePath(userContentPath, path);
+			if (fs::IsReadableFile(fullPath)) {
+				auto realFile = fs::Open(fullPath, FileAccess::Read, bufferSize);
+				if (realFile->IsValid()) {
+					return realFile;
+				}
+			}
+		}
+
+		if (auto packedFile = openFromPaks(_userPakCount, _mountedPaks.size())) {
+			return packedFile;
+		}
+
+		fullPath = fs::CombinePath(GetContentPath(), path);
+		if (fs::IsReadableFile(fullPath)) {
+			auto realFile = fs::Open(fullPath, FileAccess::Read, bufferSize);
+			if (realFile->IsValid()) {
+				return realFile;
+			}
+		}
+
+		fullPath = fs::CombinePath(GetCachePath(), path);
+		return fs::Open(fullPath, FileAccess::Read, bufferSize);
+	}
+
+	std::unique_ptr<Stream> ContentResolver::OpenSourceFile(StringView path, std::int32_t bufferSize)
+	{
+		String fullPath = fs::FindPathCaseInsensitive(fs::CombinePath(GetSourcePath(), path));
+		return fs::Open(fullPath, FileAccess::Read, bufferSize);
+	}
+
+	void ContentResolver::BeginLoading()
+	{
+		_isLoading = true;
+
+#if defined(WITH_AUDIO)
+		// Loading blocks the thread that feeds the audio device on the platforms that have no mixer thread,
+		// for much longer than any of them queues ahead. Most devices have nothing to do about that and this
+		// is a no-op for them; the one that does is the PlayStation 2, whose sound module repeats its last
+		// buffer while it is starved instead of falling silent.
+		theServiceLocator().GetAudioDevice().beginBlockingOperation();
+#endif
+
+#if defined(WITH_AUDIO)
+		// Where the samples are read on demand they are also given up here: dropping the pointers means the
+		// marking below cannot keep them, so EndLoading() frees every sample that is not played again after
+		// this load. The paths stay, so anything still wanted is read back the first time it plays. Without
+		// this the set of resident samples only ever grows - a level that has been visited once keeps every
+		// sound it declared for the rest of the session.
+		if (DeferSounds) {
+			for (auto& resource : _cachedMetadata) {
+				for (auto& [key, sound] : resource.second->Sounds) {
+					sound.Buffers.clear();
+				}
+			}
+		}
+#endif
+
+		// Reset Referenced flag
+		for (auto& resource : _cachedMetadata) {
+			resource.second->Flags &= ~MetadataFlags::Referenced;
+		}
+		for (auto& resource : _cachedGraphics) {
+			resource.second->Flags &= ~GenericGraphicResourceFlags::Referenced;
+		}
+#if defined(WITH_AUDIO)
+		for (auto& resource : _cachedSounds) {
+			resource.second->Flags &= ~GenericSoundResourceFlags::Referenced;
+		}
+#endif
+	}
+
+	void ContentResolver::EndLoading()
+	{
+#if defined(DEATH_DEBUG) || defined(DEATH_TARGET_N64)
+		std::int32_t metadataKept = 0, metadataReleased = 0;
+		std::int32_t animationsKept = 0, animationsReleased = 0;
+		std::int32_t soundsKept = 0, soundsReleased = 0;
+#endif
+
+		// Pinned metadata stays with everything it uses, whatever was requested in the meantime (see PinMetadata())
+		for (auto& resource : _cachedMetadata) {
+			if ((resource.second->Flags & MetadataFlags::Pinned) == MetadataFlags::Pinned) {
+				MarkReferenced(*resource.second);
+			}
+		}
+
+		// Release unreferenced metadata
+		{
+			auto it = _cachedMetadata.begin();
+			while (it != _cachedMetadata.end()) {
+				if ((it->second->Flags & MetadataFlags::Referenced) != MetadataFlags::Referenced) {
+					it = _cachedMetadata.erase(it);
+#if defined(DEATH_DEBUG) || defined(DEATH_TARGET_N64)
+					metadataReleased++;
+#endif
+				} else {
+					++it;
+#if defined(DEATH_DEBUG) || defined(DEATH_TARGET_N64)
+					metadataKept++;
+#endif
+				}
+			}
+		}
+
+		// Released unreferenced graphics
+		{
+			auto it = _cachedGraphics.begin();
+			while (it != _cachedGraphics.end()) {
+				if ((it->second->Flags & GenericGraphicResourceFlags::Referenced) != GenericGraphicResourceFlags::Referenced) {
+					it = _cachedGraphics.erase(it);
+#if defined(DEATH_DEBUG) || defined(DEATH_TARGET_N64)
+					animationsReleased++;
+#endif
+				} else {
+					++it;
+#if defined(DEATH_DEBUG) || defined(DEATH_TARGET_N64)
+					animationsKept++;
+#endif
+				}
+			}
+		}
+
+#if defined(WITH_AUDIO)
+		// Released unreferenced sounds
+		{
+			auto it = _cachedSounds.begin();
+			while (it != _cachedSounds.end()) {
+				if ((it->second->Flags & GenericSoundResourceFlags::Referenced) != GenericSoundResourceFlags::Referenced) {
+					it = _cachedSounds.erase(it);
+#	if defined(DEATH_DEBUG) || defined(DEATH_TARGET_N64)
+					soundsReleased++;
+#	endif
+				} else {
+					++it;
+#	if defined(DEATH_DEBUG) || defined(DEATH_TARGET_N64)
+					soundsKept++;
+#	endif
+				}
+			}
+		}
+#endif
+
+#if defined(DEATH_DEBUG)
+		LOGW("Metadata: {}|{}, Animations: {}|{}, Sounds: {}|{}", metadataKept, metadataReleased,
+			animationsKept, animationsReleased, soundsKept, soundsReleased);
+#elif defined(DEATH_TARGET_N64)
+		// Every load boundary states what survived it and what the heap looks like afterwards: with 8 MB in
+		// total the resident set is the number that decides whether the next level fits, and a freeze with
+		// no diagnosis is this platform's worst failure mode
+		heap_stats_t stats;
+		sys_get_heap_stats(&stats);
+		LOGI("Load boundary: metadata {}|{}, animations {}|{}, sounds {}|{} (kept|released); heap {} bytes used, {} free, {} of them in holes",
+			metadataKept, metadataReleased, animationsKept, animationsReleased, soundsKept, soundsReleased,
+			stats.used, stats.free, stats.fragmented);
+#endif
+
+		_isLoading = false;
+
+#if defined(WITH_AUDIO)
+		theServiceLocator().GetAudioDevice().endBlockingOperation();
+#endif
+	}
+
+	void ContentResolver::MarkReferenced(Metadata& metadata)
+	{
+		metadata.Flags |= MetadataFlags::Referenced;
+
+		for (const auto& resource : metadata.Animations) {
+			// Deferred animations that were never looked up have nothing to mark yet, the ones that were
+			// must be marked, because the metadata keeps pointing at them for as long as it stays cached
+			if (resource.Base != nullptr) {
+				resource.Base->Flags |= GenericGraphicResourceFlags::Referenced;
+			}
+		}
+
+#if defined(WITH_AUDIO)
+		for (const auto& [key, resource] : metadata.Sounds) {
+			for (const auto& base : resource.Buffers) {
+				base->Flags |= GenericSoundResourceFlags::Referenced;
+			}
+		}
+#endif
+	}
+
+	void ContentResolver::PinMetadata(Metadata* metadata, bool pinned)
+	{
+		if (metadata == nullptr) {
+			return;
+		}
+		if (pinned) {
+			metadata->Flags |= MetadataFlags::Pinned;
+		} else {
+			metadata->Flags &= ~MetadataFlags::Pinned;
+		}
+	}
+
+	void ContentResolver::OverridePathHandler(Function<String(StringView)>&& callback)
+	{
+		_pathHandler = std::move(callback);
+	}
+
+	void ContentResolver::PreloadMetadataAsync(StringView path)
+	{
+		// TODO: Reimplement async preloading
+		RequestMetadata(path);
+	}
+
+	Metadata* ContentResolver::RequestMetadata(StringView path, bool forceIndexed)
+	{
+		auto pathNormalized = fs::ToNativeSeparators(path);
+		// Indexed metadata (animations loaded with keepIndexed for runtime recoloring) is cached under a separate
+		// key - "*" can't appear in a real path - so a baked load of the same path can't shadow the indexed variant
+		// the player needs (and vice versa). Without this, whichever variant loads first wins for everyone.
+		String cacheKey = (forceIndexed ? String(pathNormalized + "*"_s) : String(pathNormalized));
+		auto it = _cachedMetadata.find(cacheKey);
+		if (it != _cachedMetadata.end()) {
+			// Already loaded - Mark as referenced
+			MarkReferenced(*it->second);
+			return it->second.get();
+		}
+
+		// Try to load it
+		auto s = OpenContentFile(fs::CombinePath("Metadata"_s, String(pathNormalized + ".res"_s)));
+		auto fileSize = s->GetSize();
+		if (fileSize < 4 || fileSize > 64 * 1024 * 1024) {
+			// 64 MB file size limit
+			if (s->IsValid()) {
+				LOGE("Cannot load metadata \"{}\" with unexpected file size of {} bytes", path, fileSize);
+			}
+			return nullptr;
+		}
+
+		auto buffer = std::make_unique<char[]>(fileSize);
+		s->Read(buffer.get(), fileSize);
+
+		bool multipleAnimsNoStatesWarning = false;
+
+		std::unique_ptr<Metadata> metadata = std::make_unique<Metadata>();
+		metadata->Path = std::move(pathNormalized);
+		// The cache key references this string (the map key is a non-owning Reference), so it lives inside the value
+		metadata->CacheKey = std::move(cacheKey);
+		metadata->Flags |= MetadataFlags::Referenced;
+
+		Json::CharReaderBuilder builder;
+		auto reader = std::unique_ptr<Json::CharReader>(builder.newCharReader());
+		Json::Value doc; std::string errors;
+		if (reader->parse(buffer.get(), buffer.get() + fileSize, &doc, &errors)) {
+			metadata->BoundingBox = GetVector2iFromJson(doc["BoundingBox"], Vector2i(InvalidValue, InvalidValue));
+
+			// A file can declare all of its animations deferred at once, and any single entry can opt in or out
+			// of it (see the deferred animations section of `Metadata`)
+			// Whether a metadata's sheets are read now or the first time each animation is actually looked up.
+			// The content decides per file, except where there is not enough memory for the choice to be the
+			// content's: a Nintendo 64 has 8 MB of RDRAM in total, and one player's metadata alone describes
+			// enough animations to hold about 2 MB of sheets and collision masks resident - which, on top of
+			// the level's own tileset and layers, is what put the level load past the end of memory. Deferring
+			// everything there costs a sheet read from the cartridge the first time an animation is used (a PI
+			// DMA out of the ROM, not a seek on a disc) and keeps only what a level actually animates resident.
+#if defined(DEATH_TARGET_N64)
+			// The document's own "Deferred" key is deliberately NOT read here: a file declaring false would
+			// load its whole sheet set eagerly at parse time, and with exceptions disabled the allocation
+			// that does not fit aborts the process instead of degrading per animation
+			constexpr bool deferredByDefault = true;
+#else
+			bool deferredByDefault = false;
+			doc["Deferred"].get(deferredByDefault);
+#endif
+
+			const auto& animations = doc["Animations"];
+			if (animations.isObject()) {
+				std::size_t count = animations.getMemberCount();
+				metadata->Animations.reserve(count);
+				if (deferredByDefault) {
+					metadata->DeferredAnimations.reserve(count);
+				}
+
+				for (auto it = animations.begin(); it != animations.end(); ++it) {
+					// TODO: Keys are not used
+					std::string_view assetPath;
+					if ((*it)["Path"].get(assetPath) != Json::SUCCESS || assetPath.empty()) {
+						continue;
+					}
+
+					GraphicResource graphics;
+					graphics.LoopMode = AnimationLoopMode::Loop;
+
+					// Index all palette-based sprites (including UI) so they're recolored at draw time through the shared
+					// palette texture - no baking, palette changes stay cheap, and nothing goes stale. Pre-RGBA (true-
+					// color) graphics are kept as-is by the `palette != nullptr` guard inside RequestGraphics.
+					bool keepIndexed = true;
+
+					std::int64_t flags;
+					if ((*it)["Flags"].get(flags) == Json::SUCCESS) {
+						if ((flags & 0x01) == 0x01) {
+							graphics.LoopMode = AnimationLoopMode::Once;
+						}
+						/*if ((flags & 0x02) == 0x02) {
+							keepIndexed = true;
+						}*/
+					}
+
+					std::int64_t paletteOffset;
+					if ((*it)["PaletteOffset"].get(paletteOffset) != Json::SUCCESS || paletteOffset < 0) {
+						paletteOffset = 0;
+					}
+					// Remember the palette offset so the renderer/manual draws sample the right palette region for
+					// an indexed sprite (0 = default sprite palette; gems use the gem-gradient rows)
+					graphics.PaletteOffset = (std::uint16_t)paletteOffset;
+
+					std::int64_t frameOffset;
+					if ((*it)["FrameOffset"].get(frameOffset) != Json::SUCCESS) {
+						frameOffset = 0;
+					}
+					graphics.FrameOffset = (std::int32_t)frameOffset;
+
+					std::int64_t frameCount = 0;
+					bool hasFrameCount = ((*it)["FrameCount"].get(frameCount) == Json::SUCCESS);
+
+					// TODO: Use AnimDuration instead
+					double frameRate = 0;
+					bool hasAnimDuration = ((*it)["FrameRate"].get(frameRate) == Json::SUCCESS);
+					float animDuration = (hasAnimDuration && frameRate > 0 ? (1.0f / (float)frameRate) * 5.0f : -1.0f);
+
+					bool deferred = deferredByDefault;
+					(*it)["Deferred"].get(deferred);
+
+					// The index has to stay addressable by GraphicResource::DeferredIndex - a metadata that
+					// describes more animations than that just loads the rest the usual way
+					if (deferred && metadata->DeferredAnimations.size() >= GraphicResource::NotDeferred) {
+						deferred = false;
+					}
+
+					if (deferred) {
+						// Keep just the description; the sheet is read the first time the animation is looked up
+						graphics.DeferredIndex = (std::uint16_t)metadata->DeferredAnimations.size();
+						DeferredGraphicResource& deferredGraphics = metadata->DeferredAnimations.emplace_back();
+						deferredGraphics.Path = fs::ToNativeSeparators(assetPath);
+						deferredGraphics.AnimDuration = animDuration;
+						deferredGraphics.FrameCount = (std::int32_t)frameCount;
+						deferredGraphics.KeepIndexed = keepIndexed;
+						deferredGraphics.HasAnimDuration = hasAnimDuration;
+						deferredGraphics.HasFrameCount = hasFrameCount;
+
+						// The same rule as the eager branch below - the first sheet's frame size - but taken from
+						// the sheet's header alone, without decoding it. Left at InvalidValue, the box became
+						// UpdateHitbox(INT_MAX, INT_MAX): every actor whose metadata was deferred as a whole (all
+						// of them on the Nintendo 64) had a hitbox a billion pixels wide, so bullets collided
+						// with whatever solid object existed anywhere in the level and a player two tiles from
+						// a bird cage was "lifting" it, frozen in place.
+						if (metadata->BoundingBox == Vector2i(InvalidValue, InvalidValue)) {
+							auto cached = _cachedGraphics.find(Pair(String::nullTerminatedView(deferredGraphics.Path),
+								std::uint16_t(keepIndexed ? IndexedGraphicsCacheKey : paletteOffset)));
+							Vector2i frameDimensions;
+							if (cached != _cachedGraphics.end()) {
+								metadata->BoundingBox = GenericGraphicResource::GetDefaultBoundingBox(cached->second->FrameDimensions);
+							} else if (ReadAuraFrameDimensions(deferredGraphics.Path, frameDimensions)) {
+								metadata->BoundingBox = GenericGraphicResource::GetDefaultBoundingBox(frameDimensions);
+							}
+						}
+					} else {
+						graphics.Base = RequestGraphics(assetPath, (std::uint16_t)paletteOffset, keepIndexed);
+						if (graphics.Base == nullptr) {
+							continue;
+						}
+
+						graphics.AnimDuration = (hasAnimDuration ? animDuration : graphics.Base->AnimDuration);
+						graphics.FrameCount = (hasFrameCount ? (std::int32_t)frameCount : graphics.Base->FrameCount - graphics.FrameOffset);
+
+						// If no bounding box is provided, use the first sprite (a fully deferred metadata has no
+						// sprite to take it from, so it has to declare one explicitly)
+						if (metadata->BoundingBox == Vector2i(InvalidValue, InvalidValue)) {
+							metadata->BoundingBox = GenericGraphicResource::GetDefaultBoundingBox(graphics.Base->FrameDimensions);
+						}
+					}
+
+					const auto& states = (*it)["States"];
+					if (states.isArray()) {
+						for (const auto& stateItem : states) {
+							std::int64_t state;
+							if (stateItem.get(state) == Json::SUCCESS) {
+#if defined(DEATH_DEBUG)
+								// Additional checks only for Debug configuration
+								for (const auto& anim : metadata->Animations) {
+									if (anim.State == (AnimState)state) {
+										LOGW("Animation state {} defined twice in file \"{}\"", state, path);
+										break;
+									}
+								}
+#endif
+								graphics.State = (AnimState)state;
+								metadata->Animations.push_back(graphics);
+							}
+						}
+					} else if (count > 1) {
+						if (!multipleAnimsNoStatesWarning) {
+							multipleAnimsNoStatesWarning = true;
+							LOGW("Multiple animations defined but no states specified in file \"{}\"", path);
+						}
+					} else {
+						graphics.State = AnimState::Default;
+						metadata->Animations.push_back(graphics);
+					}
+				}
+
+				// Animation states must be sorted, so binary search can be used
+				nCine::sort(metadata->Animations.begin(), metadata->Animations.end());
+			}
+
+			const auto& sounds = doc["Sounds"];
+			if (sounds.isObject()) {
+				std::size_t count = sounds.getMemberCount();
+				metadata->Sounds.reserve(count);
+
+				for (auto it = sounds.begin(); it != sounds.end(); ++it) {
+					std::string_view key = it.memberName();
+					const auto& assetPaths = (*it)["Paths"];
+					if (key.empty() || !assetPaths.isArray() || assetPaths.empty()) {
+						continue;
+					}
+
+					SoundResource sound;
+#if defined(WITH_AUDIO)
+					// Don't load sounds in headless mode
+					if (!_isHeadless) {
+						for (auto assetPathItem : assetPaths) {
+							std::string_view assetPath;
+							if (assetPathItem.get(assetPath) == Json::SUCCESS && !assetPath.empty()) {
+								sound.Paths.push_back(fs::ToNativeSeparators(assetPath));
+							}
+						}
+						// A level describes far more sounds than it plays - one player's metadata alone lists
+						// over thirty - and every sample is resident for as long as the metadata is. Where sounds
+						// are deferred (see DeferSounds), only the paths are kept here and the samples are read
+						// the first time something plays them (see ResolveSound()).
+						if (!DeferSounds) {
+							ResolveSound(sound);
+						}
+					}
+#endif
+					metadata->Sounds.emplace(key, std::move(sound));
+				}
+			}
+		}
+
+		return _cachedMetadata.emplace(metadata->CacheKey, std::move(metadata)).first->second.get();
+	}
+
+	bool ContentResolver::ResolveSound(Resources::SoundResource& sound)
+	{
+#if defined(WITH_AUDIO)
+		if (!sound.Buffers.empty()) {
+			return true;
+		}
+		if (sound.Unavailable || sound.Paths.empty() || _isHeadless) {
+			return false;
+		}
+
+		for (const String& assetPath : sound.Paths) {
+			auto it = _cachedSounds.find(assetPath);
+			if (it != _cachedSounds.end()) {
+				// Already resident (another metadata resolved it) - taking a pointer costs nothing, so no
+				// headroom question arises, and the Referenced mark keeps EndLoading() from evicting
+				// samples that are still played
+				it->second->Flags |= GenericSoundResourceFlags::Referenced;
+				sound.Buffers.push_back(it->second.get());
+			} else {
+#	if defined(NCINE_HAS_NATIVE_AUDIO)
+				// The console plays only its own copy, which streams from the cartridge while it plays and holds
+				// nothing decoded (the prepared tree does not carry the originals at all)
+				String nativePath = GetNativeSoundPath(assetPath);
+				if (nativePath.empty()) {
+					continue;
+				}
+				auto resource = std::make_unique<GenericSoundResource>(nativePath);
+#	else
+				auto s = OpenContentFile(fs::CombinePath("Animations"_s, assetPath));
+				auto resource = std::make_unique<GenericSoundResource>(std::move(s), assetPath);
+#	endif
+				if (resource->Buffer.numSamples() <= 0) {
+					// The file was missing or could not be decoded (AudioBuffer already logged it).
+					// Keeping the dead resource cached would hold it for the rest of the level and
+					// pretend the sound is playable; dropping it here lets the empty-Buffers path
+					// below mark the sound Unavailable, so the read is not retried on every play.
+					continue;
+				}
+				auto res = _cachedSounds.emplace(assetPath, std::move(resource));
+				res.first->second->Flags |= GenericSoundResourceFlags::Referenced;
+				sound.Buffers.push_back(res.first->second.get());
+			}
+		}
+
+		if (sound.Buffers.empty()) {
+			// Nothing readable behind any of the paths, so don't come back on every play
+			sound.Unavailable = true;
+			return false;
+		}
+		return true;
+#else
+		static_cast<void>(sound);
+		return false;
+#endif
+	}
+
+	bool ContentResolver::ResolveAnimation(Metadata& metadata, GraphicResource& animation)
+	{
+		if (animation.DeferredIndex == GraphicResource::NotDeferred) {
+			// The entry was already resolved and its graphics couldn't be loaded, don't try again on every lookup
+			return false;
+		}
+
+		const DeferredGraphicResource& deferred = metadata.DeferredAnimations[animation.DeferredIndex];
+#if defined(DEATH_TARGET_N64)
+		if (!HasHeadroomToResolve("animation", deferred.Path)) {
+			// Deliberately leaves DeferredIndex alone, so it is retried once there is room again
+			return false;
+		}
+#endif
+		GenericGraphicResource* base = RequestGraphics(deferred.Path, animation.PaletteOffset, deferred.KeepIndexed);
+		if (base == nullptr) {
+			// An eagerly loaded entry would have been dropped during parsing, this is the deferred equivalent.
+			// Some assets are optional by design (e.g., the check for Lori's graphics), so this isn't an error.
+			LOGD("Cannot load animation \"{}\" of metadata \"{}\"", deferred.Path, metadata.Path);
+			animation.DeferredIndex = GraphicResource::NotDeferred;
+			return false;
+		}
+
+		// The description is intentionally kept, so the graphics can be released and loaded again later without
+		// having to reparse the metadata
+		animation.Base = base;
+		animation.AnimDuration = (deferred.HasAnimDuration ? deferred.AnimDuration : base->AnimDuration);
+		animation.FrameCount = (deferred.HasFrameCount ? deferred.FrameCount : base->FrameCount - animation.FrameOffset);
+		return true;
+	}
+
+	void ContentResolver::PreloadDeferredAnimations()
+	{
+#if defined(DEATH_TARGET_N64)
+		/*
+			A deferred sheet is read and decoded the first time an animation is used, in the middle of a
+			frame: 50-120 ms for a 256x256 or 256x512 sheet even with the in-memory decoder, a visible hitch.
+			The loading screen is where that time is free - but not for everything a metadata declares: the
+			player alone declares ~160 animations, and reading them all took a megabyte of a heap that has
+			about two to spare in a level, most of it for sheets the level never shows (the airboard, the
+			swimming set, ...). What is read here is the set the trace showed hitching in ordinary play, and
+			the largest sheets there are: the player's idle flavors, which trigger whenever the player just
+			stands still. Everything else stays deferred. The floor keeps a level that is already tight from
+			losing its working room to this.
+		*/
+		constexpr std::int32_t MinFreeHeapAfterPreload = 1800 * 1024;
+
+		std::int32_t preloaded = 0, skipped = 0;
+		for (auto& [key, metadata] : _cachedMetadata) {
+			if (!metadata->Path.hasPrefix("Interactive/Player"_s)) {
+				continue;
+			}
+			for (GraphicResource& animation : metadata->Animations) {
+				if (animation.Base != nullptr || animation.DeferredIndex == GraphicResource::NotDeferred) {
+					continue;
+				}
+				const DeferredGraphicResource& deferred = metadata->DeferredAnimations[animation.DeferredIndex];
+				// The idle flavors (the hitch), and the end-of-level animation: read at the very end of a
+				// level, when the heap is at its lowest and most fragmented, it is the one sheet whose
+				// absence is not a missing flourish but a player who vanishes without the exit animation
+				if (deferred.Path.find("idle_flavor"_s) == nullptr && deferred.Path.find("/eol."_s) == nullptr) {
+					continue;
+				}
+				heap_stats_t stats;
+				sys_get_heap_stats(&stats);
+				if (stats.free < MinFreeHeapAfterPreload) {
+					skipped++;
+					continue;
+				}
+				if (ResolveAnimation(*metadata, animation)) {
+					preloaded++;
+				}
+			}
+		}
+		if (preloaded > 0 || skipped > 0) {
+			heap_stats_t stats;
+			sys_get_heap_stats(&stats);
+			LOGI("Preloaded {} deferred animations ({} left deferred for room), {} bytes of heap free", preloaded, skipped, stats.free);
+		}
+#endif
+	}
+
+	GenericGraphicResource* ContentResolver::RequestGraphics(StringView path, std::uint16_t paletteOffset, bool keepIndexed)
+	{
+		// First resources are requested, reset _isLoading flag, because palette should be already applied
+		_isLoading = false;
+
+		// Indexed sprites don't bake a palette, so they're cached under a dedicated key (independent of paletteOffset)
+		std::uint16_t cacheKeyOffset = (keepIndexed ? IndexedGraphicsCacheKey : paletteOffset);
+
+		auto pathNormalized = fs::ToNativeSeparators(path);
+		auto it = _cachedGraphics.find(Pair(String::nullTerminatedView(pathNormalized), cacheKeyOffset));
+		if (it != _cachedGraphics.end()) {
+			// Already loaded - Mark as referenced
+			it->second->Flags |= GenericGraphicResourceFlags::Referenced;
+			return it->second.get();
+		}
+
+		if (fs::GetExtension(pathNormalized) == "aura"_s) {
+			return RequestGraphicsAura(pathNormalized, paletteOffset, keepIndexed);
+		}
+
+		auto s = OpenContentFile(fs::CombinePath("Animations"_s, String(pathNormalized + ".res"_s)));
+		auto fileSize = s->GetSize();
+		if (fileSize < 4 || fileSize > 64 * 1024 * 1024) {
+			// 64 MB file size limit, also if not found try to use cache
+			if (s->IsValid()) {
+				LOGE("Cannot load animation \"{}\" with unexpected file size of {} bytes", path, fileSize);
+			}
+			return nullptr;
+		}
+
+		auto buffer = std::make_unique<char[]>(fileSize);
+		s->Read(buffer.get(), fileSize);
+		s->Dispose();
+
+		Json::CharReaderBuilder builder;
+		auto reader = std::unique_ptr<Json::CharReader>(builder.newCharReader());
+		Json::Value doc; std::string errors;
+		if (reader->parse(buffer.get(), buffer.get() + fileSize, &doc, &errors)) {
+			// Try to load it
+			std::unique_ptr<GenericGraphicResource> graphics = std::make_unique<GenericGraphicResource>();
+			graphics->Flags |= GenericGraphicResourceFlags::Referenced;
+
+			String fullPath = fs::CombinePath("Animations"_s, pathNormalized);
+			std::unique_ptr<ITextureLoader> texLoader = ITextureLoader::createFromStream(OpenContentFile(fullPath), fullPath);
+			if (texLoader->hasLoaded()) {
+				auto texFormat = texLoader->texFormat().pixelFormat();
+				if (texFormat != PixelFormat::RGBA8 && texFormat != PixelFormat::RGB8) {
+					return nullptr;
+				}
+
+				std::int32_t w = texLoader->width();
+				std::int32_t h = texLoader->height();
+				std::uint8_t* pixels = (std::uint8_t*)texLoader->pixels();
+				const std::uint32_t* palette = _palettes + paletteOffset;
+				bool linearSampling = false;
+				bool needsMask = true;
+
+				std::int64_t flags;
+				if (doc["Flags"].get(flags) == Json::SUCCESS) {
+					// Palette already applied, keep as is
+					if ((flags & 0x01) != 0x01) {
+						palette = nullptr;
+						// TODO: Apply linear sampling only to these images
+						if ((flags & 0x02) == 0x02) {
+							linearSampling = true;
+						}
+					}
+					if ((flags & 0x08) == 0x08) {
+						needsMask = false;
+					}
+				}
+
+				// Keep the raw palette indices in the texture (red channel) instead of baking colors, so it can be
+				// recolored at draw time by the PaletteRemap shader. Only meaningful for actually-indexed sprites.
+				if (keepIndexed && palette != nullptr) {
+					palette = nullptr;
+					graphics->Flags |= GenericGraphicResourceFlags::Indexed;
+				}
+
+				if (needsMask) {
+					// One bit per pixel: collision only tests solidity against MaskAlphaThreshold
+					const std::int32_t maskBytes = (w * h + 7) / 8;
+					graphics->Mask = std::make_unique<std::uint8_t[]>(maskBytes);
+					std::memset(graphics->Mask.get(), 0, maskBytes);
+					for (std::int32_t i = 0; i < w * h; i++) {
+						if (pixels[(i * PixelSize) + 3] > MaskAlphaThreshold) {
+							graphics->Mask[i >> 3] |= std::uint8_t(1) << (i & 7);
+						}
+					}
+				}
+				if (palette != nullptr) {
+					for (std::uint32_t i = 0; i < w * h; i++) {
+						std::uint32_t srcIdx = i * PixelSize;
+						std::uint32_t color = palette[pixels[srcIdx]];
+						std::uint8_t alpha = pixels[srcIdx + 3];
+
+						std::uint8_t r = (color >> 0) & 0xFF;
+						std::uint8_t g = (color >> 8) & 0xFF;
+						std::uint8_t b = (color >> 16) & 0xFF;
+						std::uint8_t a = ((color >> 24) & 0xFF) * alpha / 255;
+
+						pixels[srcIdx + 0] = r;
+						pixels[srcIdx + 1] = g;
+						pixels[srcIdx + 2] = b;
+						pixels[srcIdx + 3] = a;
+					}
+				}
+
+				if (!_isHeadless) {
+					// Don't load textures in headless mode, only collision masks
+					if ((graphics->Flags & GenericGraphicResourceFlags::Indexed) == GenericGraphicResourceFlags::Indexed) {
+						bool paletteBaseTransparent = (((_palettes[paletteOffset] >> 24) & 0xFF) == 0);
+						graphics->TextureDiffuse = CreateIndexedTexture(fullPath.data(), pixels, w, h, PixelSize, paletteBaseTransparent);
+					} else {
+						graphics->TextureDiffuse = std::make_unique<Texture>(fullPath.data(), Texture::Format::RGBA8, w, h);
+						graphics->TextureDiffuse->LoadFromTexels(pixels, 0, 0, w, h);
+					}
+					graphics->TextureDiffuse->SetMinFiltering(linearSampling ? SamplerFilter::Linear : SamplerFilter::Nearest);
+					graphics->TextureDiffuse->SetMagFiltering(linearSampling ? SamplerFilter::Linear : SamplerFilter::Nearest);
+				}
+
+				double animDuration;
+				if (doc["Duration"].get(animDuration) != Json::SUCCESS) {
+					animDuration = 0.0;
+				}
+				graphics->AnimDuration = (float)animDuration;
+
+				std::int64_t frameCount;
+				if (doc["FrameCount"].get(frameCount) != Json::SUCCESS) {
+					frameCount = 0;
+				}
+				graphics->FrameCount = (std::int32_t)frameCount;
+
+				graphics->FrameDimensions = GetVector2iFromJson(doc["FrameSize"]);
+				graphics->FrameConfiguration = GetVector2iFromJson(doc["FrameConfiguration"]);
+				
+				graphics->Hotspot = GetVector2iFromJson(doc["Hotspot"]);
+				graphics->Coldspot = GetVector2iFromJson(doc["Coldspot"], Vector2i(InvalidValue, InvalidValue));
+				graphics->Gunspot = GetVector2iFromJson(doc["Gunspot"], Vector2i(InvalidValue, InvalidValue));
+
+#if defined(DEATH_DEBUG)
+				MigrateGraphics(pathNormalized);
+#endif
+				return _cachedGraphics.emplace(Pair(String(pathNormalized), cacheKeyOffset), std::move(graphics)).first->second.get();
+			}
+		}
+
+		return nullptr;
+	}
+
+	bool ContentResolver::ReadAuraFrameDimensions(StringView path, Vector2i& frameDimensions)
+	{
+		if (fs::GetExtension(path) != "aura"_s) {
+			return false;
+		}
+
+		// The first 26 bytes of the header RequestGraphicsAura() parses: signatures, version, flags,
+		// channel count and the frame size (the rest - frame layout, spots, the image - is not needed)
+		auto s = OpenContentFile(fs::CombinePath("Animations"_s, path));
+		if (!s->IsValid() || s->GetSize() < 26) {
+			return false;
+		}
+
+		std::uint64_t signature1 = s->ReadValueAsLE<std::uint64_t>();
+		std::uint32_t signature2 = s->ReadValueAsLE<std::uint16_t>();
+		std::uint8_t version = s->ReadValue<std::uint8_t>();
+		std::uint8_t flags = s->ReadValue<std::uint8_t>();
+		if (signature1 != 0xB8EF8498E2BFBBEF || signature2 != 0x208F || version != 2 || (flags & 0x80) != 0x80) {
+			return false;
+		}
+
+		s->ReadValue<std::uint8_t>();	// channelCount
+		std::uint32_t frameDimensionsX = s->ReadValueAsLE<std::uint32_t>();
+		std::uint32_t frameDimensionsY = s->ReadValueAsLE<std::uint32_t>();
+		frameDimensions = Vector2i(std::int32_t(frameDimensionsX), std::int32_t(frameDimensionsY));
+		return true;
+	}
+
+	GenericGraphicResource* ContentResolver::RequestGraphicsAura(StringView path, std::uint16_t paletteOffset, bool keepIndexed)
+	{
+		auto s = OpenContentFile(fs::CombinePath("Animations"_s, path));
+
+		auto fileSize = s->GetSize();
+		if (fileSize < 16 || fileSize > 64 * 1024 * 1024) {
+			// 64 MB file size limit, also if not found try to use cache
+			if (!s->IsValid()) {
+				// Said out loud on the consoles, whose content trees are prepared ahead of time: a sheet that
+				// is missing there shows as an animation that never appears, with nothing else to explain it
+				LOGW("Cannot load graphics \"{}\": File not found", path);
+			}
+			return nullptr;
+		}
+
+		std::uint64_t signature1 = s->ReadValueAsLE<std::uint64_t>();
+		std::uint32_t signature2 = s->ReadValueAsLE<std::uint16_t>();
+		std::uint8_t version = s->ReadValue<std::uint8_t>();
+		std::uint8_t flags = s->ReadValue<std::uint8_t>();
+
+		if (signature1 != 0xB8EF8498E2BFBBEF || signature2 != 0x208F || version != 2 || (flags & 0x80) != 0x80) {
+			LOGW("Cannot load graphics \"{}\": Invalid signature", path);
+			return nullptr;
+		}
+
+		std::uint8_t channelCount = s->ReadValue<std::uint8_t>();
+		std::uint32_t frameDimensionsX = s->ReadValueAsLE<std::uint32_t>();
+		std::uint32_t frameDimensionsY = s->ReadValueAsLE<std::uint32_t>();
+
+		std::uint8_t frameConfigurationX = s->ReadValue<std::uint8_t>();
+		std::uint8_t frameConfigurationY = s->ReadValue<std::uint8_t>();
+		std::uint16_t frameCount = s->ReadValueAsLE<std::uint16_t>();
+		std::uint16_t animDuration = s->ReadValueAsLE<std::uint16_t>();
+
+		std::uint16_t hotspotX = s->ReadValueAsLE<std::uint16_t>();
+		std::uint16_t hotspotY = s->ReadValueAsLE<std::uint16_t>();
+
+		std::uint16_t coldspotX = s->ReadValueAsLE<std::uint16_t>();
+		std::uint16_t coldspotY = s->ReadValueAsLE<std::uint16_t>();
+
+		std::uint16_t gunspotX = s->ReadValueAsLE<std::uint16_t>();
+		std::uint16_t gunspotY = s->ReadValueAsLE<std::uint16_t>();
+
+		// A tightly packed sheet lists where every frame sits instead of laying them out in a grid, so it
+		// carries its own size (see JJ2Anims::PackFramesTightly). The name has to stay qualified here, because
+		// <windows.h> declares a global FrameRect() and this file sees Jazz2::Resources through a using directive.
+		SmallVector<Resources::FrameRect, 0> frameRects;
+		std::uint32_t width, height;
+		if ((flags & 0x04) == 0x04) {
+			width = s->ReadValueAsLE<std::uint16_t>();
+			height = s->ReadValueAsLE<std::uint16_t>();
+
+			frameRects.reserve(frameCount);
+			for (std::uint32_t i = 0; i < frameCount; i++) {
+				Resources::FrameRect& rect = frameRects.emplace_back();
+				rect.X = s->ReadValueAsLE<std::uint16_t>();
+				rect.Y = s->ReadValueAsLE<std::uint16_t>();
+				rect.W = s->ReadValueAsLE<std::uint16_t>();
+				rect.H = s->ReadValueAsLE<std::uint16_t>();
+				rect.OffsetX = s->ReadValueAsLE<std::int16_t>();
+				rect.OffsetY = s->ReadValueAsLE<std::int16_t>();
+			}
+		} else {
+			width = frameDimensionsX * frameConfigurationX;
+			height = frameDimensionsY * frameConfigurationY;
+		}
+
+		// Baking the palette expands the image to RGBA in place, so that case needs the full 4 bytes/pixel;
+		// otherwise the decoded data stays packed to `channelCount` bytes/pixel and only the decoder's final
+		// (overlapping) 4-byte store runs past it, which the few bytes of slack cover. Sizing every sprite
+		// for 4 bytes/pixel meant allocating four times what an 8-bit sheet needs.
+		// Only a sprite that keeps its indices needs no expansion; everything else is either baked in place or
+		// uploaded as RGBA, both of which read the buffer as 4 bytes/pixel. The condition mirrors exactly the
+		// one that sets GenericGraphicResourceFlags::Indexed below.
+		const bool willStayIndexed = (keepIndexed && (flags & 0x01) != 0x01);
+		const std::uint32_t sourceStride = (willStayIndexed ? channelCount : PixelSize);
+		// A sheet is read in mid-level on the platforms that defer animations, when the heap is at its most
+		// fragmented, and a sheet is one contiguous block of up to a few hundred KB: this is the allocation
+		// that failed on the Nintendo 64 with 900 KB free but none of it in one piece. The failure has a
+		// recoverable answer - the animation stays missing, and the deferred entry retries when there is
+		// room - so it is asked for without the abort the throwing form ends in on a console
+		std::unique_ptr<std::uint8_t[]> pixels(new (std::nothrow) std::uint8_t[width * height * sourceStride + 3]);
+		if (pixels == nullptr) {
+			LOGE("Cannot load graphics \"{}\": Out of memory for a {}x{} sheet ({} bytes)", path, width, height,
+				width * height * sourceStride + 3);
+			return nullptr;
+		}
+
+		if (!ReadImageFromFile(s, pixels.get(), width, height, channelCount, true,
+				(flags & Compatibility::JJ2Anims::ImageContentLz4Flag) == Compatibility::JJ2Anims::ImageContentLz4Flag)) {
+			LOGE("Cannot load graphics \"{}\": The image content cannot be decoded", path);
+			return nullptr;
+		}
+
+		std::unique_ptr<GenericGraphicResource> graphics = std::make_unique<GenericGraphicResource>();
+		graphics->Flags |= GenericGraphicResourceFlags::Referenced;
+
+		const std::uint32_t* palette = _palettes + paletteOffset;
+		bool linearSampling = false;
+		bool needsMask = true;
+		if ((flags & 0x01) == 0x01) {
+			palette = nullptr;
+			linearSampling = true;
+		}
+		if ((flags & 0x02) == 0x02) {
+			needsMask = false;
+		}
+
+		// Keep the raw palette indices in the texture (red channel) instead of baking colors, so the sprite can be
+		// recolored at draw time by the PaletteRemap shader. Only meaningful for actually palette-based sprites.
+		if (keepIndexed && palette != nullptr) {
+			palette = nullptr;
+			graphics->Flags |= GenericGraphicResourceFlags::Indexed;
+		}
+
+		if (needsMask) {
+			// One bit per pixel: collision only tests solidity against MaskAlphaThreshold
+			const std::uint32_t maskBytes = (width * height + 7) / 8;
+			graphics->Mask = std::make_unique<std::uint8_t[]>(maskBytes);
+			std::memset(graphics->Mask.get(), 0, maskBytes);
+			// The decoded buffer is tightly packed to `channelCount` bytes/pixel: a 1-channel sprite is opaque
+			// except index 0 (transparent), a 2-channel sprite has explicit alpha in the 2nd byte, anything
+			// wider keeps alpha in the 4th byte. One loop per layout rather than a channel-count branch per
+			// pixel: this runs over a whole sheet in the middle of a frame when a deferred animation is used
+			std::uint8_t* DEATH_RESTRICT mask = graphics->Mask.get();
+			const std::uint32_t pixelCount = width * height;
+			if (channelCount == 1) {
+				for (std::uint32_t i = 0; i < pixelCount; i++) {
+					if (pixels[i] != 0) {
+						mask[i >> 3] |= std::uint8_t(1) << (i & 7);
+					}
+				}
+			} else {
+				const std::uint8_t* DEATH_RESTRICT alphaPtr = pixels.get() + (channelCount == 2 ? 1 : 3);
+				for (std::uint32_t i = 0; i < pixelCount; i++, alphaPtr += channelCount) {
+					if (*alphaPtr > MaskAlphaThreshold) {
+						mask[i >> 3] |= std::uint8_t(1) << (i & 7);
+					}
+				}
+			}
+		}
+		if (palette != nullptr) {
+			// Expanded from the back: the destination stride (RGBA) is never narrower than the decoded one, so
+			// working downwards guarantees a pixel is read before anything can be written over it. Reading at
+			// PixelSize regardless of `channelCount` used to be wrong for the packed 1- and 2-channel sheets,
+			// which took their indices (and alpha) from the wrong bytes.
+			for (std::uint32_t i = width * height; i-- > 0; ) {
+				const std::uint32_t srcIdx = i * channelCount;
+				const std::uint32_t dstIdx = i * PixelSize;
+				const std::uint32_t color = palette[pixels[srcIdx]];
+				std::uint8_t alpha;
+				if (channelCount == 1) {
+					// Index only: transparency comes from the palette entry itself
+					alpha = 255;
+				} else if (channelCount == 2) {
+					alpha = pixels[srcIdx + 1];
+				} else {
+					alpha = pixels[srcIdx + 3];
+				}
+
+				const std::uint8_t r = (color >> 0) & 0xFF;
+				const std::uint8_t g = (color >> 8) & 0xFF;
+				const std::uint8_t b = (color >> 16) & 0xFF;
+				const std::uint8_t a = ((color >> 24) & 0xFF) * alpha / 255;
+
+				pixels[dstIdx + 0] = r;
+				pixels[dstIdx + 1] = g;
+				pixels[dstIdx + 2] = b;
+				pixels[dstIdx + 3] = a;
+			}
+		}
+
+		if (!_isHeadless) {
+			// Don't load textures in headless mode, only collision masks
+			if ((graphics->Flags & GenericGraphicResourceFlags::Indexed) == GenericGraphicResourceFlags::Indexed) {
+				bool paletteBaseTransparent = (((_palettes[paletteOffset] >> 24) & 0xFF) == 0);
+				graphics->TextureDiffuse = CreateIndexedTexture(path.data(), pixels.get(), width, height, channelCount, paletteBaseTransparent);
+			} else {
+				graphics->TextureDiffuse = std::make_unique<Texture>(path.data(), Texture::Format::RGBA8, width, height);
+				graphics->TextureDiffuse->LoadFromTexels(pixels.get(), 0, 0, width, height);
+			}
+			graphics->TextureDiffuse->SetMinFiltering(linearSampling ? SamplerFilter::Linear : SamplerFilter::Nearest);
+			graphics->TextureDiffuse->SetMagFiltering(linearSampling ? SamplerFilter::Linear : SamplerFilter::Nearest);
+		}
+
+		// AnimDuration is multiplied by 256 before saving, so divide it here back
+		graphics->AnimDuration = animDuration / 256.0f;
+		graphics->FrameDimensions = Vector2i(frameDimensionsX, frameDimensionsY);
+		graphics->FrameConfiguration = Vector2i(frameConfigurationX, frameConfigurationY);
+		graphics->FrameCount = frameCount;
+		graphics->FrameRects = std::move(frameRects);
+		// The collision mask covers the whole sheet, so its rows are as wide as the sheet
+		graphics->MaskStride = (std::int32_t)width;
+
+		if (hotspotX != UINT16_MAX || hotspotY != UINT16_MAX) {
+			graphics->Hotspot = Vector2i(hotspotX, hotspotY);
+		} else {
+			graphics->Hotspot = Vector2i();
+		}
+
+		if (coldspotX != UINT16_MAX || coldspotY != UINT16_MAX) {
+			graphics->Coldspot = Vector2i(coldspotX, coldspotY);
+		} else {
+			graphics->Coldspot = Vector2i(InvalidValue, InvalidValue);
+		}
+
+		if (gunspotX != UINT16_MAX || gunspotY != UINT16_MAX) {
+			graphics->Gunspot = Vector2i(gunspotX, gunspotY);
+		} else {
+			graphics->Gunspot = Vector2i(InvalidValue, InvalidValue);
+		}
+
+		// Indexed sprites are cached under a dedicated key (matching the lookup in RequestGraphics) so they don't
+		// collide with the baked variant of the same sprite
+		std::uint16_t cacheKeyOffset = (keepIndexed ? IndexedGraphicsCacheKey : paletteOffset);
+		return _cachedGraphics.emplace(Pair(String(path), cacheKeyOffset), std::move(graphics)).first->second.get();
+	}
+
+	bool ContentResolver::ReadImageFromFile(std::unique_ptr<Stream>& s, std::uint8_t* data, std::int32_t width, std::int32_t height,
+		std::int32_t channelCount, bool contentEndsStream, bool lz4)
+	{
+		if (lz4) {
+			// One LZ4 block of the raw pixels, see JJ2Anims::WriteImageContentLz4() - its size comes first, so
+			// it is read exactly, whatever follows it
+#if defined(WITH_LZ4)
+			return Compatibility::JJ2Anims::ReadImageContentLz4(*s, data, width * height * channelCount);
+#else
+			LOGE("The image content is LZ4, which this build does not support");
+			return false;
+#endif
+		}
+
+		// When the image content runs to the end of the file, it is read into memory in one go and decoded
+		// from there: the decoder works a byte at a time, and a byte through the stream is a virtual call
+		// (through a buffer, but a call all the same) where a byte from memory is a load. A sheet of a few
+		// hundred thousand pixels took hundreds of milliseconds through the stream on the Nintendo 64, in
+		// the middle of a frame when a deferred animation was first used. Falls back to the stream when
+		// the copy cannot be placed - a level in progress may not have the contiguous room.
+		//
+		// The encoded length of the image is not known in advance, so the copy runs to the end of the stream
+		// and the surplus cannot be given back - a compressed stream out of a .pak cannot seek backwards at
+		// all. So when something follows the image it is decoded through the stream instead, which is the
+		// only way to leave the position exactly at its end. That surplus silently cost the episode
+		// background images, which are read right after the title one.
+		if (contentEndsStream) {
+			const std::int64_t remaining = s->GetSize() - s->GetPosition();
+			if (remaining > 0 && remaining <= 2 * 1024 * 1024) {
+				std::unique_ptr<std::uint8_t[]> content(new (std::nothrow) std::uint8_t[std::size_t(remaining)]);
+				if (content != nullptr && s->Read(content.get(), remaining) == remaining) {
+					Compatibility::JJ2Anims::ImageContentDecoder decoder;
+					const std::uint8_t* src = content.get();
+					decoder.Decode(src, content.get() + remaining, data, width * height, channelCount);
+					return true;
+				}
+			}
+		}
+		// The decoder lives next to the encoder that produced the file, so the two can't drift apart
+		Compatibility::JJ2Anims::ReadImageContent(*s, data, width, height, channelCount);
+		return true;
+	}
+
+	void ContentResolver::ExpandTileDiffuse(std::uint8_t* pixelsOffset, std::uint32_t widthWithPadding, std::uint32_t bytesPerPixel)
+	{
+		if constexpr (TileSet::TilePadding == 0) {
+			// The atlas has no border to fill on this platform, see TileSet::TilePadding
+			static_cast<void>(pixelsOffset); static_cast<void>(widthWithPadding); static_cast<void>(bytesPerPixel);
+			return;
+		}
+
+		// Top
+		for (std::uint32_t x = 0; x < TileSet::DefaultTileSize; x++) {
+			std::uint32_t from = (1 * widthWithPadding + (x + 1)) * bytesPerPixel;
+			std::uint32_t to = (0 * widthWithPadding + (x + 1)) * bytesPerPixel;
+			std::memcpy(&pixelsOffset[to], &pixelsOffset[from], bytesPerPixel);
+		}
+
+		// Bottom
+		for (std::uint32_t x = 0; x < TileSet::DefaultTileSize; x++) {
+			std::uint32_t from = (TileSet::DefaultTileSize * widthWithPadding + (x + 1)) * bytesPerPixel;
+			std::uint32_t to = ((TileSet::DefaultTileSize + 1) * widthWithPadding + (x + 1)) * bytesPerPixel;
+			std::memcpy(&pixelsOffset[to], &pixelsOffset[from], bytesPerPixel);
+		}
+
+		// Left
+		for (std::uint32_t y = 0; y < TileSet::DefaultTileSize; y++) {
+			std::uint32_t from = ((y + 1) * widthWithPadding + 1) * bytesPerPixel;
+			std::uint32_t to = ((y + 1) * widthWithPadding + 0) * bytesPerPixel;
+			std::memcpy(&pixelsOffset[to], &pixelsOffset[from], bytesPerPixel);
+		}
+
+		// Right
+		for (std::uint32_t y = 0; y < TileSet::DefaultTileSize; y++) {
+			std::uint32_t from = ((y + 1) * widthWithPadding + TileSet::DefaultTileSize) * bytesPerPixel;
+			std::uint32_t to = ((y + 1) * widthWithPadding + (TileSet::DefaultTileSize + 1)) * bytesPerPixel;
+			std::memcpy(&pixelsOffset[to], &pixelsOffset[from], bytesPerPixel);
+		}
+
+		// Corners (TL, TR, BL, BR)
+		{
+			std::uint32_t from = (0 * widthWithPadding + 1) * bytesPerPixel;
+			std::uint32_t to = (0 * widthWithPadding + 0) * bytesPerPixel;
+			std::memcpy(&pixelsOffset[to], &pixelsOffset[from], bytesPerPixel);
+		}
+		{
+			std::uint32_t from = (0 * widthWithPadding + TileSet::DefaultTileSize) * bytesPerPixel;
+			std::uint32_t to = (0 * widthWithPadding + (TileSet::DefaultTileSize + 1)) * bytesPerPixel;
+			std::memcpy(&pixelsOffset[to], &pixelsOffset[from], bytesPerPixel);
+		}
+		{
+			std::uint32_t from = ((TileSet::DefaultTileSize + 1) * widthWithPadding + 1) * bytesPerPixel;
+			std::uint32_t to = ((TileSet::DefaultTileSize + 1) * widthWithPadding + 0) * bytesPerPixel;
+			std::memcpy(&pixelsOffset[to], &pixelsOffset[from], bytesPerPixel);
+		}
+		{
+			std::uint32_t from = ((TileSet::DefaultTileSize + 1) * widthWithPadding + TileSet::DefaultTileSize) * bytesPerPixel;
+			std::uint32_t to = ((TileSet::DefaultTileSize + 1) * widthWithPadding + (TileSet::DefaultTileSize + 1)) * bytesPerPixel;
+			std::memcpy(&pixelsOffset[to], &pixelsOffset[from], bytesPerPixel);
+		}
+	}
+
+	std::unique_ptr<Texture> ContentResolver::CreateIndexedTexture(const char* name, const std::uint8_t* pixels, std::int32_t width, std::int32_t height, std::int32_t srcChannels, bool paletteBaseTransparent)
+	{
+		// `pixels` holds the palette index in the red (first) channel. The smallest lossless texture format is R8
+		// (index only) when transparency is on/off and reproducible by the palette base (entry 0 transparent), or
+		// RG8 (index + alpha sampled into .a via swizzle) when alpha is partial or the palette base is opaque (gems).
+		// 1/2-channel input is already pre-packed (by the asset converter) and uploads directly with no scan/repack.
+		std::int32_t count = width * height;
+		std::unique_ptr<Texture> texture;
+
+		if (srcChannels == 2) {
+			// Pre-packed (index, alpha) - upload directly as RG8
+			texture = std::make_unique<Texture>(name, Texture::Format::RG8, width, height);
+			texture->LoadFromTexels(pixels, 0, 0, width, height);
+			texture->SetSwizzle(SwizzleChannel::Red, SwizzleChannel::Green, SwizzleChannel::Blue, SwizzleChannel::Green);
+		} else if (srcChannels == 1) {
+			if (paletteBaseTransparent) {
+				// Pre-packed index only, transparency via palette entry 0 - upload directly as R8
+				texture = std::make_unique<Texture>(name, Texture::Format::R8, width, height);
+				texture->LoadFromTexels(pixels, 0, 0, width, height);
+			} else {
+				// Opaque palette base (e.g., gems): synthesize on/off alpha from the index so transparency survives
+				std::unique_ptr<std::uint8_t[]> packed = std::make_unique<std::uint8_t[]>(count * 2);
+				for (std::int32_t i = 0; i < count; i++) {
+					packed[(i * 2) + 0] = pixels[i];
+					packed[(i * 2) + 1] = (pixels[i] == 0 ? 0 : 255);
+				}
+				texture = std::make_unique<Texture>(name, Texture::Format::RG8, width, height);
+				texture->LoadFromTexels(packed.get(), 0, 0, width, height);
+				texture->SetSwizzle(SwizzleChannel::Red, SwizzleChannel::Green, SwizzleChannel::Blue, SwizzleChannel::Green);
+			}
+		} else {
+			// RGBA source that isn't pre-packed (a user-supplied PNG using the indexed pipeline). Pack (index, alpha)
+			// into RG8 in a single pass: always correct (fully-opaque sprites just waste the alpha byte) and never
+			// crashes on user content. Indexed tilesets don't reach this branch - RequestTileSet hands them over as a
+			// single index channel, so they take the R8 path above.
+			std::unique_ptr<std::uint8_t[]> packed = std::make_unique<std::uint8_t[]>(count * 2);
+			for (std::int32_t i = 0; i < count; i++) {
+				packed[(i * 2) + 0] = pixels[(i * srcChannels) + 0];
+				packed[(i * 2) + 1] = pixels[(i * srcChannels) + 3];
+			}
+			texture = std::make_unique<Texture>(name, Texture::Format::RG8, width, height);
+			texture->LoadFromTexels(packed.get(), 0, 0, width, height);
+			texture->SetSwizzle(SwizzleChannel::Red, SwizzleChannel::Green, SwizzleChannel::Blue, SwizzleChannel::Green);
+		}
+		// A sprite atlas is uploaded once here and then only sampled, so a backend that keeps the decoded
+		// texels alongside what the hardware samples can give them up - which on the PSP is the difference
+		// between the animation set fitting in the heap and not (see Texture::ReleaseHostCopy())
+		texture->ReleaseHostCopy();
+		return texture;
+	}
+
+	std::unique_ptr<Tiles::TileSet> ContentResolver::RequestTileSet(StringView path, std::uint16_t captionTileId, bool applyPalette, const std::uint8_t* paletteRemapping,
+		const BitArray* usedTiles, bool withDiffuse)
+	{
+		// Try user "Content" directory first, then "Content" directory and "Cache" directory
+		String fullPath;
+		if (_pathHandler) {
+			fullPath = _pathHandler(String(path + ".j2t"_s));
+		}
+		if (fullPath.empty()) {
+			fullPath = FindContentFile(fs::CombinePath("Tilesets"_s, String(path + ".j2t"_s)));
+			if (fullPath.empty()) {
+				return nullptr;
+			}
+		}
+
+		auto s = fs::Open(fullPath, FileAccess::Read, 16 * 1024);
+		if (!s->IsValid()) {
+			return nullptr;
+		}
+
+		return RequestTileSet(*s, path, captionTileId, applyPalette, paletteRemapping, usedTiles, withDiffuse);
+	}
+
+	std::unique_ptr<Tiles::TileSet> ContentResolver::RequestTileSet(Stream& s, StringView path, std::uint16_t captionTileId, bool applyPalette,
+		const std::uint8_t* paletteRemapping, const BitArray* usedTiles, bool withDiffuse)
+	{
+		// Read outside of an assert, which isn't evaluated at all in builds without them
+		Formats::TileSetHeader header;
+		if (!Formats::TileSetFile::ReadHeader(s, header)) {
+			LOGE("Tile set \"{}\" has invalid signature", path);
+			return nullptr;
+		}
+
+		const std::uint8_t flags = header.Flags;
+		std::uint8_t channelCount = header.ChannelCount;
+		std::uint32_t width = header.Width;
+		std::uint32_t height = header.Height;
+		std::uint16_t tileCount = header.TileCount;
+
+		// Read compressed palette and mask
+		DeflateStream uc(s, header.BodySize);
+
+		ReadTilesetPalette(uc, applyPalette);
+
+		// Mark individual tiles as 32-bit or 8-bit
+		std::unique_ptr<uint8_t[]> is32bitTile;
+		if (!_isHeadless && withDiffuse) {
+			is32bitTile = std::make_unique<std::uint8_t[]>((tileCount + 7) / 8);
+			uc.Read(is32bitTile.get(), (tileCount + 7) / 8);
+		} else {
+			uc.Seek((tileCount + 7) / 8, SeekOrigin::Current);
+		}
+
+		// Mask (kept packed, 1 bit per pixel - see ReadTilesetMask)
+		std::uint32_t maskSize;
+		std::unique_ptr<std::uint8_t[]> mask = ReadTilesetMask(uc, maskSize);
+		if (!uc.IsValid()) {
+			return nullptr;
+		}
+		// The image content follows the compressed block, the stream is moved past it in case the decompression didn't
+		// get to its end marker yet
+		uc.CeaseReading();
+
+		SmallVector<std::unique_ptr<Texture>, 1> textureDiffuse;
+		std::unique_ptr<Color[]> captionTile;
+		// Filled by BuildTilesetDiffuse() when only part of the tileset is packed into the atlas
+		std::unique_ptr<std::uint16_t[]> atlasSlot;
+		// Per-tile flag (1 = fully opaque diffuse); used to cull hidden debris. Set by BuildTilesetDiffuse().
+		std::unique_ptr<std::uint8_t[]> tileDiffuseOpaque;
+		// Per-tile first visible row and reflection flag for the blur-behind layers (see TileSet::GetTileEffectInfo());
+		// set by BuildTilesetDiffuse() only where those layers are drawn with their effects
+		std::unique_ptr<std::uint8_t[]> tileEffectInfo;
+		// Whether tiles keep raw palette indices (recolored at draw time) vs baked colors; set by BuildTilesetDiffuse()
+		bool indexTiles = false;
+
+		// The image content follows the compressed block, so it's read from the raw stream (headless builds masks only)
+		if (!_isHeadless && withDiffuse) {
+			const bool lz4Content = ((flags & Formats::TileSetFile::ImageLz4) == Formats::TileSetFile::ImageLz4);
+			String name = path;
+			textureDiffuse = BuildTilesetDiffuse(s, name.data(), channelCount, lz4Content, usedTiles, atlasSlot, width, height, tileCount,
+				is32bitTile.get(), paletteRemapping, captionTileId, indexTiles, tileDiffuseOpaque, tileEffectInfo, captionTile);
+		}
+
+		if (!uc.IsValid()) {
+			return nullptr;
+		}
+
+		auto tileSet = std::make_unique<Tiles::TileSet>(path,
+			tileCount, Death::move(textureDiffuse), Death::move(mask),
+			maskSize, Death::move(captionTile), tileDiffuseOpaque.get());
+		tileSet->IsIndexed = indexTiles;
+		tileSet->AtlasSlot = Death::move(atlasSlot);
+#if defined(TILEMAP_LAYER_EFFECTS)
+		tileSet->SetTileEffectInfo(Death::move(tileEffectInfo));
+#endif
+		return tileSet;
+	}
+
+	void ContentResolver::ReadTilesetPalette(Stream& uc, bool applyPalette)
+	{
+		if (!applyPalette || _isHeadless) {
+			uc.Seek(ColorsPerPalette * sizeof(std::uint32_t), SeekOrigin::Current);
+			return;
+		}
+
+		std::uint32_t newPalette[ColorsPerPalette];
+		for (std::size_t i = 0; i < arraySize(newPalette); i++) {
+			newPalette[i] = uc.ReadValueAsLE<std::uint32_t>();
+		}
+
+		if (std::memcmp(_palettes, newPalette, ColorsPerPalette * sizeof(std::uint32_t)) != 0) {
+			// The sprite palette changed. Indexed sprites/tiles recolor from the live palette texture, so they don't
+			// need reloading; only the baked fonts are dropped so they rebake with the new palette.
+			if (_isLoading) {
+				DropBakedFonts();
+			}
+
+			std::memcpy(_palettes, newPalette, ColorsPerPalette * sizeof(std::uint32_t));
+			RecreateGemPalettes();
+		}
+	}
+
+	std::unique_ptr<std::uint8_t[]> ContentResolver::ReadTilesetMask(Stream& uc, std::uint32_t& maskSize)
+	{
+		maskSize = uc.ReadValueAsLE<std::uint32_t>();
+
+		// The cache already stores the mask packed (1 bit per pixel, LSB-first, row-major) - keep it packed:
+		// TileSet and every collision query consume the packed form directly, which is 8x smaller than the
+		// former byte-per-pixel expansion (~1 MB -> 128 KB for a big tileset) and lets the rectangle scans
+		// test a whole 32-pixel row with one 32-bit AND
+		std::unique_ptr<std::uint8_t[]> mask = std::make_unique<std::uint8_t[]>(maskSize);
+		uc.Read(mask.get(), maskSize);
+		return mask;
+	}
+
+#if defined(TILEMAP_LAYER_EFFECTS)
+	namespace
+	{
+		// What a blur-behind layer needs to know about a tile built into the atlas (see TileSet::GetTileEffectInfo()):
+		// its first visible row, the mirror line of a reflection that starts with it, and whether any visible texel
+		// reflects (some blue) or displaces (red or green other than 128). An indexed tile is resolved through the
+		// palette in effect now.
+		std::uint8_t ComputeTileEffectInfo(const std::uint8_t* tile, std::uint32_t stride, std::uint32_t channels, const std::uint32_t* palette)
+		{
+			constexpr std::uint8_t AllBits = (TileSet::TileEffectReflective | TileSet::TileEffectDisplaces);
+			std::int32_t topRow = TileSet::DefaultTileSize;
+			std::uint8_t effectBits = 0;
+			for (std::int32_t y = 0; y < TileSet::DefaultTileSize && effectBits != AllBits; y++) {
+				const std::uint8_t* row = &tile[((y + TileSet::TilePadding) * stride + TileSet::TilePadding) * channels];
+				for (std::int32_t x = 0; x < TileSet::DefaultTileSize; x++) {
+					std::uint32_t color;
+					if (channels == 1) {
+						// Index 0 is transparent, whatever its palette entry (see BuildTilesetDiffuse())
+						const std::uint8_t index = row[x];
+						color = (index != 0 ? palette[index] : 0);
+					} else {
+						const std::uint8_t* texel = &row[x * channels];
+						color = std::uint32_t(texel[0]) | (std::uint32_t(texel[1]) << 8) | (std::uint32_t(texel[2]) << 16) | (std::uint32_t(texel[3]) << 24);
+					}
+					if ((color >> 24) != 0) {
+						if (topRow == TileSet::DefaultTileSize) {
+							topRow = y;
+						}
+						effectBits |= TileSet::GetTexelEffectBits(color);
+						if (effectBits == AllBits) {
+							// The first visible row is known by now too, so the rest of the tile can't change anything
+							break;
+						}
+					}
+				}
+			}
+			return std::uint8_t(topRow | effectBits);
+		}
+	}
+#endif
+
+	SmallVector<std::unique_ptr<Texture>, 1> ContentResolver::BuildTilesetDiffuse(Stream& s, const char* name, std::uint8_t channelCount,
+		bool lz4Content, const BitArray* usedTiles, std::unique_ptr<std::uint16_t[]>& atlasSlot,
+		std::uint32_t width, std::uint32_t height, std::uint16_t tileCount, const std::uint8_t* is32bitTile,
+		const std::uint8_t* paletteRemapping, std::uint16_t captionTileId, bool& indexTiles,
+		std::unique_ptr<std::uint8_t[]>& tileDiffuseOpaque, std::unique_ptr<std::uint8_t[]>& tileEffectInfo, std::unique_ptr<Color[]>& captionTile)
+	{
+		// 32-bit (true-color) tiles have no palette index, so a tileset containing any must stay baked as RGBA;
+		// an all-8-bit tileset keeps raw palette indices and recolors at draw time (uploaded as R8).
+		indexTiles = true;
+		for (std::int32_t t = 0; t < (std::int32_t)tileCount; t++) {
+			if ((is32bitTile[t / 8] & (1 << (t & 7))) != 0) {
+				indexTiles = false;
+				break;
+			}
+		}
+
+		const std::uint32_t srcTilesPerRow = width / TileSet::DefaultTileSize;
+		const std::uint32_t srcTilesPerColumn = height / TileSet::DefaultTileSize;
+		const std::uint32_t paddedTileSizeSrc = TileSet::PaddedTileSize;
+
+		// The source pixels are laid out `channelCount` bytes per pixel (1 = index only, 4 = RGBA / index-in-red;
+		// an 8-bit tile keeps its palette index in the first byte either way).
+		//
+		// The sheet is never held whole. It is decoded one tile row (a "band" of 32 rows) at a time into a
+		// single band buffer, in step with the atlas build below: atlas slots are assigned in ascending tile
+		// order - both with and without the used-tile pruning - so the tiles of every chunk, and of every slot
+		// within it, come from non-decreasing source rows, and the band that holds the current tile is always
+		// either the one already decoded or one further down the sheet. The decoder keeps its state between
+		// bands (the format is a sequential run-length/index scheme), so nothing is decoded twice.
+		//
+		// The whole sheet was 660-900 KB for the retail tilesets even at one byte per pixel, the largest
+		// allocation a level load made and the one that failed on the Nintendo 64: after a level had been
+		// played and torn down the main menu had 2.2 MB free but no contiguous 900 KB left, and the third level
+		// loaded from the menu aborted in that read. A band of a 960 px wide sheet is 30 KB.
+		const std::uint32_t sheetBandRows = TileSet::DefaultTileSize;
+		static_assert(Compatibility::JJ2Anims::TilesetLz4BandRows == TileSet::DefaultTileSize, "LZ4 blocks of a tileset have to be one band each");
+		bool lz4Failed = false;
+		const std::uint32_t sheetBandCount = (height + sheetBandRows - 1) / sheetBandRows;
+		std::unique_ptr<std::uint8_t[]> sheetBand = std::make_unique<std::uint8_t[]>(std::size_t(sheetBandRows) * width * channelCount);
+		Compatibility::JJ2Anims::ImageContentDecoder sheetDecoder;
+		std::int32_t sheetBandIndex = -1;
+		// The compressed sheet is read into memory in one go when it can be (see ReadImageFromFile for
+		// why); it is a fraction of the decoded size and goes away with this function
+		std::unique_ptr<std::uint8_t[]> sheetData;
+		const std::uint8_t* sheetSrc = nullptr;
+		const std::uint8_t* sheetEnd = nullptr;
+		{
+			const std::int64_t remaining = s.GetSize() - s.GetPosition();
+			if (remaining > 0 && remaining <= 2 * 1024 * 1024) {
+				sheetData.reset(new (std::nothrow) std::uint8_t[std::size_t(remaining)]);
+				if (sheetData != nullptr) {
+					if (s.Read(sheetData.get(), remaining) == remaining) {
+						sheetSrc = sheetData.get();
+						sheetEnd = sheetSrc + remaining;
+					} else {
+						sheetData = nullptr;
+					}
+				}
+			}
+		}
+		// The caption tile is cut out of its band when that band comes by (see below)
+		std::int32_t captionBand = -1;
+		auto extractCaptionTile = [&]() {
+			const std::uint32_t tileX = (captionTileId % srcTilesPerRow) * TileSet::DefaultTileSize;
+			const std::uint32_t tileY = (captionTileId / srcTilesPerRow) * TileSet::DefaultTileSize;
+			const bool captionIs32bit = ((is32bitTile[captionTileId / 8] & (1 << (captionTileId & 7))) != 0);
+			captionTile = std::make_unique<Color[]>(TileSet::DefaultTileSize * TileSet::DefaultTileSize / 3);
+			const std::uint8_t* pixels = sheetBand.get();
+
+			for (std::uint32_t y = 0; y < TileSet::DefaultTileSize / 3; y++) {
+				for (std::uint32_t x = 0; x < TileSet::DefaultTileSize; x++) {
+					std::uint32_t r = 0, g = 0, b = 0;
+					for (std::uint32_t row = 0; row < 3; row++) {
+						const std::uint32_t srcRow = (tileY % sheetBandRows) + y * 3 + row;
+						const std::uint32_t src = (srcRow * width + (tileX + x)) * channelCount;
+						if (captionIs32bit) {
+							r += pixels[src + 0]; g += pixels[src + 1]; b += pixels[src + 2];
+						} else {
+							const std::uint32_t color = _palettes[pixels[src]];
+							r += (color >> 0) & 0xFF; g += (color >> 8) & 0xFF; b += (color >> 16) & 0xFF;
+						}
+					}
+					captionTile[y * TileSet::DefaultTileSize + x] = Color((std::uint8_t)(r / 3), (std::uint8_t)(g / 3), (std::uint8_t)(b / 3));
+				}
+			}
+		};
+		// Decodes the sheet forward until `band` is the one in the buffer; a band already passed stays passed
+		auto decodeSheetUpTo = [&](std::int32_t band) {
+			while (sheetBandIndex < band && std::uint32_t(sheetBandIndex + 1) < sheetBandCount) {
+				sheetBandIndex++;
+				const std::uint32_t rows = std::min(sheetBandRows, height - std::uint32_t(sheetBandIndex) * sheetBandRows);
+				if (lz4Content) {
+					// One LZ4 block per band, written for exactly this band height (JJ2Anims::TilesetLz4BandRows)
+					const std::int32_t bandBytes = std::int32_t(rows * width * channelCount);
+#if defined(WITH_LZ4)
+					const bool decoded = (sheetData != nullptr
+						? Compatibility::JJ2Anims::DecodeImageContentLz4(sheetSrc, sheetEnd, sheetBand.get(), bandBytes)
+						: Compatibility::JJ2Anims::ReadImageContentLz4(s, sheetBand.get(), bandBytes));
+#else
+					const bool decoded = false;
+#endif
+					if (!decoded) {
+						if (!lz4Failed) {
+							lz4Failed = true;
+#if defined(WITH_LZ4)
+							LOGE("Tileset \"{}\" has damaged image content, the tiles past row {} are empty", name, sheetBandIndex * sheetBandRows);
+#else
+							LOGE("Tileset \"{}\" has its image content in LZ4, which this build does not support", name);
+#endif
+						}
+						std::memset(sheetBand.get(), 0, std::size_t(bandBytes));
+					}
+				} else if (sheetData != nullptr) {
+					sheetDecoder.Decode(sheetSrc, sheetEnd, sheetBand.get(), std::int32_t(rows * width), channelCount);
+				} else {
+					sheetDecoder.Decode(s, sheetBand.get(), std::int32_t(rows * width), channelCount);
+				}
+				if (sheetBandIndex == captionBand) {
+					extractCaptionTile();
+				}
+			}
+		};
+
+		// The atlas gets 1px padding around each tile (so sampling never bleeds across tiles). Indexed output
+		// is a single index channel (-> R8), baked output is RGBA.
+
+		// The atlas does not have to keep the source sheet's row width - a tile is found by its index, and
+		// TileSet reads the row width back from the texture. The consoles round every texture up to a power
+		// of two, so a sheet laid out 22 tiles wide became a 748 px atlas padded to 1024: a quarter of the
+		// video memory wasted, in megabyte-sized blocks. Fifteen tiles is 510 px, which pads to 512 with two
+		// pixels to spare, so a 15-row chunk is an exactly-filled 512x512 texture.
+		//
+		// The PSP wants the same number for a second reason: 512 is not just what its textures pad to, it is
+		// the largest dimension the GE can address at all. A wider atlas has to be split into side-by-side
+		// pages and drawn one page at a time, which puts a per-tile page lookup into the tilemap's hot loop,
+		// keeping every atlas 510 px wide means the paged path is never taken by a tileset.
+		//
+		// The PlayStation 2 has the same hard ceiling one octave up: `TEX0.TW`/`TH` are log2 fields capped
+		// at 10, so 1024 texels per axis is all the GS can ADDRESS. Keeping the source sheet's row width
+		// broke on the wider tilesets - secretf/04_haunted1 is laid out 32 tiles across, which is 1088 px
+		// padded, and the sampled extent silently clamped to 1024 while the texture coordinates still ran
+		// to 1088. That is not a dropped tileset, it is a wrapped one: every tile past the clamp sampled
+		// somebody else's pixels.
+		//
+		// The Nintendo 64's RDP never addresses the atlas as a whole - each primitive loads its own tile's
+		// texels into TMEM - so there is no sampler limit to stay under. The 15-tile row is kept anyway to
+		// match what the RDP backend advertises as its texture-size limit, so the chunking below behaves
+		// the same as on the other fixed-function consoles.
+		//
+		// The legacy OpenGL backend joins them for both reasons at once, which is why this is keyed on the
+		// BACKEND there rather than on a platform: what it runs on is a GL that may well sample only
+		// power-of-two textures (TinyGL on MorphOS), and the source sheet's own row width is exactly what
+		// broke on the PlayStation 2 above - secretf/04_haunted1's 32-tile row is 1088 px padded, which no
+		// limit that is a power of two can hold.
+#if defined(DEATH_TARGET_DREAMCAST) || defined(DEATH_TARGET_N64) || defined(DEATH_TARGET_WII) || \
+		defined(DEATH_TARGET_GAMECUBE) || defined(DEATH_TARGET_PS2) || defined(DEATH_TARGET_PSP) || \
+		defined(DEATH_TARGET_3DS) || defined(WITH_RHI_LEGACYGL)
+		constexpr std::uint32_t PreferredAtlasTilesPerRow = 15;
+#else
+		constexpr std::uint32_t PreferredAtlasTilesPerRow = 0;
+#endif
+		const std::uint32_t totalTiles = srcTilesPerRow * srcTilesPerColumn;
+		const std::uint32_t tilesPerRow = (PreferredAtlasTilesPerRow > 0 && totalTiles > PreferredAtlasTilesPerRow
+			? PreferredAtlasTilesPerRow : srcTilesPerRow);
+		// Where the caller knows which tiles the level actually references, only those go into the atlas.
+		// Slot 0 is reserved and left blank, so a tile that was pruned but turns up later - a script placing
+		// one, an id outside the set - maps there and draws as empty instead of sampling a neighbour.
+		SmallVector<std::uint16_t, 0> slotToTile;
+		if (usedTiles != nullptr) {
+			atlasSlot = std::make_unique<std::uint16_t[]>(tileCount);
+			slotToTile.push_back(0);
+			for (std::uint32_t t = 0; t < tileCount; t++) {
+				if ((*usedTiles)[t]) {
+					atlasSlot[t] = (std::uint16_t)slotToTile.size();
+					slotToTile.push_back((std::uint16_t)t);
+				}
+			}
+		}
+		const std::uint32_t atlasTiles = (usedTiles != nullptr ? (std::uint32_t)slotToTile.size() : totalTiles);
+		const std::uint32_t tilesPerColumn = (tilesPerRow > 0 ? (atlasTiles + tilesPerRow - 1) / tilesPerRow : 0);
+		const std::uint32_t paddedWidth = tilesPerRow * paddedTileSizeSrc;
+		const std::uint32_t paddedHeight = tilesPerColumn * paddedTileSizeSrc;
+		const std::uint32_t dstChannels = (indexTiles ? 1u : 4u);
+
+		tileDiffuseOpaque = std::make_unique<std::uint8_t[]>(tileCount);
+#if defined(TILEMAP_LAYER_EFFECTS)
+		// A tile the atlas leaves out has nothing visible and no reflection
+		tileEffectInfo = std::make_unique<std::uint8_t[]>(tileCount);
+		std::memset(tileEffectInfo.get(), TileSet::DefaultTileSize, tileCount);
+#endif
+
+		// Caption tile (level-select thumbnail): downscale one tile 1:3 vertically, averaging 3 source rows. Resolve
+		// 8-bit indices through the palette here (32-bit tiles already hold RGB).
+		if (KeepCaptionTiles && captionTileId > 0) {
+			const std::uint32_t tileX = (captionTileId % srcTilesPerRow) * TileSet::DefaultTileSize;
+			const std::uint32_t tileY = (captionTileId / srcTilesPerRow) * TileSet::DefaultTileSize;
+			if (tileX + TileSet::DefaultTileSize <= width && tileY + TileSet::DefaultTileSize <= height) {
+				captionBand = std::int32_t(tileY / sheetBandRows);
+			}
+		}
+
+		// Upload the atlas, splitting it into consecutive row-band textures when it exceeds the device's
+		// texture-size limit (a 4096-limit desktop always gets a single texture - identical to before; a
+		// 1024-limit console splits e.g. a 2790-tile set into 4 chunks). Bands are aligned to whole padded
+		// tile rows, so a tile never straddles two textures; TileSet derives TilesPerTexture from chunk 0.
+		const std::int32_t maxTextureSize = theServiceLocator().GetRhiCapabilities().GetValue(RHI::IRhiCapabilities::IntValues::MaxTextureSize);
+		const std::uint32_t paddedTileSize = TileSet::PaddedTileSize;
+
+		// The fixed-function consoles round every texture up to a power of two, so chunking right at their
+		// 1024 limit makes each chunk ask video memory for a single megabyte-sized contiguous block. That is
+		// the first allocation to fail once the heap is fragmented: the tileset lost its store as soon as the
+		// pause menu's textures arrived and could never get it back, leaving the tilemap to flicker out.
+		// Halving the chunk height costs the same total memory - two 512-tall chunks instead of one 1024-tall
+		// one, both exactly filling their power-of-two height - but asks for it in half-sized pieces.
+		//
+		// On the PSP this coincides with the device limit rather than halving it (the GE cannot address more
+		// than 512 texels per axis anyway), so it changes nothing there today - it is stated explicitly all
+		// the same, because the pairing with PreferredAtlasTilesPerRow above is what makes a chunk exactly one
+		// GE texture, and that should not silently depend on what the backend happens to report.
+		//
+		// The PlayStation 2 does not round its storage up to a power of two (GsVram places the exact pages a
+		// buffer needs), so the argument there is only about the SIZE of the run: a 510x1020 8-bit chunk is
+		// 64 contiguous pages out of a 352-page cache, which is the first thing to fail once the window is
+		// broken up. Half-height chunks are 32 pages each for the same total.
+#if defined(DEATH_TARGET_DREAMCAST) || defined(DEATH_TARGET_N64) || defined(DEATH_TARGET_WII) || \
+		defined(DEATH_TARGET_GAMECUBE) || defined(DEATH_TARGET_PS2) || defined(DEATH_TARGET_PSP) || \
+		defined(DEATH_TARGET_3DS) || defined(WITH_RHI_LEGACYGL)
+#	if defined(DEATH_TARGET_N64)
+		// 256 KB at most per chunk of a 1024-wide CI8 atlas: a taller chunk is one block of half a
+		// megabyte, which a heap that has been through a few level loads no longer holds in one piece
+		constexpr std::int32_t PreferredChunkHeight = 256;
+#	else
+		constexpr std::int32_t PreferredChunkHeight = 512;
+#	endif
+#else
+		constexpr std::int32_t PreferredChunkHeight = 0;
+#endif
+		const std::int32_t chunkHeightLimit = (PreferredChunkHeight > 0 &&
+			(maxTextureSize <= 0 || PreferredChunkHeight < maxTextureSize) ? PreferredChunkHeight : maxTextureSize);
+		std::uint32_t tileRowsPerChunk = (chunkHeightLimit > 0 ? std::uint32_t(chunkHeightLimit) / paddedTileSize : tilesPerColumn);
+		if (tileRowsPerChunk == 0) {
+			tileRowsPerChunk = 1;
+		}
+		if ((std::int32_t)paddedWidth > maxTextureSize && maxTextureSize > 0) {
+			LOGW("Tileset atlas width {} exceeds the device texture-size limit {}", paddedWidth, maxTextureSize);
+		}
+
+		// The atlas is never materialized as one image. It used to be, and that single allocation was the
+		// largest the game ever made - 1.05 MB for a 930-tile set - which on a console heap is the first thing
+		// to fail once a level has been loaded and torn down: coming back to the main menu asked for it again
+		// with 2.7 MB free but no contiguous megabyte left. Each row band is now built in a buffer the size of
+		// one chunk and uploaded before the next is filled, so the peak is one chunk rather than the whole
+		// sheet and nothing here needs a contiguous block larger than a single texture.
+		const std::uint32_t chunkRowsMax = std::min(tileRowsPerChunk, tilesPerColumn);
+		const std::size_t chunkBytes = std::size_t(paddedWidth) * chunkRowsMax * paddedTileSize * dstChannels;
+		std::unique_ptr<std::uint8_t[]> chunk = std::make_unique<std::uint8_t[]>(chunkBytes);
+
+		SmallVector<std::unique_ptr<Texture>, 1> textures;
+		const bool paletteBaseTransparent = (((_palettes[0] >> 24) & 0xFF) == 0);
+		// An indexed tile is drawn with the colours of the palette in effect now, which is also the one the level is
+		// drawn with (a level's own palette is applied before its tile set is built), and the converted palettes carry
+		// a few translucent entries among their colours - so a tile without a transparent texel can still draw some
+		// pixels translucent. Recorded per tile as the second level of tileDiffuseOpaque (see TileSet::IsTileOpaque()),
+		// but only where the tile map reads it (`TILEMAP_PER_TILE_OPACITY`) - elsewhere the tiles' rows would be scanned
+		// for nothing, on the consoles that build the atlas slowest.
+#if defined(TILEMAP_PER_TILE_OPACITY)
+		constexpr bool recordsOpaqueAsDrawn = true;
+#else
+		constexpr bool recordsOpaqueAsDrawn = false;
+#endif
+		bool translucentIndex[ColorsPerPalette];
+		bool paletteHasTranslucentColors = false;
+		for (std::int32_t i = 0; i < ColorsPerPalette; i++) {
+			translucentIndex[i] = (((_palettes[i] >> 24) & 0xFF) != 255);
+			if (i > 0 && translucentIndex[i]) {
+				paletteHasTranslucentColors = true;
+			}
+		}
+		for (std::uint32_t firstTileRow = 0; firstTileRow < tilesPerColumn; firstTileRow += tileRowsPerChunk) {
+			const std::uint32_t chunkTileRows = std::min(tileRowsPerChunk, tilesPerColumn - firstTileRow);
+			const std::uint32_t chunkHeight = chunkTileRows * paddedTileSize;
+
+			// A row band can run short of tiles at the end of the sheet, and the one pixel of padding around
+			// every tile is never written by the copy below, so the band starts blank
+			std::memset(chunk.get(), 0, std::size_t(paddedWidth) * chunkHeight * dstChannels);
+
+			const std::uint32_t firstSlot = firstTileRow * tilesPerRow;
+			const std::uint32_t lastSlot = std::min((firstTileRow + chunkTileRows) * tilesPerRow, atlasTiles);
+			for (std::uint32_t slot = firstSlot; slot < lastSlot; slot++) {
+				if (usedTiles != nullptr && slot == 0) {
+					continue;	// The reserved blank slot
+				}
+				const std::uint32_t tile = (usedTiles != nullptr ? (std::uint32_t)slotToTile[slot] : slot);
+				const std::int32_t tileIdx = (std::int32_t)tile;
+				const std::uint32_t srcX = (tile % srcTilesPerRow) * TileSet::DefaultTileSize;
+				const std::uint32_t srcY = (tile / srcTilesPerRow) * TileSet::DefaultTileSize;
+				const std::uint32_t dstX = (slot % tilesPerRow) * paddedTileSizeSrc;
+				const std::uint32_t dstY = ((slot / tilesPerRow) - firstTileRow) * paddedTileSizeSrc;
+				// The sheet's tile grid can be larger than its declared tile count (the last row may be
+				// padding), and the flag array holds exactly (tileCount + 7) / 8 bytes - a grid position
+				// past the count has no flag to read and is never a 32-bit tile
+				const bool is32bit = (tileIdx < (std::int32_t)tileCount) &&
+					((is32bitTile[tileIdx / 8] & (1 << (tileIdx & 7))) != 0);
+
+				std::uint8_t* dstTile = &chunk[(dstY * paddedWidth + dstX) * dstChannels];
+				bool opaque = true;
+				bool opaqueAsDrawn = recordsOpaqueAsDrawn;
+
+				// A source tile row is exactly one decoded band (both are DefaultTileSize rows tall). Slots
+				// ascend with tile IDs, so this only ever moves the decoder forward (see the note at the top).
+				const std::int32_t srcBand = std::int32_t(srcY / sheetBandRows);
+				if DEATH_UNLIKELY(srcBand < sheetBandIndex) {
+					LOGE("Tileset \"{}\" slot {} samples tile {} above the decoded band, skipped", name, slot, tile);
+					continue;
+				}
+				decodeSheetUpTo(srcBand);
+				const std::uint8_t* pixels = sheetBand.get();
+				if (!is32bit && indexTiles && channelCount == 1 && paletteRemapping == nullptr) {
+					// The common case - an 8-bit tile of an indexed atlas, not remapped - is a copy of its rows as
+					// they are (index 0 is transparent). Taking it apart per pixel through the general loop below
+					// was a sizeable part of building the atlas on the consoles.
+					for (std::uint32_t y = 0; y < TileSet::DefaultTileSize; y++) {
+						const std::uint8_t* srcRow = &pixels[y * width + srcX];
+						std::memcpy(&dstTile[(y + TileSet::TilePadding) * paddedWidth + TileSet::TilePadding], srcRow, TileSet::DefaultTileSize);
+						if (opaque && std::memchr(srcRow, 0, TileSet::DefaultTileSize) != nullptr) {
+							opaque = false;
+						}
+						if (opaque && opaqueAsDrawn && paletteHasTranslucentColors) {
+							for (std::uint32_t x = 0; x < TileSet::DefaultTileSize; x++) {
+								if (translucentIndex[srcRow[x]]) {
+									opaqueAsDrawn = false;
+									break;
+								}
+							}
+						}
+					}
+				} else {
+					for (std::uint32_t y = 0; y < TileSet::DefaultTileSize; y++) {
+						for (std::uint32_t x = 0; x < TileSet::DefaultTileSize; x++) {
+							const std::uint32_t src = (y * width + (srcX + x)) * channelCount;
+							const std::uint32_t dst = ((y + TileSet::TilePadding) * paddedWidth + (x + TileSet::TilePadding)) * dstChannels;
+
+							if (is32bit) {
+								// True-color: copy RGBA straight through (only happens in baked tilesets, so dstChannels == 4)
+								dstTile[dst + 0] = pixels[src + 0];
+								dstTile[dst + 1] = pixels[src + 1];
+								dstTile[dst + 2] = pixels[src + 2];
+								dstTile[dst + 3] = pixels[src + 3];
+								if (pixels[src + 3] != 255) {
+									opaque = false;
+								}
+							} else {
+								// 8-bit: index is the first byte; transparency is index 0 (carried as on/off alpha when the
+								// source is 4-channel). Remapping preserves transparency - a transparent source stays index 0
+								// even if the remap table moves index 0 elsewhere.
+								const std::uint8_t origIndex = pixels[src];
+								const bool transparent = (channelCount >= 4 ? (pixels[src + 3] == 0) : (origIndex == 0));
+								const std::uint8_t index = (transparent ? 0 : (paletteRemapping != nullptr ? paletteRemapping[origIndex] : origIndex));
+
+								if (indexTiles) {
+									dstTile[dst] = index;
+									if (transparent) {
+										opaque = false;
+									} else if (translucentIndex[index]) {
+										opaqueAsDrawn = false;
+									}
+								} else {
+									const std::uint32_t color = _palettes[index];
+									const std::uint8_t alpha = (transparent ? 0 : (std::uint8_t)((color >> 24) & 0xFF));
+									dstTile[dst + 0] = (color >> 0) & 0xFF;
+									dstTile[dst + 1] = (color >> 8) & 0xFF;
+									dstTile[dst + 2] = (color >> 16) & 0xFF;
+									dstTile[dst + 3] = alpha;
+									if (alpha != 255) {
+										opaque = false;
+									}
+								}
+							}
+						}
+					}
+				}
+
+				if (tileIdx < (std::int32_t)tileCount) {
+					tileDiffuseOpaque[tileIdx] = (opaque ? (opaqueAsDrawn ? 2 : 1) : 0);
+#if defined(TILEMAP_LAYER_EFFECTS)
+					tileEffectInfo[tileIdx] = ComputeTileEffectInfo(dstTile, paddedWidth, dstChannels, _palettes);
+#endif
+				}
+
+				ExpandTileDiffuse(dstTile, paddedWidth, dstChannels);
+			}
+
+			std::unique_ptr<Texture> textureDiffuse;
+			if (indexTiles) {
+				// Index 0 is the transparent palette entry (row 0), so this uploads directly as R8 (no per-pixel alpha)
+				textureDiffuse = CreateIndexedTexture(name, chunk.get(), paddedWidth, chunkHeight, 1, paletteBaseTransparent);
+			} else {
+				textureDiffuse = std::make_unique<Texture>(name, Texture::Format::RGBA8, paddedWidth, chunkHeight);
+				textureDiffuse->LoadFromTexels(chunk.get(), 0, 0, paddedWidth, chunkHeight);
+			}
+			textureDiffuse->SetMinFiltering(SamplerFilter::Nearest);
+			textureDiffuse->SetMagFiltering(SamplerFilter::Nearest);
+			textures.push_back(Death::move(textureDiffuse));
+		}
+
+		// The caption tile can lie below the last tile the atlas took (an unused one, with pruning)
+		if (captionBand >= 0 && sheetBandIndex < captionBand) {
+			decodeSheetUpTo(captionBand);
+		}
+
+		return textures;
+	}
+
+	bool ContentResolver::LevelExists(StringView levelName)
+	{
+		// Try user "Content" directory first, then "Content" directory and "Cache" directory
+		auto pathNormalized = fs::ToNativeSeparators(levelName);
+		return !FindContentFile(fs::CombinePath("Episodes"_s, String(pathNormalized + ".j2l"_s))).empty();
+	}
+
+	bool ContentResolver::TryGetNextLevelName(StringView path, String& nextLevel)
+	{
+		// Try user "Content" directory first, then "Content" directory and "Cache" directory, the same way as TryLoadLevel()
+		auto pathNormalized = fs::ToNativeSeparators(path);
+		String fullPath;
+		if (_pathHandler) {
+			fullPath = _pathHandler(String(pathNormalized + ".j2l"_s));
+		}
+		if (fullPath.empty()) {
+			fullPath = FindContentFile(fs::CombinePath("Episodes"_s, String(pathNormalized + ".j2l"_s)));
+			if (fullPath.empty()) {
+				return false;
+			}
+		}
+
+		auto s = fs::Open(fullPath, FileAccess::Read);
+		if (!s->IsValid()) {
+			return false;
+		}
+
+		Formats::LevelHeader header;
+		if (!Formats::LevelFile::ReadHeader(*s, header)) {
+			return false;
+		}
+
+		// The properties come first, so nothing else has to be read
+		Formats::LevelReader reader(*s, header);
+		Formats::LevelProperties properties;
+		reader.ReadProperties(properties);
+		if (!reader.IsValid()) {
+			return false;
+		}
+
+		nextLevel = std::move(properties.NextLevel);
+		return true;
+	}
+
+	bool ContentResolver::TryLoadLevel(StringView path, const LevelLoadOptions& options, LevelDescriptor& descriptor)
+	{
+		// Try user "Content" directory first, then "Content" directory and "Cache" directory
+		auto pathNormalized = fs::ToNativeSeparators(path);
+		String fullPath;
+		if (_pathHandler) {
+			fullPath = _pathHandler(String(pathNormalized + ".j2l"_s));
+		}
+		if (fullPath.empty()) {
+			fullPath = FindContentFile(fs::CombinePath("Episodes"_s, String(pathNormalized + ".j2l"_s)));
+			if (fullPath.empty()) {
+				return false;
+			}
+		}
+
+		auto s = fs::Open(fullPath, FileAccess::Read, 16 * 1024);
+		if (!s->IsValid()) {
+			return false;
+		}
+
+		return TryLoadLevel(*s, fullPath, options, descriptor);
+	}
+
+	bool ContentResolver::TryLoadLevel(Stream& s, StringView fullPath, const LevelLoadOptions& options, LevelDescriptor& descriptor)
+	{
+		descriptor.FullPath = fullPath;
+
+		Formats::LevelHeader header;
+		if (!Formats::LevelFile::ReadHeader(s, header)) {
+			// A level converted by another version of the game (the cache is rebuilt when the version changes, see
+			// JJ2Anims::CacheVersion), or not a level at all
+			LOGE("Level \"{}\" has invalid signature or unsupported version", fullPath);
+			return false;
+		}
+
+		Formats::LevelReader reader(s, header);
+
+		// Read metadata
+		Formats::LevelProperties properties;
+		reader.ReadProperties(properties);
+
+		descriptor.DisplayName = std::move(properties.DisplayName);
+		descriptor.NextLevel = std::move(properties.NextLevel);
+		descriptor.SecretLevel = std::move(properties.SecretLevel);
+		descriptor.BonusLevel = std::move(properties.BonusLevel);
+		descriptor.MusicPath = std::move(properties.Music);
+
+		std::uint32_t rawAmbientColor = properties.AmbientColor;
+		descriptor.AmbientColor = Vector4f((rawAmbientColor & 0xff) / 255.0f, ((rawAmbientColor >> 8) & 0xff) / 255.0f,
+			((rawAmbientColor >> 16) & 0xff) / 255.0f, ((rawAmbientColor >> 24) & 0xff) / 255.0f);
+
+		descriptor.Weather = (WeatherType)properties.Weather;
+		descriptor.WeatherIntensity = properties.WeatherIntensity;
+		descriptor.WaterLevel = properties.WaterLevel;
+		descriptor.Editable = ((header.Flags & LevelFlags::NotEditable) != LevelFlags::NotEditable);
+
+		PitType pitType;
+		if ((header.Flags & LevelFlags::HasPit) == LevelFlags::HasPit) {
+			pitType = ((header.Flags & LevelFlags::HasPitInstantDeath) == LevelFlags::HasPitInstantDeath ? PitType::InstantDeathPit : PitType::FallForever);
+		} else {
+			pitType = PitType::StandOnPlatform;
+		}
+
+		// TODO: Store and use the additional palettes (if not headless)
+		std::uint32_t newPalette[ColorsPerPalette];
+		bool hasCustomPalette = reader.ReadPalettes(newPalette, nullptr);
+		if (hasCustomPalette && !_isHeadless && std::memcmp(_palettes, newPalette, ColorsPerPalette * sizeof(std::uint32_t)) != 0) {
+			// Palettes differs, drop all cached resources, so it will be reloaded with new palette
+			if (_isLoading) {
+				// Indexed sprites/tiles recolor from the live palette texture and need no reload; only the baked
+				// fonts are dropped to rebake with the new palette
+				DropBakedFonts();
+			}
+
+			std::memcpy(_palettes, newPalette, ColorsPerPalette * sizeof(std::uint32_t));
+			RecreateGemPalettes();
+		}
+
+		descriptor.TileMap = std::make_unique<Tiles::TileMap>(properties.DefaultTileSet, properties.CaptionTileId, !hasCustomPalette);
+		descriptor.TileMap->SetPitType(pitType);
+
+		// Extra Tilesets
+		SmallVector<Formats::ExtraTileSetRecord, 0> extraTileSets;
+		reader.ReadExtraTileSets(extraTileSets);
+		for (const Formats::ExtraTileSetRecord& tileSet : extraTileSets) {
+			// TODO: A true color tile set remapped to an additional palette is used as it is, only an 8-bit one is remapped
+			bool isRemapped = ((tileSet.Flags & Formats::ExtraTileSetRecord::Remapped) != 0 &&
+				(tileSet.Flags & Formats::ExtraTileSetRecord::TrueColor) == 0);
+			if ((tileSet.Flags & Formats::ExtraTileSetRecord::Embedded) != 0) {
+				// Tiles of the level itself, not in any tile set file
+				Death::IO::MemoryStream ms(tileSet.Data.data(), std::int64_t(tileSet.Data.size()));
+				descriptor.TileMap->AddTileSet(ms, tileSet.Name, tileSet.Offset, tileSet.Count, isRemapped ? tileSet.Remapping : nullptr);
+			} else {
+				descriptor.TileMap->AddTileSet(tileSet.Name, tileSet.Offset, tileSet.Count, isRemapped ? tileSet.Remapping : nullptr);
+			}
+		}
+
+		if (!descriptor.TileMap->IsValid()) {
+			// Cannot load one of required tilesets (errors already logged by TileMap)
+			return false;
+		}
+
+		// Overriden tiles (diffuse and mask)
+		if (!_isHeadless) {
+			SmallVector<Formats::TileDiffuseOverride, 0> diffuseOverrides;
+			reader.ReadTileDiffuseOverrides(&diffuseOverrides);
+			for (const Formats::TileDiffuseOverride& tile : diffuseOverrides) {
+				ApplyTileDiffuseOverride(*descriptor.TileMap, tile.TileId, tile.Indices);
+			}
+		} else {
+			reader.ReadTileDiffuseOverrides(nullptr);
+		}
+
+		SmallVector<Formats::TileMaskOverride, 0> maskOverrides;
+		reader.ReadTileMaskOverrides(&maskOverrides);
+		for (const Formats::TileMaskOverride& tile : maskOverrides) {
+			descriptor.TileMap->OverrideTileMask(tile.TileId, tile.Mask);
+		}
+
+		// Text Event Strings
+		reader.ReadTexts(descriptor.LevelTexts);
+
+		// Animated Tiles
+		std::uint16_t animatedTilesOffset;
+		SmallVector<Formats::AnimatedTileRecord, 0> animatedTiles;
+		reader.ReadAnimatedTiles(animatedTilesOffset, animatedTiles);
+		descriptor.TileMap->SetAnimatedTiles(animatedTilesOffset, animatedTiles);
+
+		// Layers
+		std::int32_t layerCount = reader.ReadLayerCount();
+		for (std::int32_t i = 0; i < layerCount; i++) {
+			descriptor.TileMap->LoadLayer(reader);
+		}
+		if (descriptor.TileMap->HasLoadFailed()) {
+			// Out of memory for a layer: the level cannot be played, and the caller shows why
+			LOGE("Cannot load level \"{}\": Out of memory for its layers", fullPath);
+			return false;
+		}
+
+		// Events
+		descriptor.EventMap = std::make_unique<Events::EventMap>(descriptor.TileMap->GetSize());
+		descriptor.EventMap->SetPitType(pitType);
+		descriptor.EventMap->LoadEvents(reader, *descriptor.TileMap, options);
+		if (descriptor.EventMap->HasLoadFailed()) {
+			LOGE("Cannot load level \"{}\": Out of memory for its events", fullPath);
+			return false;
+		}
+
+		// Everything that can reference a tile has now been read, so the atlas can be cut down to what
+		// this level actually uses
+		descriptor.TileMap->PruneTilesetAtlas();
+
+		if (!reader.IsValid()) {
+			LOGE("Level \"{}\" cannot be read, the file is corrupted", fullPath);
+			return false;
+		}
+		return true;
+	}
+
+	void ContentResolver::ApplyDefaultPalette()
+	{
+		static_assert(sizeof(SpritePalette) == ColorsPerPalette * sizeof(std::uint32_t));
+
+		if (!_isHeadless && std::memcmp(_palettes, SpritePalette, ColorsPerPalette * sizeof(std::uint32_t)) != 0) {
+			// Palettes differs, drop all cached resources, so it will be reloaded with new palette
+			if (_isLoading) {
+				// Indexed sprites/tiles recolor from the live palette texture and need no reload; only the baked
+				// fonts are dropped to rebake with the new palette
+				DropBakedFonts();
+			}
+
+			std::memcpy(_palettes, SpritePalette, ColorsPerPalette * sizeof(std::uint32_t));
+			RecreateGemPalettes();
+		}
+	}
+
+	void ContentResolver::ApplyTileDiffuseOverride(Tiles::TileMap& tileMap, std::int32_t tileId, const std::uint8_t* indices)
+	{
+		bool overrideIndexed = tileMap.IsTileSetIndexed(tileId);
+		std::uint32_t tileDiffuse[TileSet::PaddedTileSize * TileSet::PaddedTileSize];
+		for (std::uint32_t y = 0; y < TileSet::DefaultTileSize; y++) {
+			for (std::uint32_t x = 0; x < TileSet::DefaultTileSize; x++) {
+				std::uint32_t from = y * TileSet::DefaultTileSize + x;
+				std::uint32_t to = (y + TileSet::TilePadding) * TileSet::PaddedTileSize + (x + TileSet::TilePadding);
+
+				// Store the palette index (with full alpha) for an indexed tileset; otherwise bake the color
+				std::uint32_t color = (overrideIndexed ? ((std::uint32_t)indices[from] | 0xFF000000u) : _palettes[indices[from]]);
+				tileDiffuse[to] = color;
+			}
+		}
+
+		ExpandTileDiffuse((std::uint8_t*)tileDiffuse, TileSet::PaddedTileSize, PixelSize);
+		tileMap.OverrideTileDiffuse(tileId, tileDiffuse);
+	}
+
+	bool ContentResolver::ApplyTileDiffuseOverrideRgba(Tiles::TileMap& tileMap, std::int32_t tileId, const std::uint8_t* rgba)
+	{
+		if (tileMap.IsTileSetIndexed(tileId)) {
+			return false;
+		}
+		std::uint32_t tileDiffuse[TileSet::PaddedTileSize * TileSet::PaddedTileSize];
+		for (std::uint32_t y = 0; y < TileSet::DefaultTileSize; y++) {
+			for (std::uint32_t x = 0; x < TileSet::DefaultTileSize; x++) {
+				const std::uint8_t* from = &rgba[(y * TileSet::DefaultTileSize + x) * 4];
+				std::uint32_t to = (y + TileSet::TilePadding) * TileSet::PaddedTileSize + (x + TileSet::TilePadding);
+				tileDiffuse[to] = std::uint32_t(from[0]) | (std::uint32_t(from[1]) << 8) | (std::uint32_t(from[2]) << 16) | (std::uint32_t(from[3]) << 24);
+			}
+		}
+		ExpandTileDiffuse((std::uint8_t*)tileDiffuse, TileSet::PaddedTileSize, PixelSize);
+		return tileMap.OverrideTileDiffuse(tileId, tileDiffuse);
+	}
+
+	void ContentResolver::SetSpritePalette(ArrayView<const std::uint32_t> palette)
+	{
+		std::int32_t paletteSize = (std::int32_t)palette.size();
+		std::int32_t count = (paletteSize < ColorsPerPalette ? paletteSize : ColorsPerPalette);
+		if (count <= 0) {
+			return;
+		}
+
+		std::memcpy(_palettes, palette.data(), count * sizeof(std::uint32_t));
+		// Rebuilds the gem gradient rows from the new base palette, then marks rows 0..gems dirty and refreshes the
+		// per-player recolor rows (which are also derived from the base palette)
+		RecreateGemPalettes();
+	}
+
+	std::optional<Episode> ContentResolver::GetEpisode(StringView name, bool withImages)
+	{
+		String fullPath = FindContentFile(fs::CombinePath("Episodes"_s, String(name + ".j2e"_s)));
+		if (fullPath.empty()) {
+			return std::nullopt;
+		}
+		return GetEpisodeByPath(fullPath, withImages);
+	}
+
+	std::optional<Episode> ContentResolver::GetEpisodeByPath(StringView path, bool withImages)
+	{
+		auto s = fs::Open(path, FileAccess::Read);
+		if (s->GetSize() < 16) {
+			return std::nullopt;
+		}
+
+		std::uint64_t signature = s->ReadValueAsLE<std::uint64_t>();
+		std::uint8_t fileType = s->ReadValue<std::uint8_t>();
+		if (signature != 0x2095A59FF0BFBBEF || fileType != ContentFileType::Episode) {
+			return std::nullopt;
+		}
+
+		Episode episode;
+		episode.Name = fs::GetFileNameWithoutExtension(path);
+
+		/*std::uint16_t flags =*/ s->ReadValueAsLE<std::uint16_t>();
+
+		std::uint8_t nameLength = s->ReadValue<std::uint8_t>();
+		episode.DisplayName = String(NoInit, nameLength);
+		s->Read(episode.DisplayName.data(), nameLength);
+
+		episode.Position = s->ReadValueAsLE<std::uint16_t>();
+
+		nameLength = s->ReadValue<std::uint8_t>();
+		episode.FirstLevel = String(NoInit, nameLength);
+		s->Read(episode.FirstLevel.data(), nameLength);
+
+		nameLength = s->ReadValue<std::uint8_t>();
+		episode.PreviousEpisode = String(NoInit, nameLength);
+		s->Read(episode.PreviousEpisode.data(), nameLength);
+
+		nameLength = s->ReadValue<std::uint8_t>();
+		episode.NextEpisode = String(NoInit, nameLength);
+		s->Read(episode.NextEpisode.data(), nameLength);
+
+		if (withImages && !_isHeadless) {
+			// Every episode carries a full-colour backdrop of around half a megabyte of video memory once
+			// padded, and the episode list keeps all of them loaded at once. That does not fit next to the
+			// rest of the menu on a console with a few megabytes of it, where they would either fail to
+			// allocate or evict each other on every scroll; the section draws without them when they are
+			// absent, which looks better than the flicker.
+			//
+			// The PSP is in the same position for a different reason: its textures live in main memory rather
+			// than in a separate video pool, so the eleven 320x200 backdrops (512x256 once padded, half a
+			// megabyte each) come to over five megabytes of it - to show one at a time, on a 480x272 screen.
+			// The original model only hands a user application around twenty of those megabytes in total (the
+			// later ones with PSP_LARGE_MEMORY do give roughly fifty), and it is the smaller one that has to
+			// fit.
+			//
+			// The Nintendo 64's textures also live in main memory, and even with the Expansion Pak there is
+			// only 8 MB of RDRAM in total - half the Dreamcast's heap - so the backdrops are skipped there too.
+			// So do the GameCube's, in its 24 MB, where the thirteen backdrops of a full installation ran it out
+			// of memory the moment the episode list opened.
+#if defined(DEATH_TARGET_DREAMCAST) || defined(DEATH_TARGET_N64) || defined(DEATH_TARGET_PSP) || defined(DEATH_TARGET_GAMECUBE)
+			constexpr bool LoadEpisodeBackgrounds = false;
+#else
+			constexpr bool LoadEpisodeBackgrounds = true;
+#endif
+
+			std::uint16_t titleWidth = s->ReadValueAsLE<std::uint16_t>();
+			std::uint16_t titleHeight = s->ReadValueAsLE<std::uint16_t>();
+			if (titleWidth > 0 && titleHeight > 0) {
+				std::unique_ptr<std::uint32_t[]> pixels = std::make_unique<std::uint32_t[]>(titleWidth * titleHeight);
+				// The background image follows this one, so the read must stop exactly at its end - unless the
+				// background is skipped on this platform, in which case nothing after it is read at all
+				ReadImageFromFile(s, (std::uint8_t*)pixels.get(), titleWidth, titleHeight, 4, !LoadEpisodeBackgrounds);
+
+				episode.TitleImage = std::make_unique<Texture>(path.data(), Texture::Format::RGBA8, titleWidth, titleHeight);
+				episode.TitleImage->LoadFromTexels((unsigned char*)pixels.get(), 0, 0, titleWidth, titleHeight);
+				episode.TitleImage->SetMinFiltering(SamplerFilter::Nearest);
+				episode.TitleImage->SetMagFiltering(SamplerFilter::Nearest);
+			}
+
+			if constexpr (LoadEpisodeBackgrounds) {
+				std::uint16_t backgroundWidth = s->ReadValueAsLE<std::uint16_t>();
+				std::uint16_t backgroundHeight = s->ReadValueAsLE<std::uint16_t>();
+				if (backgroundWidth > 0 && backgroundHeight > 0) {
+					std::unique_ptr<std::uint32_t[]> pixels = std::make_unique<std::uint32_t[]>(backgroundWidth * backgroundHeight);
+					ReadImageFromFile(s, (std::uint8_t*)pixels.get(), backgroundWidth, backgroundHeight, 4);
+
+					episode.BackgroundImage = std::make_unique<Texture>(path.data(), Texture::Format::RGBA8, backgroundWidth, backgroundHeight);
+					episode.BackgroundImage->LoadFromTexels((unsigned char*)pixels.get(), 0, 0, backgroundWidth, backgroundHeight);
+					episode.BackgroundImage->SetMinFiltering(SamplerFilter::Linear);
+					episode.BackgroundImage->SetMagFiltering(SamplerFilter::Linear);
+				}
+			}
+		}
+
+		// Explicitly moved rather than relying on the implicit move of a returned local: `Episode` is
+		// move-only, and GCC before 8 only applies that implicit move when the return type matches the
+		// local's exactly - not through a conversion to `std::optional`, which is what this is. No copy
+		// elision is possible for a converting return anyway, so this is equivalent on every compiler.
+		return Death::move(episode);
+	}
+
+#if defined(NCINE_HAS_NATIVE_AUDIO)
+	String ContentResolver::GetNativeSoundPath(StringView assetPath) const
+	{
+		if (fs::GetExtension(assetPath) != "wav"_s) {
+			return {};
+		}
+		String nativePath = fs::CombinePath({ GetContentPath(), "Animations"_s, String(assetPath + "64"_s) });
+		return (fs::IsReadableFile(nativePath) ? nativePath : String());
+	}
+#endif
+
+	std::unique_ptr<AudioStreamPlayer> ContentResolver::GetMusic(StringView path)
+	{
+#if defined(WITH_AUDIO)
+		// Don't load sounds in headless mode
+		if (_isHeadless) {
+			return nullptr;
+		}
+
+		String fullPath;
+		if (_pathHandler) {
+			fullPath = _pathHandler(path);
+		}
+		if (fullPath.empty()) {
+#	if defined(NCINE_HAS_NATIVE_AUDIO)
+			// The console cannot decode any of the original module formats; the asset packer converts every track
+			// it can into a ".xm64" module, which the audio device plays with its instruments streamed from the
+			// cartridge, and pre-renders the rest into a compressed ".wav64" recording
+			StringView stem = fs::GetFileNameWithoutExtension(path);
+			for (StringView extension : { "xm64"_s, "wav64"_s }) {
+				fullPath = fs::CombinePath({ GetContentPath(), "Music"_s, String(stem + "."_s + extension) });
+				if (fs::IsReadableFile(fullPath)) {
+					break;
+				}
+			}
+#	else
+			StringView userContentPath = GetUserContentPath();
+			if (!userContentPath.empty()) {
+				fullPath = fs::CombinePath({ userContentPath, "Music"_s, path });
+			}
+			if (!fs::IsReadableFile(fullPath)) {
+				fullPath = fs::CombinePath({ GetContentPath(), "Music"_s, path });
+			}
+			if (!fs::IsReadableFile(fullPath)) {
+				// "Source" directory must be case in-sensitive
+				fullPath = fs::FindPathCaseInsensitive(fs::CombinePath(GetSourcePath(), path));
+			}
+#	endif
+		}
+		if (!fs::IsReadableFile(fullPath)) {
+			return nullptr;
+		}
+		return std::make_unique<AudioStreamPlayer>(fullPath);
+#else
+		return nullptr;
+#endif
+	}
+
+	void ContentResolver::DropBakedFonts()
+	{
+		// Only an atlas that baked the palette goes stale when the palette changes. A backend that samples
+		// a paletted texture keeps the indices and resolves colors from the live palette texture, so its
+		// fonts draw correctly under the new palette without being touched - and reloading one is not free
+		// on the console that needs this most: `font_small` is 128x529, which on the PSP is a 67 KB host
+		// copy plus a 69 KB GE store plus the decode buffer, asked for during level load with a whole
+		// level already resident. That reload is what used to end the process there, with no message,
+		// because the allocation that failed was neither `operator new` nor one of SmallVector's.
+		for (std::int32_t i = 0; i < (std::int32_t)FontType::Count; i++) {
+			if (_fonts[i] != nullptr && !_fonts[i]->IsPaletteIndexed()) {
+				_fonts[i] = nullptr;
+			}
+		}
+	}
+
+	UI::Font* ContentResolver::GetFont(FontType fontType)
+	{
+		if (fontType >= FontType::Count) {
+			return nullptr;
+		}
+
+		// Don't load fonts in headless mode
+		if (_isHeadless) {
+			return nullptr;
+		}
+
+		auto& font = _fonts[(std::int32_t)fontType];
+		if (font == nullptr) {
+			StringView fontName;
+			switch (fontType) {
+				case FontType::Small: fontName = "font_small.font"_s; break;
+				case FontType::Medium: fontName = "font_medium.font"_s; break;
+				default:
+					return nullptr;
+			}
+
+			String fontPath = fs::CombinePath({ "Animations"_s, "UI"_s, fontName });
+			font = std::make_unique<UI::Font>(OpenContentFile(fontPath), fontPath, _palettes);
+		}
+
+		return font.get();
+	}
+
+	Shader* ContentResolver::GetShader(PrecompiledShader shader)
+	{
+		if (shader >= PrecompiledShader::Count) {
+			return nullptr;
+		}
+
+		return _precompiledShaders[(std::int32_t)shader].get();
+	}
+
+	void ContentResolver::CompileShaders()
+	{
+		// Don't load shaders in headless mode
+		if (_isHeadless) {
+			return;
+		}
+
+		ZoneScoped;
+
+#if defined(RHI_CAP_SHADERS) && defined(RHI_CAP_FRAMEBUFFERS)
+		// Lighting only exists on the shader render path - the direct tier composites it on the CPU in the combine
+		// pass and never asks for this (see LevelHandler::OnInitialized). All lights of a viewport go out as one
+		// mesh, so there is no per-light program and no batched twin of one: a batch would still be one instance
+		// block per light, while this shares the interleaved per-vertex format (position.xy, texcoords.xy,
+		// color.rgba = 8 floats / 32 bytes) of the tile-layer meshes, filled in LightingRenderer::OnDraw().
+		{
+			_precompiledShaders[(std::int32_t)PrecompiledShader::LightingMesh] = CompileShader("LightingMesh", ShadersGen::LightingMesh);
+			Shader* shader = _precompiledShaders[(std::int32_t)PrecompiledShader::LightingMesh].get();
+			constexpr std::int32_t Stride = 8 * sizeof(float);
+			shader->SetAttribute(Material::PositionAttributeName, Stride, reinterpret_cast<void*>(0 * sizeof(float)));
+			shader->SetAttribute(Material::TexCoordsAttributeName, Stride, reinterpret_cast<void*>(2 * sizeof(float)));
+			shader->SetAttribute(Material::ColorAttributeName, Stride, reinterpret_cast<void*>(4 * sizeof(float)));
+		}
+#endif
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::Blur] = CompileShader("Blur", ShadersGen::Blur);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::Downsample] = CompileShader("Downsample", ShadersGen::Downsample);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::Combine] = CompileShader("Combine", ShadersGen::Combine);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::CombineWithWater] = CompileShader("CombineWithWater", ShadersGen::CombineWithWater);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::CombineWithWaterLow] = CompileShader("CombineWithWaterLow", ShadersGen::CombineWithWaterLow);
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::TexturedBackground] = CompileShader("TexturedBackground", ShadersGen::TexturedBackground);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::TexturedBackgroundDither] = CompileShader("TexturedBackgroundDither", ShadersGen::TexturedBackground, "DITHER");
+		_precompiledShaders[(std::int32_t)PrecompiledShader::TexturedBackgroundCircle] = CompileShader("TexturedBackgroundCircle", ShadersGen::TexturedBackgroundCircle);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::TexturedBackgroundCircleDither] = CompileShader("TexturedBackgroundCircleDither", ShadersGen::TexturedBackgroundCircle, "DITHER");
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::Colorized] = CompileShader("Colorized", ShadersGen::Colorized);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedColorized] = CompileShader("BatchedColorized", ShadersGen::BatchedColorized, Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::Colorized]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedColorized]);
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::Tinted] = CompileShader("Tinted", ShadersGen::Tinted);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedTinted] = CompileShader("BatchedTinted", ShadersGen::BatchedTinted, Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::Tinted]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedTinted]);
+
+		// Palette-aware Tinted, for tinted tile layers drawn from an indexed tileset
+		_precompiledShaders[(std::int32_t)PrecompiledShader::TintedPalette] = CompileShader("TintedPalette", ShadersGen::Tinted, "USE_PALETTE");
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedTintedPalette] = CompileShader("BatchedTintedPalette", ShadersGen::BatchedTinted, "USE_PALETTE", Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::TintedPalette]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedTintedPalette]);
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::Outline] = CompileShader("Outline", ShadersGen::Outline);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedOutline] = CompileShader("BatchedOutline", ShadersGen::BatchedOutline, Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::Outline]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedOutline]);
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::WhiteMask] = CompileShader("WhiteMask", ShadersGen::WhiteMask);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedWhiteMask] = CompileShader("BatchedWhiteMask", ShadersGen::BatchedWhiteMask, Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::WhiteMask]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedWhiteMask]);
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::PartialWhiteMask] = CompileShader("PartialWhiteMask", ShadersGen::PartialWhiteMask);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedPartialWhiteMask] = CompileShader("BatchedPartialWhiteMask", ShadersGen::BatchedPartialWhiteMask, Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::PartialWhiteMask]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedPartialWhiteMask]);
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::FrozenMask] = CompileShader("FrozenMask", ShadersGen::FrozenMask);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedFrozenMask] = CompileShader("BatchedFrozenMask", ShadersGen::BatchedFrozenMask, Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::FrozenMask]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedFrozenMask]);
+
+		// Palette-based rendering: indexed sprites/tiles are recolored at draw time through a palette texture bound
+		// at unit 1. Batched variants let many indexed sprites that share the same palette texture (e.g., all actors
+		// using the default sprite palette) collapse into a single draw call, exactly like the non-palette shaders.
+		_precompiledShaders[(std::int32_t)PrecompiledShader::PaletteRemap] = CompileShader("PaletteRemap", ShadersGen::PaletteRemap);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedPaletteRemap] = CompileShader("BatchedPaletteRemap", ShadersGen::BatchedPaletteRemap, Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::PaletteRemap]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedPaletteRemap]);
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::OutlinePalette] = CompileShader("OutlinePalette", ShadersGen::OutlinePalette);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedOutlinePalette] = CompileShader("BatchedOutlinePalette", ShadersGen::BatchedOutlinePalette, Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::OutlinePalette]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedOutlinePalette]);
+
+		// Palette-aware variants of the mask shaders, so a recolored (indexed) actor keeps correct colors while
+		// hit-flashing, frozen, or in sugar rush.
+		_precompiledShaders[(std::int32_t)PrecompiledShader::WhiteMaskPalette] = CompileShader("WhiteMaskPalette", ShadersGen::WhiteMask, "USE_PALETTE");
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedWhiteMaskPalette] = CompileShader("BatchedWhiteMaskPalette", ShadersGen::BatchedWhiteMask, "USE_PALETTE", Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::WhiteMaskPalette]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedWhiteMaskPalette]);
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::PartialWhiteMaskPalette] = CompileShader("PartialWhiteMaskPalette", ShadersGen::PartialWhiteMask, "USE_PALETTE");
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedPartialWhiteMaskPalette] = CompileShader("BatchedPartialWhiteMaskPalette", ShadersGen::BatchedPartialWhiteMask, "USE_PALETTE", Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::PartialWhiteMaskPalette]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedPartialWhiteMaskPalette]);
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::FrozenMaskPalette] = CompileShader("FrozenMaskPalette", ShadersGen::FrozenMask, "USE_PALETTE");
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedFrozenMaskPalette] = CompileShader("BatchedFrozenMaskPalette", ShadersGen::BatchedFrozenMask, "USE_PALETTE", Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::FrozenMaskPalette]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedFrozenMaskPalette]);
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::ShieldFire] = CompileShader("ShieldFire", ShadersGen::ShieldFire);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedShieldFire] = CompileShader("BatchedShieldFire", ShadersGen::BatchedShieldFire, Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::ShieldFire]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedShieldFire]);
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::ShieldLightning] = CompileShader("ShieldLightning", ShadersGen::ShieldLightning);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::BatchedShieldLightning] = CompileShader("BatchedShieldLightning", ShadersGen::BatchedShieldLightning, Shader::Introspection::NoUniformsInBlocks);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::ShieldLightning]->RegisterBatchedShader(*_precompiledShaders[(int32_t)PrecompiledShader::BatchedShieldLightning]);
+
+#if defined(TILEMAP_USE_SINGLE_DRAW)
+		// Tile-layer mesh shaders (used by TileMap when TILEMAP_USE_SINGLE_DRAW is enabled; cheap to keep compiled
+		// either way). Define the interleaved per-vertex format (position.xy, texcoords.xy, color.rgba = 8 floats /
+		// 32 bytes) shared by both, filled in TileMap::DrawLayer.
+		_precompiledShaders[(std::int32_t)PrecompiledShader::TileMapMesh] = CompileShader("TileMapMesh", ShadersGen::TileMapMesh);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::TileMapMeshPalette] = CompileShader("TileMapMeshPalette", ShadersGen::TileMapMeshPalette);
+		for (PrecompiledShader meshShader : { PrecompiledShader::TileMapMesh, PrecompiledShader::TileMapMeshPalette }) {
+			Shader* shader = _precompiledShaders[(std::int32_t)meshShader].get();
+			constexpr std::int32_t Stride = 8 * sizeof(float);
+			shader->SetAttribute(Material::PositionAttributeName, Stride, reinterpret_cast<void*>(0 * sizeof(float)));
+			shader->SetAttribute(Material::TexCoordsAttributeName, Stride, reinterpret_cast<void*>(2 * sizeof(float)));
+			shader->SetAttribute(Material::ColorAttributeName, Stride, reinterpret_cast<void*>(4 * sizeof(float)));
+		}
+#endif
+
+#if !defined(DISABLE_RESCALE_SHADERS)
+		_precompiledShaders[(std::int32_t)PrecompiledShader::ResizeHQ2x] = CompileShader("ResizeHQ2x", ShadersGen::ResizeHQ2x);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::Resize3xBrz] = CompileShader("Resize3xBrz", ShadersGen::Resize3xBrz);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::ResizeCrtScanlines] = CompileShader("ResizeCrtScanlines", ShadersGen::ResizeCrtScanlines);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::ResizeCrtShadowMask] = CompileShader("ResizeCrtShadowMask", ShadersGen::ResizeCrtShadowMask);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::ResizeCrtApertureGrille] = CompileShader("ResizeCrtApertureGrille", ShadersGen::ResizeCrtApertureGrille);
+#	if defined(RHI_CAP_HEAVY_RESCALE_SHADERS)
+		// These three are skipped where the backend's offline shader profile rejected them (see
+		// RHI_CAP_HEAVY_RESCALE_SHADERS): the menu does not offer their modes there, so compiling them
+		// would only produce a program with nothing to bind - and one error line each, every launch
+		_precompiledShaders[(std::int32_t)PrecompiledShader::ResizeMonochrome] = CompileShader("ResizeMonochrome", ShadersGen::ResizeMonochrome);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::ResizeSabr] = CompileShader("ResizeSabr", ShadersGen::ResizeSabr);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::ResizeCleanEdge] = CompileShader("ResizeCleanEdge", ShadersGen::ResizeCleanEdge);
+#	endif
+#endif
+#if !defined(DEATH_TARGET_VITA)
+		// vitaGL's runtime shader compiler (SceShaccCg) crashes while building the antialiasing resolve shader,
+		// and the AA subpass is force-disabled on Vita anyway (see UpscaleRenderPass), so it is not compiled there
+		_precompiledShaders[(std::int32_t)PrecompiledShader::Antialiasing] = CompileShader("Antialiasing", ShadersGen::Antialiasing);
+#endif
+
+		_precompiledShaders[(std::int32_t)PrecompiledShader::Transition] = CompileShader("Transition", ShadersGen::Transition);
+		_precompiledShaders[(std::int32_t)PrecompiledShader::TouchCircle] = CompileShader("TouchCircle", ShadersGen::TouchCircle);
+	}
+
+#if defined(TILEMAP_LAYER_EFFECTS)
+	bool ContentResolver::CompileLayerEffectShaders()
+	{
+		if (_isHeadless) {
+			return false;
+		}
+
+		constexpr PrecompiledShader LayerEffectShaders[] = {
+			PrecompiledShader::TileMapMeshXRay, PrecompiledShader::TileMapMeshXRayPalette,
+			PrecompiledShader::TileMapMeshBlur, PrecompiledShader::TileMapMeshBlurPalette,
+			PrecompiledShader::Silhouette, PrecompiledShader::SilhouettePalette
+		};
+
+		if (_precompiledShaders[(std::int32_t)PrecompiledShader::TileMapMeshXRay] == nullptr) {
+			ZoneScoped;
+
+			_precompiledShaders[(std::int32_t)PrecompiledShader::TileMapMeshXRay] = CompileShader("TileMapMeshXRay", ShadersGen::TileMapMeshXRay);
+			_precompiledShaders[(std::int32_t)PrecompiledShader::TileMapMeshXRayPalette] = CompileShader("TileMapMeshXRayPalette", ShadersGen::TileMapMeshXRay, "USE_PALETTE");
+			_precompiledShaders[(std::int32_t)PrecompiledShader::TileMapMeshBlur] = CompileShader("TileMapMeshBlur", ShadersGen::TileMapMeshBlur);
+			_precompiledShaders[(std::int32_t)PrecompiledShader::TileMapMeshBlurPalette] = CompileShader("TileMapMeshBlurPalette", ShadersGen::TileMapMeshBlur, "USE_PALETTE");
+			_precompiledShaders[(std::int32_t)PrecompiledShader::Silhouette] = CompileShader("Silhouette", ShadersGen::Silhouette);
+			_precompiledShaders[(std::int32_t)PrecompiledShader::SilhouettePalette] = CompileShader("SilhouettePalette", ShadersGen::Silhouette, "USE_PALETTE");
+
+			// The actor coverage uses the interleaved per-vertex format of the tile-layer meshes (position.xy,
+			// texcoords.xy, color.rgba = 8 floats), the blur layer adds the mirror line of its reflection (9 floats,
+			// see TileMap::AppendBlurTileQuad()) and the x-ray tiles the texture coordinates of their mask frame
+			// and the weights of both frames (12 floats, see TileMap::AppendXRayTile())
+			for (PrecompiledShader meshShader : { PrecompiledShader::Silhouette, PrecompiledShader::SilhouettePalette }) {
+				Shader* shader = _precompiledShaders[(std::int32_t)meshShader].get();
+				constexpr std::int32_t Stride = 8 * sizeof(float);
+				shader->SetAttribute(Material::PositionAttributeName, Stride, reinterpret_cast<void*>(0 * sizeof(float)));
+				shader->SetAttribute(Material::TexCoordsAttributeName, Stride, reinterpret_cast<void*>(2 * sizeof(float)));
+				shader->SetAttribute(Material::ColorAttributeName, Stride, reinterpret_cast<void*>(4 * sizeof(float)));
+			}
+			for (PrecompiledShader meshShader : { PrecompiledShader::TileMapMeshBlur, PrecompiledShader::TileMapMeshBlurPalette }) {
+				Shader* shader = _precompiledShaders[(std::int32_t)meshShader].get();
+				constexpr std::int32_t Stride = 9 * sizeof(float);
+				shader->SetAttribute(Material::PositionAttributeName, Stride, reinterpret_cast<void*>(0 * sizeof(float)));
+				shader->SetAttribute(Material::TexCoordsAttributeName, Stride, reinterpret_cast<void*>(2 * sizeof(float)));
+				shader->SetAttribute(Material::ColorAttributeName, Stride, reinterpret_cast<void*>(4 * sizeof(float)));
+				shader->SetAttribute("aAxisY", Stride, reinterpret_cast<void*>(8 * sizeof(float)));
+			}
+			for (PrecompiledShader meshShader : { PrecompiledShader::TileMapMeshXRay, PrecompiledShader::TileMapMeshXRayPalette }) {
+				Shader* shader = _precompiledShaders[(std::int32_t)meshShader].get();
+				constexpr std::int32_t Stride = 12 * sizeof(float);
+				shader->SetAttribute(Material::PositionAttributeName, Stride, reinterpret_cast<void*>(0 * sizeof(float)));
+				shader->SetAttribute(Material::TexCoordsAttributeName, Stride, reinterpret_cast<void*>(2 * sizeof(float)));
+				shader->SetAttribute("aTexCoords1", Stride, reinterpret_cast<void*>(4 * sizeof(float)));
+				shader->SetAttribute("aWeights", Stride, reinterpret_cast<void*>(6 * sizeof(float)));
+				shader->SetAttribute(Material::ColorAttributeName, Stride, reinterpret_cast<void*>(8 * sizeof(float)));
+			}
+		}
+
+		for (PrecompiledShader shader : LayerEffectShaders) {
+			if (_precompiledShaders[(std::int32_t)shader] == nullptr || !_precompiledShaders[(std::int32_t)shader]->IsLinked()) {
+				return false;
+			}
+		}
+		return true;
+	}
+#endif
+
+	std::unique_ptr<Shader> ContentResolver::CompileShader(const char* shaderName, const ShaderCompiler::Program& program, const char* variantName, Shader::Introspection introspection)
+	{
+		const ShaderCompiler::ProgramVariant* variant = nullptr;
+		if (variantName == nullptr || variantName[0] == '\0') {
+			// The base variant is unnamed (Name "") and is always Variants[0]
+			if (program.VariantCount > 0) {
+				variant = &program.Variants[0];
+			}
+		} else {
+			for (std::size_t i = 0; i < program.VariantCount; i++) {
+				if (strcmp(program.Variants[i].Name, variantName) == 0) {
+					variant = &program.Variants[i];
+					break;
+				}
+			}
+		}
+		FATAL_ASSERT_MSG(variant != nullptr, "Shader \"{}\" has no variant \"{}\"", program.Name, variantName != nullptr ? variantName : "(base)");
+
+		std::unique_ptr shader = std::make_unique<Shader>();
+		// "render_mode" flags are program-level metadata applied by Material::SetShader()
+		shader->SetRenderModes(program.RenderModes);
+#if !defined(RHI_CAP_BATCHING)
+		// Where the backend does not batch, a batched program is never handed out (see
+		// RenderResources::GetBatchedShader), so there is nothing to gain by building it. The object is still
+		// returned - the caller registers it as a batched counterpart, and that registration is simply never
+		// consulted - but it stays unlinked, which on the RSX also keeps a dozen programs' worth of microcode
+		// out of memory. NoUniformsInBlocks is what marks a batched program, exactly as in RenderResources.
+		if (introspection == Shader::Introspection::NoUniformsInBlocks) {
+			return shader;
+		}
+#endif
+		// The program name + the variant's own name are the true identity the fixed-function console
+		// backends resolve their generated effect tables from - the shaderName label is only a label
+		if (shader->LoadFromCache(shaderName, ShadersVersion, introspection, *variant, program.Name)) {
+			return shader;
+		}
+
+		const AppConfiguration& appCfg = theApplication().GetAppConfiguration();
+		const RHI::IRhiCapabilities& caps = theServiceLocator().GetRhiCapabilities();
+		// Clamping the value as some drivers report a maximum size similar to SSBO one
+		std::int32_t maxUniformBlockSize = std::clamp<std::int32_t>(caps.GetValue(RHI::IRhiCapabilities::IntValues::MaxUniformBlockSize), 0, 64 * 1024);
+		// A backend whose instance array is not a bindable buffer cannot address more instances than its
+		// shaders were compiled for, however much block space it publishes (see IntValues::MaxBatchSize)
+		const std::int32_t maxBatchSize = caps.GetValue(RHI::IRhiCapabilities::IntValues::MaxBatchSize);
+
+		std::int32_t batchSize = RHI::ShaderProgram::DefaultBatchSize;
+		bool batchSizeComputed = false;
+		if (introspection == Shader::Introspection::NoUniformsInBlocks) {
+			if (appCfg.fixedBatchSize > 0) {
+				batchSize = appCfg.fixedBatchSize;
+				batchSizeComputed = true;
+			} else if (maxUniformBlockSize < 64 * 1024) {
+				// The UBO is smaller than the 64 KB the in-shader BATCH_SIZE fallbacks assume, so the batch size is
+				// computed from the std140 instance stride reflected offline by ShaderCompiler - this replaces the probe
+				// compilation that used to run the shader twice
+				std::int32_t instanceStride = 0;
+				for (std::size_t i = 0; i < variant->BlockCount; i++) {
+					if (variant->Blocks[i].InstanceStride > 0) {
+						instanceStride = std::int32_t(variant->Blocks[i].InstanceStride);
+						break;
+					}
+				}
+				DEATH_ASSERT(instanceStride > 0);
+				if (instanceStride > 0) {
+					// The whole per-batch block is suballocated from a uniform buffer, so its size has to respect
+					// the uniform buffer offset alignment, exactly like the introspected block size did before
+					const std::int32_t offsetAlignment = caps.GetValue(RHI::IRhiCapabilities::IntValues::UniformBufferOffsetAlignment);
+					std::int32_t alignedStride = instanceStride;
+					if (offsetAlignment > 0) {
+						alignedStride += (offsetAlignment - instanceStride % offsetAlignment) % offsetAlignment;
+					}
+					batchSize = maxUniformBlockSize / alignedStride;
+					if (maxBatchSize > 0 && batchSize > maxBatchSize) {
+						batchSize = maxBatchSize;
+					}
+					LOGI("Shader \"{}\" - instance stride: {} + {} align bytes, max batch size: {}", shaderName,
+						instanceStride, alignedStride - instanceStride, batchSize);
+					batchSizeComputed = true;
+				}
+			}
+		}
+
+		// The ceiling the device published bounds whatever the steps above arrived at - including the case
+		// where they arrived at nothing. `DefaultBatchSize` here means "let the in-shader BATCH_SIZE fallback
+		// decide", and that fallback is the 64 KB-worth of instances, which is always above a ceiling a device
+		// bothered to publish. Leaving it there would compile the instance array for 64 KB while RenderBatcher
+		// fills only `maxBatchSize` instances of it, and the bound buffer range would then be smaller than the
+		// block the program declares - undefined on desktop GL, a rejected draw on WebGL.
+		if (introspection == Shader::Introspection::NoUniformsInBlocks &&
+			maxBatchSize > 0 && (batchSize <= 0 || batchSize > maxBatchSize)) {
+			batchSize = maxBatchSize;
+			batchSizeComputed = true;
+		}
+
+		bool hasLinked;
+		while (true) {
+			hasLinked = shader->LoadFromMemory(shaderName, introspection, *variant, batchSize, program.Name);
+			if (hasLinked || !batchSizeComputed || batchSize <= 1) {
+				break;
+			}
+			batchSize--;
+			LOGW("Failed to compile the shader, recompiling with batch size: {}", batchSize);
+		}
+		if (!hasLinked) {
+			// Don't save to cache if it cannot be linked
+			return shader;
+		}
+
+		shader->SaveToCache(shaderName, ShadersVersion);
+		return shader;
+	}
+	std::unique_ptr<Texture> ContentResolver::GetNoiseTexture()
+	{
+		// Don't load textures in headless mode
+		if (_isHeadless) {
+			return nullptr;
+		}
+
+		constexpr std::int32_t Size = 64;
+		std::uint32_t texels[Size * Size];
+
+		for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(arraySize(texels)); i++) {
+			texels[i] = Random().Fast(0, INT32_MAX) | 0xff000000;
+		}
+
+		// The blue channel holds smooth noise instead of white noise: gradient noise that tiles with the
+		// texture, which the low-power path of CombineWithWater.shader reads its light rays from instead of
+		// evaluating simplex noise per pixel. 13 lattice cells across the tile, which that shader maps to
+		// 8 noise units, are 0.62 units per cell, and with the deviation normalized below that matches the
+		// shader's simplex noise in both contrast and sharpness. Nothing else reads this channel.
+		constexpr std::int32_t Cells = 13;
+		Vector2f gradients[Cells * Cells];
+		for (Vector2f& gradient : gradients) {
+			float angle = Random().FastFloat(0.0f, fTwoPi);
+			gradient = Vector2f(std::cos(angle), std::sin(angle));
+		}
+		auto fade = [](float t) {
+			return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+		};
+		float noise[Size * Size];
+		float sum = 0.0f, sumOfSquares = 0.0f;
+		for (std::int32_t y = 0; y < Size; y++) {
+			for (std::int32_t x = 0; x < Size; x++) {
+				float cellX = (x + 0.5f) * Cells / Size;
+				float cellY = (y + 0.5f) * Cells / Size;
+				std::int32_t x0 = (std::int32_t)cellX, y0 = (std::int32_t)cellY;
+				float dx = cellX - x0, dy = cellY - y0;
+				auto corner = [&](std::int32_t cx, std::int32_t cy, float ox, float oy) {
+					const Vector2f& g = gradients[(cy % Cells) * Cells + (cx % Cells)];
+					return g.X * ox + g.Y * oy;
+				};
+				float u = fade(dx), v = fade(dy);
+				float top = corner(x0, y0, dx, dy) + u * (corner(x0 + 1, y0, dx - 1.0f, dy) - corner(x0, y0, dx, dy));
+				float bottom = corner(x0, y0 + 1, dx, dy - 1.0f) + u * (corner(x0 + 1, y0 + 1, dx - 1.0f, dy - 1.0f) - corner(x0, y0 + 1, dx, dy - 1.0f));
+				float value = top + v * (bottom - top);
+				noise[y * Size + x] = value;
+				sum += value;
+				sumOfSquares += value * value;
+			}
+		}
+		float mean = sum / (Size * Size);
+		float deviation = std::sqrt(std::max(sumOfSquares / (Size * Size) - mean * mean, 1e-6f));
+		float scale = 0.47f / deviation;
+		for (std::int32_t i = 0; i < Size * Size; i++) {
+			float value = std::clamp((noise[i] - mean) * scale * 0.5f + 0.5f, 0.0f, 1.0f);
+			texels[i] = (texels[i] & 0xff00ffffu) | ((std::uint32_t)(value * 255.0f + 0.5f) << 16);
+		}
+
+		std::unique_ptr<Texture> tex = std::make_unique<Texture>("Noise", Texture::Format::RGBA8, Size, Size);
+		tex->LoadFromTexels((std::uint8_t*)texels, 0, 0, Size, Size);
+		tex->SetMinFiltering(SamplerFilter::Linear);
+		tex->SetMagFiltering(SamplerFilter::Linear);
+		tex->SetWrap(SamplerWrapping::Repeat);
+		return tex;
+	}
+
+	void ContentResolver::RecreateGemPalettes()
+	{
+		constexpr std::int32_t GemColorCount = 4;
+		constexpr std::int32_t Expansion = 32;
+
+		static const std::int32_t PaletteStops[] = {
+			55, 52, 48, 15, 15,
+			87, 84, 80, 15, 15,
+			39, 36, 32, 15, 15,
+			95, 92, 88, 15, 15
+		};
+
+		constexpr std::int32_t StopsPerGem = (std::int32_t(arraySize(PaletteStops)) / GemColorCount) - 1;
+
+		// Start to fill palette texture from the second row (right after base palette)
+		std::int32_t src = 0, dst = ColorsPerPalette;
+		for (std::int32_t color = 0; color < GemColorCount; color++, src++) {
+			// Compress 2 gem color gradients to single palette row
+			for (std::int32_t i = 0; i < StopsPerGem; i++) {
+				// Base Palette is in first row of "palettes" array
+				std::uint32_t from = _palettes[PaletteStops[src++]];
+				std::uint32_t to = _palettes[PaletteStops[src]];
+
+				std::int32_t r = (from & 0xff) * 8, dr = ((to & 0xff) * 8) - r;
+				std::int32_t g = ((from >> 8) & 0xff) * 8, dg = (((to >> 8) & 0xff) * 8) - g;
+				std::int32_t b = ((from >> 16) & 0xff) * 8, db = (((to >> 16) & 0xff) * 8) - b;
+				std::int32_t a = (from & 0xff000000);
+				r *= Expansion; g *= Expansion; b *= Expansion;
+
+				for (std::int32_t j = 0; j < Expansion; j++) {
+					_palettes[dst] = ((r / (8 * Expansion)) & 0xff) | (((g / (8 * Expansion)) & 0xff) << 8) |
+									 (((b / (8 * Expansion)) & 0xff) << 16) | a;
+					r += dr; g += dg; b += db;
+					dst++;
+				}
+			}
+		}
+
+		// The base palette (row 0) and the gem palette rows just changed - mark them for re-upload. `dst` is the
+		// first index past the last gem color written, so (dst - 1) is the last touched palette index.
+		MarkPaletteDirty(0, (dst - 1) / ColorsPerPalette);
+
+		// Per-player recolor rows are derived from the (now changed) base palette, so rebuild them too
+		RefreshDynamicPaletteRows();
+	}
+
+	std::uint32_t ContentResolver::ShiftHue(std::uint32_t color, float degrees)
+	{
+		// Packed color is 0xAABBGGRR
+		float r = (color & 0xFF) / 255.0f;
+		float g = ((color >> 8) & 0xFF) / 255.0f;
+		float b = ((color >> 16) & 0xFF) / 255.0f;
+
+		// Rotate the hue in YIQ space: this keeps the perceived luma (Y) and the chroma magnitude constant, so the
+		// recolored result keeps the original's brightness and saturation and only its hue changes. (Rotating in
+		// HSL/HSV instead preserves the *nominal* S/L but often looks much stronger, as those aren't perceptual.)
+		float y = 0.299f * r + 0.587f * g + 0.114f * b;
+		float i = 0.596f * r - 0.274f * g - 0.322f * b;
+		float q = 0.211f * r - 0.523f * g + 0.312f * b;
+
+		// YIQ's chroma angle runs opposite to the conventional HSV hue direction, so negate `degrees` here: this makes
+		// a positive argument increase the HSV hue (e.g., red 0deg + 60 -> yellow), matching what the per-gradient
+		// angles in HueShiftDegreesForGradient assume.
+		float rad = -degrees * 0.01745329252f; // degrees -> radians
+		float cs = std::cos(rad), sn = std::sin(rad);
+		float i2 = i * cs - q * sn;
+		float q2 = i * sn + q * cs;
+
+		// YIQ -> RGB (inverse of the matrix above)
+		float r2 = y + 0.956f * i2 + 0.621f * q2;
+		float g2 = y - 0.272f * i2 - 0.647f * q2;
+		float b2 = y - 1.106f * i2 + 1.703f * q2;
+
+		std::int32_t ri = (std::int32_t)(r2 * 255.0f + 0.5f);
+		std::int32_t gi = (std::int32_t)(g2 * 255.0f + 0.5f);
+		std::int32_t bi = (std::int32_t)(b2 * 255.0f + 0.5f);
+		ri = (ri < 0 ? 0 : (ri > 255 ? 255 : ri));
+		gi = (gi < 0 ? 0 : (gi > 255 ? 255 : gi));
+		bi = (bi < 0 ? 0 : (bi > 255 ? 255 : bi));
+
+		return (color & 0xFF000000u) | ((std::uint32_t)bi << 16) | ((std::uint32_t)gi << 8) | (std::uint32_t)ri;
+	}
+
+	float ContentResolver::HueShiftDegreesForGradient(std::int32_t gradientStart)
+	{
+		// Per-gradient rotations. The combined base+twin hues land roughly evenly around the wheel:
+		// base {0, 35, 73, 158, 207, 287, 335} + twins below fill the green/cyan/blue gaps.
+		switch (gradientStart) {
+			case 0x10: return 42.0f;	// chartreuse ~73°	-> green ~115°
+			case 0x18: return 195.0f;	// red ~0°			-> blue ~195°
+			case 0x20: return 104.0f;	// azure ~207°		-> magenta ~311°
+			case 0x28: return 145.0f;	// orange ~35°		-> cyan ~180°
+			case 0x30: return 65.0f;	// rose ~335°		-> gold ~40°
+			case 0x50: return 218.0f;	// spring-green ~158° -> crimson ~16°
+			case 0x58: return 168.0f;	// purple ~287°		-> lime ~95°
+			default: return 190.0f;		// neutrals (0x40, 0x48) and anything unrecognized -> ~190°
+		}
+	}
+
+	namespace
+	{
+		// A destination block recolored by a fur section: copies `Size` colors from the section's chosen 8-color source
+		// gradient (starting `SrcOffset` colors into it) into the palette starting at `Start`. A section can recolor
+		// more than one block, e.g., when a character draws one logical color across two separate palette ranges.
+		// `Size == 0` marks an unused block slot.
+		struct FurBlock {
+			std::int32_t Start;      // First destination palette index (0 = transparent, never a real destination)
+			std::int32_t Size;       // Number of consecutive indices to recolor (SrcOffset + Size must be <= FurSectionSize)
+			std::int32_t SrcOffset;  // Offset into the source gradient for Start (so Start+i takes gradient color SrcOffset+i)
+		};
+		constexpr FurBlock NoBlock = { 0, 0, 0 };
+
+		// A character's recolor scheme: the destination blocks for each of the 4 sections, in the canonical order
+		// Primary Fur, Secondary Fur, Weapon, Misc - so the same picked color recolors the analogous region on every
+		// character. The destination ranges differ per character because each one's sprites are drawn with a different
+		// set of palette ranges; derived from a palette-usage analysis of the dumped sprites (see player-color-customization).
+		struct FurScheme {
+			FurBlock Sections[ContentResolver::FurSectionCount][ContentResolver::FurSectionMaxBlocks];
+		};
+
+		// [0] Default - Jazz (also the Frog morph and anything unspecified): the standard rabbit fur ranges.
+		// [1] Spaz: green rabbit gun (0x10), but his fur uses different ranges than Jazz - primary red 0x18,
+		//     secondary orange 0x28, misc green 0x20.
+		// [2] Lori: entirely different ranges. Her blonde hair is a bright highlight (0x28) plus the 0x3B-0x3F gold ramp,
+		//     recolored as one section; the ramp is mapped one gradient step below the highlight so the highlight->body
+		//     transition stays smooth instead of jumping. Her purple suit is 0x58 (secondary); her dark-blue weapon
+		//     spans the 0x20 blue body and the 0x48 steel barrel; misc (lips) 0x30. Her eyes (the cream 0x40 sclera) are
+		//     left at their original color.
+		constexpr FurScheme FurSchemes[] = {
+			//   Primary Fur                        Secondary Fur                Weapon                                      Misc
+			{ { { { 0x10, 8, 0 }, NoBlock },        { { 0x18, 8, 0 }, NoBlock }, { { 0x20, 8, 0 }, NoBlock },                { { 0x28, 8, 0 }, NoBlock } } },
+			{ { { { 0x18, 8, 0 }, NoBlock },        { { 0x28, 8, 0 }, NoBlock }, { { 0x10, 8, 0 }, NoBlock },                { { 0x20, 8, 0 }, NoBlock } } },
+			{ { { { 0x28, 7, 1 }, { 0x3B, 5, 2 } }, { { 0x58, 8, 0 }, NoBlock }, { { 0x20, 8, 0 }, { 0x48, 8, 0 } },         { { 0x30, 8, 0 }, NoBlock } } }
+		};
+		constexpr std::int32_t FurSchemeCount = (std::int32_t)(sizeof(FurSchemes) / sizeof(FurSchemes[0]));
+	}
+
+	std::int32_t ContentResolver::GetFurSchemeIndex(PlayerType playerType)
+	{
+		// Each playable character's sprites use different palette ranges, so each needs its own recolor scheme; the Frog
+		// morph and anything unspecified fall back to the Jazz (default) scheme.
+		switch (playerType) {
+			case PlayerType::Spaz: return 1;
+			case PlayerType::Lori: return 2;
+			default: return 0;
+		}
+	}
+
+	void ContentResolver::BuildPlayerColorPalette(std::uint32_t furColor, PlayerType playerType, std::uint32_t* outPalette) const
+	{
+		BuildPlayerColorPaletteForScheme(furColor, GetFurSchemeIndex(playerType), outPalette);
+	}
+
+	void ContentResolver::BuildPlayerColorPaletteForScheme(std::uint32_t furColor, std::int32_t schemeIndex, std::uint32_t* outPalette) const
+	{
+		// Start from the default sprite palette (first row of _palettes), then recolor the fur sections.
+		std::memcpy(outPalette, _palettes, ColorsPerPalette * sizeof(std::uint32_t));
+
+		if (schemeIndex < 0 || schemeIndex >= FurSchemeCount) {
+			schemeIndex = 0;
+		}
+		const FurScheme& scheme = FurSchemes[schemeIndex];
+
+		// The fur color packs one byte per section (as in the original game). The low 7 bits of each non-zero byte are
+		// the starting palette index of an 8-color gradient in the sprite palette; copy those colors into each of the
+		// section's destination blocks. If FurHueShiftFlag is set, rotate their hue by the gradient's angle first.
+		for (std::int32_t section = 0; section < FurSectionCount; section++) {
+			std::uint32_t packed = (furColor >> (section * 8)) & 0xFF;
+			std::int32_t base = (std::int32_t)(packed & ~(std::uint32_t)FurHueShiftFlag);
+			if (base == 0) {
+				// Keep the original colors for this section (the hue-shift flag on a 0 index is a no-op)
+				continue;
+			}
+
+			bool hueShift = (packed & FurHueShiftFlag) != 0;
+			float hueDegrees = HueShiftDegreesForGradient(base);
+			for (std::int32_t block = 0; block < FurSectionMaxBlocks; block++) {
+				const FurBlock& blk = scheme.Sections[section][block];
+				if (blk.Size <= 0 || blk.Start <= 0) {
+					// Unused block slot (index 0 is transparent, never a valid destination)
+					continue;
+				}
+				for (std::int32_t i = 0; i < blk.Size; i++) {
+					std::int32_t srcIdx = base + blk.SrcOffset + i;
+					std::int32_t dstIdx = blk.Start + i;
+					if (srcIdx > 0 && srcIdx < ColorsPerPalette && dstIdx > 0 && dstIdx < ColorsPerPalette) {
+						std::uint32_t color = _palettes[srcIdx];
+						if (hueShift && hueDegrees != 0.0f) {
+							color = ShiftHue(color, hueDegrees);
+						}
+						outPalette[dstIdx] = color;
+					}
+				}
+			}
+		}
+	}
+
+	void ContentResolver::ConfigurePaletteTextureChannels(Texture& texture)
+	{
+#if defined(DEATH_TARGET_BIG_ENDIAN)
+		// A palette entry is a uint32 VALUE with red in the lowest byte (0xAABBGGRR) - the convention
+		// everything downstream extracts channels with, and what nCine::Color guarantees on both
+		// endiannesses by reordering its members. The upload reinterprets that array as bytes, and the GX
+		// backend depends on it doing exactly that: it reads the very same bytes back as uint32 entries to
+		// build its TLUTs and CPU-baked copies (GxDevice::AcquireTlutForRow, GxTexture::EnsureBakedRgba),
+		// so the two reinterprets cancel out whatever the host endianness is.
+		//
+		// A backend that instead SAMPLES the palette as an ordinary RGBA8 texture sees those raw bytes, and
+		// on a big-endian host the value above is laid out A,B,G,R rather than R,G,B,A - reversed channels,
+		// including an alpha that makes parts of an indexed sprite disappear. Declaring the order through
+		// the swizzle states it once, for every backend that samples, without touching the bytes the GX
+		// round-trip needs. Little-endian needs nothing: there the two layouts already coincide.
+		texture.SetSwizzle(SwizzleChannel::Alpha, SwizzleChannel::Blue, SwizzleChannel::Green, SwizzleChannel::Red);
+#else
+		static_cast<void>(texture);
+#endif
+	}
+
+	Texture* ContentResolver::ApplyPlayerColorPalette(std::unique_ptr<Texture>& texture, std::uint32_t furColor, PlayerType playerType)
+	{
+		if (_isHeadless) {
+			return nullptr;
+		}
+
+		std::uint32_t palette[ColorsPerPalette];
+		BuildPlayerColorPalette(furColor, playerType, palette);
+
+		if (texture == nullptr) {
+			texture = std::make_unique<Texture>("PlayerColorPalette", Texture::Format::RGBA8, ColorsPerPalette, 1);
+			texture->SetMinFiltering(SamplerFilter::Nearest);
+			texture->SetMagFiltering(SamplerFilter::Nearest);
+			ConfigurePaletteTextureChannels(*texture);
+		}
+		texture->LoadFromTexels((std::uint8_t*)palette, 0, 0, ColorsPerPalette, 1);
+		return texture.get();
+	}
+
+	Texture* ContentResolver::GetPaletteTexture()
+	{
+		if (_isHeadless) {
+			return nullptr;
+		}
+
+		if (_paletteTexture == nullptr) {
+			_paletteTexture = std::make_unique<Texture>("Palettes", Texture::Format::RGBA8, ColorsPerPalette, PaletteCount);
+			_paletteTexture->SetMinFiltering(SamplerFilter::Nearest);
+			_paletteTexture->SetMagFiltering(SamplerFilter::Nearest);
+			_paletteTexture->SetWrap(SamplerWrapping::ClampToEdge);
+			ConfigurePaletteTextureChannels(*_paletteTexture);
+			// Force a full upload on first use
+			_paletteDirtyFirstRow = 0;
+			_paletteDirtyLastRow = PaletteCount - 1;
+		}
+
+		// Upload only the rows changed since the last call - cheap enough to support per-frame palette cycling
+		if (_paletteDirtyFirstRow <= _paletteDirtyLastRow) {
+			std::int32_t rowCount = _paletteDirtyLastRow - _paletteDirtyFirstRow + 1;
+			_paletteTexture->LoadFromTexels((std::uint8_t*)(_palettes + _paletteDirtyFirstRow * ColorsPerPalette),
+				0, _paletteDirtyFirstRow, ColorsPerPalette, rowCount);
+			_paletteDirtyFirstRow = PaletteCount;
+			_paletteDirtyLastRow = -1;
+		}
+
+		return _paletteTexture.get();
+	}
+
+	void ContentResolver::MarkPaletteDirty(std::int32_t firstRow, std::int32_t lastRow)
+	{
+		if (firstRow < 0) {
+			firstRow = 0;
+		}
+		if (lastRow >= PaletteCount) {
+			lastRow = PaletteCount - 1;
+		}
+		if (firstRow > lastRow) {
+			return;
+		}
+		if (firstRow < _paletteDirtyFirstRow) {
+			_paletteDirtyFirstRow = firstRow;
+		}
+		if (lastRow > _paletteDirtyLastRow) {
+			_paletteDirtyLastRow = lastRow;
+		}
+	}
+
+	std::int32_t ContentResolver::AcquirePaletteOffset(std::uint32_t furColor, PlayerType playerType)
+	{
+		// Rows are keyed by both the fur color and the recolor scheme: the same packed color produces different
+		// palettes for characters with different schemes (e.g., Jazz vs. Lori), so they can't share a row.
+		std::uint8_t scheme = (std::uint8_t)GetFurSchemeIndex(playerType);
+
+		// Reuse the row already holding this color+scheme (shared, reference-counted) while noting the first free row
+		std::int32_t freeRow = -1;
+		for (std::int32_t row = FirstDynamicPaletteRow; row < PaletteCount; row++) {
+			if (_paletteRowRefCount[row] == 0) {
+				if (freeRow < 0) {
+					freeRow = row;
+				}
+			} else if (_paletteRowColor[row] == furColor && _paletteRowScheme[row] == scheme) {
+				_paletteRowRefCount[row]++;
+				return row * ColorsPerPalette;
+			}
+		}
+
+		if (freeRow < 0) {
+			// All dynamic rows are in use (would need more than (PaletteCount - FirstDynamicPaletteRow) distinct recolors)
+			return -1;
+		}
+
+		_paletteRowRefCount[freeRow] = 1;
+		_paletteRowColor[freeRow] = furColor;
+		_paletteRowScheme[freeRow] = scheme;
+		BuildPlayerColorPaletteForScheme(furColor, scheme, _palettes + freeRow * ColorsPerPalette);
+		MarkPaletteDirty(freeRow, freeRow);
+		return freeRow * ColorsPerPalette;
+	}
+
+	void ContentResolver::ReleasePaletteOffset(std::int32_t paletteOffset)
+	{
+		// The public API deals in flat palette offsets; map back to the texture row that backs it (a negative offset,
+		// i.e. "no palette", maps to row 0 and is rejected by the bounds check below)
+		std::int32_t row = paletteOffset / ColorsPerPalette;
+		if (row >= FirstDynamicPaletteRow && row < PaletteCount && _paletteRowRefCount[row] > 0) {
+			_paletteRowRefCount[row]--;
+			// When the count hits 0 the row is free for reuse; its contents are overwritten on the next acquire
+		}
+	}
+
+	void ContentResolver::RefreshDynamicPaletteRows()
+	{
+		for (std::int32_t row = FirstDynamicPaletteRow; row < PaletteCount; row++) {
+			if (_paletteRowRefCount[row] > 0) {
+				BuildPlayerColorPaletteForScheme(_paletteRowColor[row], _paletteRowScheme[row], _palettes + row * ColorsPerPalette);
+				MarkPaletteDirty(row, row);
+			}
+		}
+	}
+
+	bool ContentResolver::ConfigureSpriteShader(RenderCommand& command, bool indexed)
+	{
+		bool shaderChanged = (indexed
+			? command.GetMaterial().SetShader(GetShader(PrecompiledShader::PaletteRemap))
+			: command.GetMaterial().SetShaderProgramType(Material::ShaderProgramType::Sprite));
+		if (shaderChanged) {
+			command.GetMaterial().ReserveUniformsDataMemory();
+			command.GetGeometry().SetDrawParameters(PrimitiveType::TriangleStrip, 0, 4);
+
+			RHI::UniformCache* textureUniform = command.GetMaterial().Uniform(Material::TextureUniformName);
+			if (textureUniform != nullptr && textureUniform->GetIntValue(0) != 0) {
+				textureUniform->SetIntValue(0); // GL_TEXTURE0
+			}
+			RHI::UniformCache* paletteUniform = command.GetMaterial().Uniform("uTexturePalette");
+			if (paletteUniform != nullptr) {
+				paletteUniform->SetIntValue(1); // GL_TEXTURE1
+			}
+		}
+		return shaderChanged;
+	}
+
+	void ContentResolver::BindSpritePalette(RenderCommand& command, const Texture& diffuse, bool indexed, std::uint16_t paletteOffset)
+	{
+		command.GetMaterial().SetTexture(0, diffuse);
+		if (indexed) {
+			Texture* palette = GetPaletteTexture();
+			if (palette != nullptr) {
+				command.GetMaterial().SetTexture(1, *palette);
+			}
+			RHI::UniformCache* palOffsetUniform = command.GetInstanceBlock()->GetUniform(Material::PaletteOffsetUniformName);
+			if (palOffsetUniform != nullptr) {
+				palOffsetUniform->SetFloatValue((float)paletteOffset);
+			}
+		}
+	}
+
+#if defined(DEATH_DEBUG)
+	void ContentResolver::MigrateGraphics(StringView path)
+	{
+		String auraPath = fs::CombinePath({ GetContentPath(), "Animations"_s, String(path.exceptSuffix(4) + ".aura"_s) });
+		if (fs::FileExists(auraPath)) {
+			return;
+		}
+
+		auto s = fs::Open(fs::CombinePath({ GetContentPath(), "Animations"_s, String(path + ".res"_s) }), FileAccess::Read);
+		auto fileSize = s->GetSize();
+		if (fileSize < 4 || fileSize > 64 * 1024 * 1024) {
+			// 64 MB file size limit, also if not found try to use cache
+			return;
+		}
+
+		auto buffer = std::make_unique<char[]>(fileSize);
+		s->Read(buffer.get(), fileSize);
+		s->Dispose();
+
+		Json::CharReaderBuilder builder;
+		auto reader = std::unique_ptr<Json::CharReader>(builder.newCharReader());
+		Json::Value doc; std::string errors;
+		if (reader->parse(buffer.get(), buffer.get() + fileSize, &doc, &errors)) {
+			String fullPath = fs::CombinePath({ GetContentPath(), "Animations"_s, path });
+			std::unique_ptr<ITextureLoader> texLoader = ITextureLoader::createFromFile(fullPath);
+			if (texLoader->hasLoaded()) {
+				auto texFormat = texLoader->texFormat().pixelFormat();
+				if (texFormat != PixelFormat::RGBA8 && texFormat != PixelFormat::RGB8) {
+					return;
+				}
+
+				std::int32_t w = texLoader->width();
+				std::int32_t h = texLoader->height();
+				const std::uint32_t* palette = _palettes;
+				bool needsMask = true;
+
+				std::int64_t originalFlags;
+				if (doc["Flags"].get(originalFlags) == Json::SUCCESS) {
+					// Palette already applied, keep as is
+					if ((originalFlags & 0x01) != 0x01) {
+						palette = nullptr;
+					}
+					if ((originalFlags & 0x08) == 0x08) {
+						needsMask = false;
+					}
+				}
+
+				// TODO: Use FrameDuration instead
+				double animDuration;
+				if (doc["Duration"].get(animDuration) != Json::SUCCESS) {
+					animDuration = 0.0;
+				}
+
+				std::int64_t frameCount;
+				if (doc["FrameCount"].get(frameCount) != Json::SUCCESS || frameCount < 0) {
+					frameCount = 0;
+				}
+
+				Vector2i frameDimensions = GetVector2iFromJson(doc["FrameSize"]);
+				Vector2i frameConfiguration = GetVector2iFromJson(doc["FrameConfiguration"]);
+
+				Vector2i hotspot = GetVector2iFromJson(doc["Hotspot"]);
+				Vector2i coldspot = GetVector2iFromJson(doc["Coldspot"], Vector2i(InvalidValue, InvalidValue));
+				Vector2i gunspot = GetVector2iFromJson(doc["Gunspot"], Vector2i(InvalidValue, InvalidValue));
+
+				// Write to .aura file
+				auto so = fs::Open(auraPath, FileAccess::Write);
+				if (!so->IsValid()) return;
+
+				std::uint8_t flags = 0x80;
+				if (palette == nullptr) {
+					flags |= 0x01;
+				}
+				if (!needsMask) {
+					flags |= 0x02;
+				}
+
+				so->WriteValue<std::uint64_t>(0xB8EF8498E2BFBBEF);
+				so->WriteValue<std::uint32_t>(0x0002208F | (flags << 24)); // Version 2 is reserved for sprites (or bigger images)
+
+				so->WriteValue<std::uint8_t>(4);
+				so->WriteValue<std::uint32_t>((std::uint32_t)frameDimensions.X);
+				so->WriteValue<std::uint32_t>((std::uint32_t)frameDimensions.Y);
+
+				// Include Sprite extension
+				so->WriteValue<std::uint8_t>((std::uint8_t)frameConfiguration.X);
+				so->WriteValue<std::uint8_t>((std::uint8_t)frameConfiguration.Y);
+				so->WriteValue<std::uint16_t>((std::uint16_t)frameCount);
+				so->WriteValue<std::uint16_t>((std::uint16_t)(animDuration <= 0.0 ? 0 : 256 * animDuration));
+
+				if (hotspot.X != InvalidValue || hotspot.Y != InvalidValue) {
+					so->WriteValue<std::uint16_t>((std::uint16_t)hotspot.X);
+					so->WriteValue<std::uint16_t>((std::uint16_t)hotspot.Y);
+				} else {
+					so->WriteValue<std::uint16_t>(UINT16_MAX);
+					so->WriteValue<std::uint16_t>(UINT16_MAX);
+				}
+				if (coldspot.X != InvalidValue || coldspot.Y != InvalidValue) {
+					so->WriteValue<std::uint16_t>((std::uint16_t)coldspot.X);
+					so->WriteValue<std::uint16_t>((std::uint16_t)coldspot.Y);
+				} else {
+					so->WriteValue<std::uint16_t>(UINT16_MAX);
+					so->WriteValue<std::uint16_t>(UINT16_MAX);
+				}
+				if (gunspot.X != InvalidValue || gunspot.Y != InvalidValue) {
+					so->WriteValue<std::uint16_t>((std::uint16_t)gunspot.X);
+					so->WriteValue<std::uint16_t>((std::uint16_t)gunspot.Y);
+				} else {
+					so->WriteValue<std::uint16_t>(UINT16_MAX);
+					so->WriteValue<std::uint16_t>(UINT16_MAX);
+				}
+
+				Compatibility::JJ2Anims::WriteImageContent(*so, texLoader->pixels(), w, h, 4);
+			}
+		}
+	}
+#endif
+}

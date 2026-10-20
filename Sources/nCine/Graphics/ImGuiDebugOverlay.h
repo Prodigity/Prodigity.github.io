@@ -1,0 +1,151 @@
+#pragma once
+
+#if defined(WITH_IMGUI) || defined(DOXYGEN_GENERATING_OUTPUT)
+
+#include "IDebugOverlay.h"
+
+#include <memory>
+
+#include <Containers/String.h>
+#include <Containers/SmallVector.h>
+
+using namespace Death::Containers;
+
+namespace nCine
+{
+	class AppConfiguration;
+	class IInputEventHandler;
+	class Viewport;
+	class SceneNode;
+
+	/**
+		@brief Debug overlay implemented with the ImGui interface
+		
+		Concrete @ref IDebugOverlay that uses ImGui to draw the diagnostic windows: corner overlays with frame
+		timings and rendering statistics, profiler plots, a trace log, and inspector panels for the application
+		configuration, graphics capabilities, viewports and scene-graph nodes.
+	*/
+	class ImGuiDebugOverlay : public IDebugOverlay
+	{
+	public:
+		explicit ImGuiDebugOverlay(float profileTextUpdateTime);
+
+		ImGuiDebugOverlay(const ImGuiDebugOverlay&) = delete;
+		ImGuiDebugOverlay& operator=(const ImGuiDebugOverlay&) = delete;
+
+		void Update() override;
+		void UpdateFrameTimings() override;
+
+#if defined(DEATH_TRACE)
+		void Log(TraceLevel level, StringView time, StringView threadId, StringView functionName, StringView message) override;
+#endif
+
+	private:
+		static constexpr float Margin = 10.0f;
+		static constexpr float Transparency = 0.5f;
+
+#ifndef DOXYGEN_GENERATING_OUTPUT
+		// Doxygen 1.12.0 outputs also private structs/unions even if it shouldn't
+		struct ValuesType
+		{
+			enum
+			{
+				FrameTime = 0,
+				BeginFrame,
+				UpdateVisitDraw,
+				Update,
+				PostUpdate,
+				Visit,
+				Draw,
+				ImGui,
+				EndFrame,
+				CulledNodes,
+				VboUsed,
+				IboUsed,
+				UboUsed,
+				SpriteVertices,
+				MeshSpriteVertices,
+				TileMapVertices,
+				ParticleVertices,
+				LightingVertices,
+				TextVertices,
+				ImGuiVertices,
+				UnspecifiedVertices,
+				TotalVertices,
+#if defined(WITH_LUA)
+				LuaUsed,
+				LuaOperations,
+#endif
+				Count
+			};
+		};
+
+		struct LogMessage
+		{
+			String Time;
+			String Text;
+			String ThreadId;
+			StringView FunctionName;
+			TraceLevel Level;
+		};
+#endif
+
+		bool _lockOverlayPositions;
+		bool _showTopLeftOverlay;
+		bool _showTopRightOverlay;
+		bool _showBottomLeftOverlay;
+		bool _showBottomRightOverlay;
+
+		std::uint32_t _numValues;
+		std::unique_ptr<float[]> _plotValues[ValuesType::Count];
+		float _maxFrameTime;
+		float _maxUpdateVisitDraw;
+		std::uint32_t _index;
+		bool _plotAdditionalFrameValues;
+		bool _plotOverlayValues;
+		String _comboVideoModes;
+
+		SmallVector<LogMessage, 0> _logBuffer;
+
+#if defined(WITH_RENDERDOC)
+		static constexpr std::uint32_t MaxRenderDocPathLength = 128;
+		static constexpr std::uint32_t MaxRenderDocCommentsLength = 512;
+
+		String _renderDocPathTemplate;
+		String _renderDocFileComments;
+		String _renderDocCapturePath;
+		std::uint32_t _renderDocLastNumCaptures;
+#endif
+
+		void guiWindow();
+		void guiConfigureGui();
+		void guiInitTimes();
+		void guiLog();
+		void guiGraphicsCapabilities();
+		void guiApplicationConfiguration();
+		void guiRenderingSettings();
+		void guiWindowSettings();
+		void guiAudioPlayers();
+		void guiInputState();
+		void guiRenderDoc();
+		void guiAllocators();
+		void guiViewports(Viewport* viewport, std::uint32_t viewportId);
+		void guiRecursiveChildrenNodes(SceneNode* node, std::uint32_t childId);
+		void guiNodeInspector();
+
+#if defined(NCINE_PROFILING)
+		void guiTopLeft();
+#endif
+		void guiTopRight();
+		void guiBottomLeft();
+		void guiBottomRight();
+		void guiPlots();
+
+		void InitPlotValues();
+#if defined(NCINE_PROFILING)
+		void UpdateOverlayTimings();
+#endif
+	};
+}
+
+#endif

@@ -1,0 +1,343 @@
+#include "RemoteActor.h"
+
+#if defined(WITH_MULTIPLAYER)
+
+#include "RemoteElectroShot.h"
+#include "RemoteThunderbolt.h"
+#include "../../ContentResolver.h"
+#include "../../ILevelHandler.h"
+#include "../Player.h"
+#include "../../../nCine/Base/Random.h"
+#include "../../../nCine/Graphics/RenderQueue.h"
+
+namespace Jazz2::Actors::Multiplayer
+{
+	namespace
+	{
+		// Recoloring uses a per-character palette scheme; a remote player's character is identified by the metadata
+		// path the server sent (the only signal a RemoteActor has). Only the character matters here, not the morph.
+		PlayerType GetPlayerTypeFromMetadataPath(StringView path)
+		{
+			// _metadata->Path uses native separators (backslashes on Windows), so pull out the file name with the
+			// separator-aware helper instead of matching a hard-coded "Interactive/PlayerX" literal - that never
+			// matched on Windows and made every remote player fall back to Jazz's recolor scheme (wrong/default fur).
+			StringView fileName = fs::GetFileName(path);
+			if (fileName == "PlayerLori"_s) {
+				return PlayerType::Lori;
+			} else if (fileName == "PlayerSpaz"_s) {
+				return PlayerType::Spaz;
+			} else if (fileName == "PlayerFrog"_s) {
+				return PlayerType::Frog;
+			} else {
+				return PlayerType::Jazz;
+			}
+		}
+	}
+
+	RemoteActor::RemoteActor()
+		: _lastAnim(AnimState::Idle), _isAttachedLocally(false), _alwaysInterpolate(false), _furColor(0),
+			_paletteOffset(-1), _blendingPreset(DrawableNode::BlendingPreset::Alpha),
+			_activeShield(ShieldType::None), _activeShieldTime(0.0f), _sugarRushLeft(0.0f), _sugarRushStarsTime(0.0f),
+			_revUpTime(0.0f), _revUpSparkCooldown(0.0f)
+	{
+	}
+
+	std::shared_ptr<RemoteActor> RemoteActor::Create(StringView metadataPath)
+	{
+		// Actors that render through something else than their own sprite need a specialized representation
+		// that replays those visuals on the receiving side; everything else is a generic remote actor
+		if (metadataPath == "Weapon/Electro"_s) {
+			return std::make_shared<RemoteElectroShot>();
+		}
+		if (metadataPath == "Weapon/Thunderbolt"_s) {
+			return std::make_shared<RemoteThunderbolt>();
+		}
+
+		return std::make_shared<RemoteActor>();
+	}
+
+	RemoteActor::~RemoteActor()
+	{
+		// Release the shared palette offset back to the pool when the remote player disconnects/despawns
+		if (_paletteOffset >= 0) {
+			ContentResolver::Get().ReleasePaletteOffset(_paletteOffset);
+			_paletteOffset = -1;
+		}
+	}
+
+	void RemoteActor::RefreshColorPalette()
+	{
+		auto& resolver = ContentResolver::Get();
+		if (resolver.IsHeadless()) {
+			return;
+		}
+
+		// Acquire the new (shared, reference-counted) palette before releasing the old one, so an unchanged fur color
+		// keeps its slot; players with the same color and character share a single palette
+		PlayerType playerType = (_metadata != nullptr ? GetPlayerTypeFromMetadataPath(_metadata->Path) : PlayerType::Jazz);
+		std::int32_t newOffset = (_furColor != 0 ? resolver.AcquirePaletteOffset(_furColor, playerType) : -1);
+		if (_paletteOffset >= 0) {
+			resolver.ReleasePaletteOffset(_paletteOffset);
+		}
+		_paletteOffset = newOffset;
+		_renderer.SetPalette(_paletteOffset);
+
+		// Selecting a palette switches the sprite to (or away from) the palette-aware shader, which takes the
+		// material's blending factors with it
+		ApplyBlendingPreset();
+	}
+
+	void RemoteActor::ApplyBlendingPreset()
+	{
+		_renderer.setBlendingPreset(_blendingPreset);
+	}
+
+	Task<bool> RemoteActor::OnActivatedAsync(const ActorActivationDetails& details)
+	{
+		SetState(ActorState::PreserveOnRollback, true);
+		SetState(ActorState::CanBeFrozen | ActorState::CollideWithTileset | ActorState::ApplyGravitation, false);
+
+		_stateBuffer.Reset(Vector2f(details.Pos.X, details.Pos.Y), StateInterpolationBuffer::Now());
+
+		async_return true;
+	}
+
+	void RemoteActor::OnUpdate(float timeMult)
+	{
+		if (!_isAttachedLocally) {
+			std::int64_t renderTime = StateInterpolationBuffer::Now() - StateInterpolationBuffer::ServerDelay;
+
+			Vector2f pos;
+			if (_stateBuffer.Sample(renderTime, pos)) {
+				MoveInstantly(pos, MoveType::Absolute | MoveType::Force);
+			}
+		}
+
+		if (_modifierDecor != nullptr) {
+			// Glued to the interpolated position, and the renderer is refreshed right away, because the decoration
+			// may already have updated itself earlier in this frame
+			_modifierDecor->MoveInstantly(_pos, MoveType::Absolute | MoveType::Force);
+			_modifierDecor->UpdateRendererPosition();
+		}
+
+		_illuminateLights.OnUpdate(timeMult);
+
+		// Shield time decays locally (the server sends only state changes, not per-frame expiry), so the decoration
+		// fades out on remote players just like on the owning player
+		if (_activeShieldTime > 0.0f) {
+			_activeShieldTime -= timeMult;
+			if (_activeShieldTime <= 0.0f) {
+				_activeShield = ShieldType::None;
+				_activeShieldTime = 0.0f;
+			}
+		}
+
+		// Same timing as Player::OnUpdateTimers(), an early end is sent by the server
+		if (_sugarRushLeft > 0.0f) {
+			_sugarRushLeft -= timeMult;
+			if (_sugarRushLeft > 0.0f) {
+				_sugarRushStarsTime -= timeMult;
+				if (_sugarRushStarsTime <= 0.0f) {
+					_sugarRushStarsTime = Random().FastFloat(2.0f, 8.0f);
+					Player::SpawnSugarRushStar(_levelHandler, _metadata, _pos, _renderer.layer());
+				}
+			}
+		}
+
+		// The run-in-place, on the same footing as the shield and the sugar rush above: the server sends the
+		// *pose* and nothing else, so a remote player showed the wind-up at the animation's own flat speed and
+		// threw no sparks - reported as "the animation looks correct but the speed isn't". Nothing needs to be
+		// sent to fix it. The charge is a pure function of how long the wind-up has been running, so counting
+		// the frames the pose has been up here yields the same number the owner computes, not an estimate of
+		// it - see Player::UpdateRemoteRevUp().
+		//
+		// Keyed on what is actually drawn, transition included: the wind-up has a start animation played over
+		// the top, and a remote actor is sent whichever of the two is on screen.
+		AnimState drawnState = (_currentTransition != nullptr ? _currentTransition->State
+			: (_currentAnimation != nullptr ? _currentAnimation->State : _lastAnim));
+		if ((drawnState & AnimState::RevUp) == AnimState::RevUp && _metadata != nullptr) {
+			float speedUp = Player::UpdateRemoteRevUp(_levelHandler, _metadata, _pos, _renderer.layer(),
+				IsFacingLeft(), timeMult, _revUpTime, _revUpSparkCooldown);
+			// Only over the looping pose. The start animation is a transition with a length of its own, and
+			// writing the duration while one is playing is what once left the owner's own wind-up frozen on
+			// frame 0 - see the same guard in Player::UpdateRevUp().
+			if (_currentTransition == nullptr && _currentAnimation != nullptr) {
+				_renderer.AnimDuration = _currentAnimation->AnimDuration / speedUp;
+			}
+		} else if (_revUpTime > 0.0f) {
+			_revUpTime = 0.0f;
+			_revUpSparkCooldown = 0.0f;
+		}
+
+		ActorBase::OnUpdate(timeMult);
+	}
+
+	bool RemoteActor::OnDraw(RenderQueue& renderQueue)
+	{
+		// Remote players carry the same shield decoration as the local player; reuse the shared renderer so it looks
+		// identical. Skipped for non-player remote actors, which never receive a shield (and lack the shield anims).
+		if (_activeShield != ShieldType::None && _metadata != nullptr) {
+			Player::DrawShield(renderQueue, _activeShield, _activeShieldTime, _metadata,
+				_levelHandler->GetElapsedFrames(), _pos, _renderer.layer(), _shieldRenderCommands);
+		}
+
+		return ActorBase::OnDraw(renderQueue);
+	}
+
+	void RemoteActor::OnEmitLights(SmallVectorImpl<LightEmitter>& lights)
+	{
+		for (const auto& current : _lights) {
+			auto& light = lights.emplace_back(current);
+			light.Pos += _pos;
+		}
+
+		_illuminateLights.OnEmitLights(lights, _pos);
+	}
+
+	void RemoteActor::OnAttach(ActorBase* parent)
+	{
+		_isAttachedLocally = true;
+	}
+
+	void RemoteActor::OnDetach(ActorBase* parent)
+	{
+		_isAttachedLocally = false;
+	}
+
+	void RemoteActor::AssignMetadata(std::uint8_t flags, ActorState state, StringView path, AnimState anim, float rotation, float scaleX, float scaleY, ActorRendererType rendererType, DrawableNode::BlendingPreset blendingPreset)
+	{
+		constexpr ActorState RemotedFlags = ActorState::Illuminated | ActorState::IsInvulnerable |
+			ActorState::CollideWithOtherActors | ActorState::CollideWithSolidObjects | ActorState::IsSolidObject |
+			ActorState::CollideWithTilesetReduced | ActorState::CollideWithSolidObjectsBelow | ActorState::ExcludeSimilar;
+
+		// Load indexed sprites when this remote player has a custom color, so they can be recolored at draw time
+		RequestMetadata(path, _furColor != 0);
+		SetAnimation(anim);
+		// Track the assigned animation so the first SyncAnimationWithServer() for the same state isn't skipped as
+		// "unchanged", which would otherwise leave the actor stuck in its spawn animation
+		_lastAnim = anim;
+		SetState((GetState() & ~RemotedFlags) | (state & RemotedFlags));
+
+		if (GetState(ActorState::Illuminated) && _illuminateLights.IsEmpty()) {
+			_illuminateLights.Create();
+		}
+
+		// Objects that draw themselves with a non-default blending mode (additive shots, for instance) look
+		// nothing like the original without it, and it isn't derivable from anything else the client receives
+		_blendingPreset = blendingPreset;
+
+		_renderer.Initialize(rendererType);
+		_renderer.setRotation(rotation);
+
+		// Applies the blending preset too, so it has to come after Initialize()
+		RefreshColorPalette();
+
+		SyncMiscWithServer(flags);
+	}
+
+	void RemoteActor::SetPlayerColor(std::uint32_t furColor)
+	{
+		if (_furColor == furColor) {
+			return;
+		}
+		_furColor = furColor;
+
+		// Not assigned yet - AssignMetadata will pick up _furColor when it runs
+		if (_metadata == nullptr) {
+			return;
+		}
+
+		// Reload the current metadata with matching indexed-ness and re-resolve the animation (the metadata pointer
+		// changes), then (re)apply or clear the palette
+		String path = _metadata->Path;
+		AnimState currentState = (_currentAnimation != nullptr ? _currentAnimation->State : _lastAnim);
+		RequestMetadata(path, furColor != 0);
+		_currentAnimation = nullptr;
+		SetAnimation(currentState);
+
+		RefreshColorPalette();
+	}
+
+	void RemoteActor::ChangeMetadata(StringView path)
+	{
+		// Keep the recolor: load indexed when colored, and (re)apply or clear the palette
+		RequestMetadata(path, _furColor != 0);
+		RefreshColorPalette();
+	}
+
+	void RemoteActor::SyncPositionWithServer(Vector2f pos)
+	{
+		// A permanently hidden sprite must not collapse the buffer when the actor's visuals are replayed by
+		// a subclass, otherwise its position would freeze between received packets. A teleport always does.
+		bool interpolate = ((_alwaysInterpolate || _renderer.isDrawEnabled()) && !_stateBuffer.IsTeleport(pos));
+		_stateBuffer.Push(pos, StateInterpolationBuffer::Now(), interpolate);
+	}
+
+	void RemoteActor::SyncAnimationWithServer(AnimState anim, float rotation, float scaleX, float scaleY, Actors::ActorRendererType rendererType)
+	{
+		if (_lastAnim != anim) {
+			_lastAnim = anim;
+			SetAnimation(anim);
+		}
+
+		_renderer.setRotation(rotation);
+		_renderer.setScale(scaleX, scaleY);
+		_renderer.Initialize(rendererType);
+
+		ApplyBlendingPreset();
+	}
+
+	void RemoteActor::SyncMiscWithServer(std::uint8_t flags)
+	{
+		_renderer.setDrawEnabled((flags & 0x04) != 0);
+		_renderer.AnimPaused = (flags & 0x08) != 0;
+		SetFacingLeft((flags & 0x10) != 0);
+		_renderer.setFlippedY((flags & 0x20) != 0);
+
+		bool justWarped = (flags & 0x40) != 0;
+		if (justWarped) {
+			// Collapse the buffer to the most recent position, so the actor teleports instead of interpolating
+			_stateBuffer.Reset(_stateBuffer.GetLatest(), StateInterpolationBuffer::Now());
+		}
+	}
+
+	void RemoteActor::SyncLightsWithServer(ArrayView<const LightEmitter> lights)
+	{
+		_lights.assign(lights.begin(), lights.end());
+	}
+
+	void RemoteActor::SetShield(ShieldType shieldType, float timeLeft)
+	{
+		_activeShield = shieldType;
+		_activeShieldTime = (shieldType != ShieldType::None ? timeLeft : 0.0f);
+	}
+
+	void RemoteActor::SetSugarRush(float timeLeft)
+	{
+		_sugarRushLeft = std::max(timeLeft, 0.0f);
+	}
+
+	void RemoteActor::SetModifierDecor(std::shared_ptr<ActorBase> decor)
+	{
+		if (_modifierDecor == decor) {
+			return;
+		}
+
+		// A remote decoration interpolates its own position unless it's attached, which would fight the gluing below
+		if (auto* prevDecor = runtime_cast<RemoteActor>(_modifierDecor.get())) {
+			prevDecor->OnDetach(this);
+		}
+
+		_modifierDecor = std::move(decor);
+
+		if (auto* newDecor = runtime_cast<RemoteActor>(_modifierDecor.get())) {
+			newDecor->OnAttach(this);
+		}
+		if (_modifierDecor != nullptr) {
+			_modifierDecor->MoveInstantly(_pos, MoveType::Absolute | MoveType::Force);
+			_modifierDecor->UpdateRendererPosition();
+		}
+	}
+}
+
+#endif

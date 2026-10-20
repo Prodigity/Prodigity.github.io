@@ -1,0 +1,2248 @@
+﻿#include "ActorBase.h"
+#include "../ContentResolver.h"
+#include "../ILevelHandler.h"
+#include "../PreferencesCache.h"
+#include "../Events/EventMap.h"
+#include "../Tiles/TileMap.h"
+#include "../Collisions/DynamicTreeBroadPhase.h"
+
+#include "Explosion.h"
+#include "Player.h"
+#include "Solid/Pole.h"
+#include "Solid/PushableBox.h"
+#include "Weapons/ShieldFireShot.h"
+#include "Weapons/FreezerShot.h"
+#include "Weapons/ToasterShot.h"
+#include "Weapons/Thunderbolt.h"
+
+#if !defined(WITH_COROUTINES)
+#	pragma message("WITH_COROUTINES is not defined, building without asynchronous loading support")
+#endif
+
+#include "../../nCine/tracy.h"
+#include "../../nCine/Primitives/Matrix4x4.h"
+#include "../../nCine/Base/Random.h"
+#include "../../nCine/Base/FrameTimer.h"
+#include "../../nCine/Graphics/RHI/Rhi.h"
+
+using namespace Jazz2::Tiles;
+using namespace nCine;
+
+namespace Jazz2::Actors
+{
+	namespace
+	{
+		/** @brief Returns the bit pattern of a float without passing it through a floating-point instruction */
+		inline std::uint32_t FloatBits(float value)
+		{
+			// Not std::memcpy(), which the Nintendo 64 compiler expands into four byte loads and stores
+			union { float f; std::uint32_t i; } u;
+			u.f = value;
+			return u.i;
+		}
+
+		/**
+			@brief Whether both coordinates are finite and within the range of @ref floorFast()
+
+			Tested on the bit pattern, because on the Nintendo 64 even `abs.s` of a NaN raises the FPU's
+			unimplemented-operation exception - the value must not reach a floating-point instruction at all.
+		*/
+		inline bool IsUsablePosition(const Vector2f& pos)
+		{
+			// 4194304.0f (2^22); with the sign bit masked off, infinities and NaNs compare above it too
+			constexpr std::uint32_t MaxCoordinateBits = 0x4A800000u;
+			return ((FloatBits(pos.X) & 0x7FFFFFFFu) < MaxCoordinateBits && (FloatBits(pos.Y) & 0x7FFFFFFFu) < MaxCoordinateBits);
+		}
+
+		/** @brief Whether a render type leaves the alpha channel of the sprite color to the actor's own fade */
+		constexpr bool KeepsActorFadeInAlpha(ActorRendererType type)
+		{
+			// Outline and FrozenMask spend the alpha on their own transition instead (see ActorRenderer::Initialize())
+			return (type != ActorRendererType::Outline && type != ActorRendererType::FrozenMask);
+		}
+	}
+
+	ActorBase::ActorBase()
+		: _state(ActorState::None), _levelHandler(nullptr), _internalForceY(0.0f), _elasticity(0.0f), _friction(1.5f),
+			_unstuckCooldown(0.0f), _frozenTimeLeft(0.0f), _maxHealth(1), _health(1), _spawnFrames(0.0f), _spawnPos(0, 0, 0), _spawnEventType(EventType::Empty), _spawnEventParams{}, _metadata(nullptr),
+			_renderer(this), _currentAnimation(nullptr), _currentTransition(nullptr), _currentTransitionCancellable(false),
+			_collisionProxyID(Collisions::NullNode)
+	{
+	}
+
+	ActorBase::~ActorBase()
+	{
+	}
+
+	bool ActorBase::IsFacingLeft() const
+	{
+		return GetState(ActorState::IsFacingLeft);
+	}
+
+	void ActorBase::SetFacingLeft(bool value)
+	{
+		if (IsFacingLeft() == value) {
+			return;
+		}
+
+		SetState(ActorState::IsFacingLeft, value);
+		_renderer.setFlippedX(value);
+		
+		// The anchor follows the flip (see ActorRenderer::UpdateAnchor())
+		GraphicResource* res = (_currentTransition != nullptr ? _currentTransition : _currentAnimation);
+		if (res != nullptr) {
+			_renderer.UpdateAnchor();
+		}
+	}
+
+	void ActorBase::SetParent(SceneNode* parent)
+	{
+		_renderer.setParent(parent);
+	}
+
+	Task<bool> ActorBase::OnActivated(const ActorActivationDetails& details)
+	{
+		_state |= details.State | ActorState::CanBeFrozen | ActorState::CollideWithTileset | ActorState::CollideWithOtherActors | ActorState::ApplyGravitation;
+		_levelHandler = details.LevelHandler;
+		_pos = _frameStartPos = Vector2f((float)details.Pos.X, (float)details.Pos.Y);
+		_originTile = Vector2i((std::int32_t)details.Pos.X / 32, (std::int32_t)details.Pos.Y / 32);
+		if ((details.State & (ActorState::IsCreatedFromEventMap | ActorState::IsFromGenerator)) != ActorState::None) {
+			// An off-grid event has a tile of its own, the position of its object isn't in it
+			if (auto* events = _levelHandler->EventMap(); events != nullptr && events->GetOffGridEventCount() > 0) {
+				_originTile = events->GetOriginTile(Vector2i(details.Pos.X, details.Pos.Y), details.Type);
+			}
+		}
+		_spawnFrames = _levelHandler->GetElapsedFrames();
+		_spawnPos = details.Pos;
+
+		// Remember what the object was spawned from, so it can be spawned again from a level state snapshot.
+		// Parameters are always provided in full size by EventSpawner, which is the only one that sets the type.
+		_spawnEventType = details.Type;
+		if (details.Type != EventType::Empty && details.Params != nullptr) {
+			std::memcpy(_spawnEventParams, details.Params, sizeof(_spawnEventParams));
+		}
+
+		std::uint16_t layer = (std::uint16_t)details.Pos.Z;
+		_renderer.setLayer(layer);
+
+		bool success = async_await OnActivatedAsync(details);
+
+		// Several objects offset themselves from the event position while activating (a pole by its event
+		// parameters, a steam note by a fixed amount, a floating enemy onto the water surface). That offset is
+		// where the object was placed, not a distance it travelled, so it must not linger as a path until the
+		// first update overwrites it (see ResetPathTracking())
+		ResetPathTracking();
+
+		_renderer.setPosition(roundFast(_pos.X), roundFast(_pos.Y));
+
+		OnUpdateHitbox();
+
+		_state |= ActorState::Initialized;
+
+		async_return success;
+	}
+
+	Task<bool> ActorBase::OnActivatedAsync(const ActorActivationDetails& details)
+	{
+		// This should be overridden and return true
+		async_return false;
+	}
+
+	bool ActorBase::OnTileDeactivated()
+	{
+		return true;
+	}
+
+	namespace
+	{
+		// Instance flags that are part of the live state, the rest is either given by spawning (instantiation
+		// flags), managed internally, or cannot be changed during the object lifetime (ForceDisableCollisions)
+		constexpr ActorState SerializableStateMask = ActorState::IsInvulnerable | ActorState::CanJump | ActorState::CanBeFrozen |
+			ActorState::IsFacingLeft | ActorState::CollideWithTileset | ActorState::CollideWithOtherActors |
+			ActorState::CollideWithSolidObjects | ActorState::ApplyGravitation | ActorState::IsSolidObject |
+			ActorState::SkipPerPixelCollisions | ActorState::CollideWithTilesetReduced | ActorState::CollideWithSolidObjectsBelow |
+			ActorState::ExcludeSimilar;
+	}
+
+	bool ActorBase::IsSerializable() const
+	{
+		static_assert(SpawnParamsSize == Events::EventSpawner::SpawnParamsSize, "Size of spawn parameters mismatch");
+
+		return (_spawnEventType != EventType::Empty);
+	}
+
+	void ActorBase::OnSerializeState(Stream& dest)
+	{
+		dest.WriteValueAsLE<float>(_pos.X);
+		dest.WriteValueAsLE<float>(_pos.Y);
+		dest.WriteValueAsLE<float>(_speed.X);
+		dest.WriteValueAsLE<float>(_speed.Y);
+		dest.WriteValueAsLE<float>(_externalForce.X);
+		dest.WriteValueAsLE<float>(_externalForce.Y);
+		dest.WriteValueAsLE<float>(_internalForceY);
+		dest.WriteValueAsLE<float>(_elasticity);
+		dest.WriteValueAsLE<float>(_friction);
+		dest.WriteValueAsLE<float>(_frozenTimeLeft);
+		dest.WriteVariableInt32(_health);
+		dest.WriteVariableInt32(_maxHealth);
+		dest.WriteVariableUint32((std::uint32_t)(_state & SerializableStateMask));
+
+		// Only the looping animation is stored, a running transition cannot be restored without its callback
+		dest.WriteVariableUint32(_currentAnimation != nullptr ? (std::uint32_t)_currentAnimation->State : UINT32_MAX);
+		dest.WriteValueAsLE<float>(_currentTransition == nullptr ? _renderer.AnimTime : 0.0f);
+
+		std::uint8_t rendererFlags = 0;
+		if (_renderer.isDrawEnabled()) rendererFlags |= 0x01;
+		if (_renderer.AnimPaused) rendererFlags |= 0x02;
+		dest.WriteValue<std::uint8_t>(rendererFlags);
+		dest.WriteValueAsLE<std::uint16_t>(_renderer.layer());
+		dest.WriteValueAsLE<float>(_renderer.rotation());
+		dest.WriteValueAsLE<float>(_renderer.scale().X);
+		dest.WriteValueAsLE<float>(_renderer.scale().Y);
+		dest.WriteValueAsLE<float>(_renderer.alpha());
+	}
+
+	void ActorBase::OnDeserializeState(Stream& src)
+	{
+		_pos.X = src.ReadValueAsLE<float>();
+		_pos.Y = src.ReadValueAsLE<float>();
+		_speed.X = src.ReadValueAsLE<float>();
+		_speed.Y = src.ReadValueAsLE<float>();
+		_externalForce.X = src.ReadValueAsLE<float>();
+		_externalForce.Y = src.ReadValueAsLE<float>();
+		_internalForceY = src.ReadValueAsLE<float>();
+		_elasticity = src.ReadValueAsLE<float>();
+		_friction = src.ReadValueAsLE<float>();
+		_frozenTimeLeft = src.ReadValueAsLE<float>();
+		_health = src.ReadVariableInt32();
+		_maxHealth = src.ReadVariableInt32();
+		ActorState state = (ActorState)src.ReadVariableUint32();
+		_state = (_state & ~SerializableStateMask) | (state & SerializableStateMask);
+
+		std::uint32_t animState = src.ReadVariableUint32();
+		float animTime = src.ReadValueAsLE<float>();
+		std::uint8_t rendererFlags = src.ReadValue<std::uint8_t>();
+		std::uint16_t layer = src.ReadValueAsLE<std::uint16_t>();
+		float rotation = src.ReadValueAsLE<float>();
+		float scaleX = src.ReadValueAsLE<float>();
+		float scaleY = src.ReadValueAsLE<float>();
+		float alpha = src.ReadValueAsLE<float>();
+
+		// A transition started by the activation would finish with a callback that doesn't belong to the restored state
+		ForceCancelTransition();
+		if (animState != UINT32_MAX) {
+			if (_currentAnimation == nullptr || (std::uint32_t)_currentAnimation->State != animState) {
+				_currentAnimation = nullptr;
+				SetAnimation((AnimState)animState);
+			}
+			if (_currentAnimation != nullptr && _renderer.AnimDuration >= 0.0f) {
+				_renderer.AnimTime = std::clamp(animTime, 0.0f, _renderer.AnimDuration);
+			}
+		}
+
+		_renderer.setDrawEnabled((rendererFlags & 0x01) != 0);
+		_renderer.AnimPaused = ((rendererFlags & 0x02) != 0 || _frozenTimeLeft > 0.0f);
+		_renderer.setLayer(layer);
+		_renderer.setRotation(rotation);
+		_renderer.setScale(scaleX, scaleY);
+		_renderer.setAlphaF(alpha);
+		_renderer.setFlippedX(IsFacingLeft());
+		if (_currentAnimation != nullptr) {
+			_renderer.UpdateAnchor();
+		}
+
+		ResetPathTracking();
+		_renderer.setPosition(roundFast(_pos.X), roundFast(_pos.Y));
+		OnUpdateHitbox();
+
+		if ((_state & ActorState::ForceDisableCollisions) != ActorState::ForceDisableCollisions) {
+			_state |= ActorState::IsDirty;
+		}
+	}
+
+	void ActorBase::OnAttach(ActorBase* parent)
+	{
+		// Can be overridden
+	}
+
+	void ActorBase::OnDetach(ActorBase* parent)
+	{
+		// Can be overridden
+	}
+
+	void ActorBase::OnUpdate(float timeMult)
+	{
+		TileCollisionParams params = { TileDestructType::None, _speed.Y >= 0.0f };
+		TryStandardMovement(timeMult, params);
+		OnUpdateHitbox();
+		UpdateFrozenState(timeMult);
+	}
+
+	void ActorBase::OnUpdateHitbox()
+	{
+		if (_metadata != nullptr) {
+			if DEATH_UNLIKELY(_metadata->BoundingBox == Vector2i(ContentResolver::InvalidValue, ContentResolver::InvalidValue)) {
+				// A metadata without a box (a deferred one whose first sheet could not be read) falls back to
+				// the sprite that is showing, like the box would have been derived from the first sheet
+				// otherwise; INT_MAX passed on as a size made a hitbox a billion pixels wide
+				if (_currentAnimation != nullptr && _currentAnimation->Base != nullptr) {
+					Vector2i boundingBox = GenericGraphicResource::GetDefaultBoundingBox(_currentAnimation->Base->FrameDimensions);
+					UpdateHitbox(boundingBox.X, boundingBox.Y);
+				}
+				return;
+			}
+			UpdateHitbox(_metadata->BoundingBox.X, _metadata->BoundingBox.Y);
+		}
+	}
+
+	bool ActorBase::OnDraw(RenderQueue& renderQueue)
+	{
+		// Override and return true to suppress default rendering
+		return false;
+	}
+
+	void ActorBase::OnHealthChanged(ActorBase* collider)
+	{
+		// Can be overridden
+	}
+
+	bool ActorBase::OnPerish(ActorBase* collider)
+	{
+		if (GetState(ActorState::IsCreatedFromEventMap)) {
+			auto events = _levelHandler->EventMap();
+			if (events != nullptr) {
+				events->Deactivate(_originTile.X, _originTile.Y);
+				events->StoreTileEvent(_originTile.X, _originTile.Y, EventType::Empty);
+			}
+		}
+
+		_state |= ActorState::IsDestroyed | ActorState::SkipPerPixelCollisions;
+		return true;
+	}
+
+	void ActorBase::OnHitFloor(float timeMult)
+	{
+		// Called from inside the position update code when the object hits floor
+		// and was falling earlier. Objects should override this if they need to
+		// (e.g., the Player class playing a sound).
+	}
+
+	void ActorBase::OnHitCeiling(float timeMult)
+	{
+		// Called from inside the position update code when the object hits ceiling.
+		// Objects should override this if they need to.
+	}
+
+	void ActorBase::OnHitWall(float timeMult)
+	{
+		// Called from inside the position update code when the object hits a wall.
+		// Objects should override this if they need to.
+	}
+
+	bool ActorBase::OnHandleCollision(ActorBase* other)
+	{
+		if (GetState(ActorState::CanBeFrozen)) {
+			HandleFrozenStateChange(other);
+		}
+		return false;
+	}
+
+	bool ActorBase::CanCauseDamage(ActorBase* collider)
+	{
+		return false;
+	}
+
+	void ActorBase::OnTriggeredEvent(EventType eventType, std::uint8_t* eventParams)
+	{
+		// Can be overridden
+	}
+
+	void ActorBase::TryStandardMovement(float timeMult, TileCollisionParams& params)
+	{
+		ZoneScoped;
+
+		if (_unstuckCooldown > 0.0f) {
+			_unstuckCooldown -= timeMult;
+		}
+
+		float currentGravity;
+		float currentElasticity = _elasticity;
+		if ((_state & ActorState::ApplyGravitation) == ActorState::ApplyGravitation) {
+			currentGravity = _levelHandler->GetGravity();
+			if (_pos.Y >= _levelHandler->GetWaterLevel()) {
+				currentGravity *= 0.5f;
+				currentElasticity *= 0.7f;
+			}
+		} else {
+			currentGravity = 0.0f;
+		}
+
+		float accelY = (_internalForceY + _externalForce.Y) * timeMult;
+
+		_speed.X = std::clamp(_speed.X, -_horizontalSpeedLimit, _horizontalSpeedLimit);
+		_speed.Y = std::clamp(_speed.Y + accelY, -_verticalSpeedLimit, _verticalSpeedLimit);
+
+		float effectiveSpeedX, effectiveSpeedY;
+		if (_frozenTimeLeft > 0.0f) {
+			effectiveSpeedX = std::clamp(_externalForce.X * timeMult, -16.0f, 16.0f);
+			effectiveSpeedY = ((_state & ActorState::ApplyGravitation) == ActorState::ApplyGravitation
+				? (_speed.Y + 0.5f * accelY)
+				: std::clamp(((currentGravity * 2.0f) + _internalForceY) * timeMult, -16.0f, 16.0f));
+		} else {
+			effectiveSpeedX = _speed.X + _externalForce.X * timeMult;
+			effectiveSpeedY = _speed.Y + 0.5f * accelY;
+		}
+		// Gravity is applied to `_speed.Y` at the *end* of this function, after the move, so the distance
+		// travelled this frame would otherwise be `v * dt` where the exact figure is `v * dt + g * dt^2 / 2`.
+		// That missing half-step grows with `dt^2`, which made jump height depend on the frame rate: measured
+		// about 5% high at 24 FPS and 1.5% low at 144. Folding half a step of gravity in here is the
+		// velocity-Verlet form and makes the position exact for a constant acceleration, which is what a jump
+		// arc is. It has to come *before* the rise cap below, or a capped rise ends up travelling slower than
+		// the cap and the correction lands twice as hard as it should.
+		//
+		// Only while the actor is actually in flight, which is the same condition the tail applies gravity
+		// under: an actor standing on the floor has its gravity cancelled by the floor, so half a step of it
+		// is not a correction but a spurious nudge downwards, and one that costs a slope search every frame
+		// and jitters the actor by a fraction of a pixel as that search answers it.
+		if (currentGravity > 0.0f && (_state & ActorState::ApplyGravitation) == ActorState::ApplyGravitation &&
+			(_speed.Y < 0.0f || (_state & ActorState::CanJump) != ActorState::CanJump)) {
+			// An Euler bias was tried here and taken out again; see *Standing jump is 3% short* in
+			// `Docs/MovementAccuracyReference.dox` for the measurements. In short: subtracting half a step of
+			// the original's own tick makes the fully-uncapped rises exact - `a_jump`, `ap_r30` and
+			// `an_shoot_air` all land on 132.0 against 132.0 - and breaks everything whose rise gravity was
+			// *fitted* rather than derived, because those fits already absorb whatever the original integrates
+			// with. `ap_r05` went from +0.2 to +4.2, the copter with it, and two of the three springs by 5 and
+			// 8. Do not re-apply it as a blanket rule.
+			effectiveSpeedY += 0.5f * GetGravityModifier(currentGravity, /*isRising:*/_speed.Y < 0.0f) * timeMult;
+		}
+
+		// Cap applied upward speed if requested. Internal `_speed.Y` keeps its (larger) momentum, so the actor
+		// rises at a constant capped speed for the first frames while gravity bleeds the momentum off - this is
+		// how the original JJ2 springs/jumps behave (applied vertical movement clamped to 8 px/tick).
+		if (_maxRiseSpeed > 0.0f && effectiveSpeedY < -_maxRiseSpeed) {
+			effectiveSpeedY = -_maxRiseSpeed;
+		}
+		// Same idea on the horizontal axis: the momentum in `_speed.X` is kept, but the actor only travels at
+		// the capped rate, which is how the original's dash reports twice the speed it visibly moves at
+		if (_maxAppliedSpeedX > 0.0f) {
+			effectiveSpeedX = std::clamp(effectiveSpeedX, -_maxAppliedSpeedX, _maxAppliedSpeedX);
+		}
+
+		effectiveSpeedX *= timeMult;
+		effectiveSpeedY *= timeMult;
+
+		Vector2f posBefore = _pos;
+		bool movementAttempted = (std::abs(effectiveSpeedX) > 0.0f || std::abs(effectiveSpeedY) > 0.0f);
+		if (movementAttempted) {
+			// The distance of a whole frame is resolved in several shorter sub-steps. Every check below only ever
+			// tests the destination of a move, so one long step can pass straight through thin geometry, and the
+			// slope tolerance derived from its length can snap the actor diagonally across a wall corner into a
+			// pocket it cannot leave again. Both scale with `timeMult`, which is why actors used to get stuck in
+			// walls at low frame rates.
+			//
+			// The number of sub-steps is driven by two things. `timeMult` splits a long frame into as many
+			// collision steps as the same amount of time would have taken at the nominal 60 Hz, which is what
+			// makes the outcome frame-rate independent, and the distance itself caps a single step at
+			// `MaxMovementStep` so that even full speed cannot skip over anything.
+			// A whole frame that already fits inside one safe step needs neither: it cannot skip over anything,
+			// and splitting it anyway only multiplies the slope search below. At `MaxTimeMult` that was three
+			// full searches for an actor drifting a fraction of a pixel, on the weakest hardware - which is
+			// where a low frame rate, and therefore this whole path, is reached in the first place.
+			float distance = std::max(std::abs(effectiveSpeedX), std::abs(effectiveSpeedY));
+			std::int32_t substepCount = 1;
+			if (distance > MaxMovementStep) {
+				substepCount = std::max<std::int32_t>((std::int32_t)timeMult, 1);
+				if ((float)substepCount < timeMult) {
+					substepCount++;
+				}
+				if (distance > substepCount * MaxMovementStep) {
+					substepCount = (std::int32_t)(distance / MaxMovementStep) + 1;
+				}
+				if (substepCount > MaxMovementSubsteps) {
+					substepCount = MaxMovementSubsteps;
+				}
+			}
+			float stepX = effectiveSpeedX / substepCount;
+			float stepY = effectiveSpeedY / substepCount;
+
+			MovementResult result = {};
+			for (std::int32_t i = 0; i < substepCount; i++) {
+				MovementResult stepResult = {};
+				bool stepMoved = TryMoveSubstep(stepX, stepY, currentGravity, currentElasticity, params, stepResult);
+
+				result.HitWall |= stepResult.HitWall;
+				result.HitCeiling |= stepResult.HitCeiling;
+				result.HitFloor |= stepResult.HitFloor;
+
+				// Don't keep pushing into whatever was hit for the rest of the frame - the remaining sub-steps
+				// would just repeat the same blocked move
+				if (stepResult.HitWall) {
+					stepX = 0.0f;
+				}
+				if (stepResult.HitCeiling || stepResult.HitFloor) {
+					stepY = 0.0f;
+				}
+				if (!stepMoved || (stepX == 0.0f && stepY == 0.0f)) {
+					break;
+				}
+			}
+
+			// The callbacks are reported once per frame, however many sub-steps it took
+			bool hitCalled = false;
+			if (result.HitCeiling) {
+				OnHitCeiling(timeMult);
+				hitCalled = true;
+			} else if (result.HitFloor) {
+				OnHitFloor(timeMult);
+				hitCalled = true;
+			}
+			if (result.HitWall && !hitCalled) {
+				OnHitWall(timeMult);
+			}
+		}
+
+		// The actor didn't get anywhere, so it might have ended up inside solid geometry - either it was spawned
+		// there, a moving solid object swept over it, or a tile appeared around it. An actor completely at rest
+		// is covered as well (the old attempt was only reachable from the ground branch after a failed move, so
+		// an actor whose speed had already been zeroed had no way out at all), but only while gravity applies to
+		// it - an actor being warped or carried along has its position dictated from elsewhere. Note that merely
+		// standing on the floor or leaning against a wall is not stuck and `TryUnstuck()` leaves it alone.
+		if (_pos == posBefore && (movementAttempted || (_state & ActorState::ApplyGravitation) == ActorState::ApplyGravitation)) {
+			TryUnstuck();
+		}
+
+		// Reduce all forces if they are present
+		if (std::abs(_externalForce.X) > 0.0f) {
+			if (_externalForce.X > 0.0f) {
+				_externalForce.X = std::max(_externalForce.X - _friction * timeMult, 0.0f);
+			} else {
+				_externalForce.X = std::min(_externalForce.X + _friction * timeMult, 0.0f);
+			}
+		}
+
+		// Handle gravity and collision with floor. The state is re-checked instead of trusting `currentGravity`
+		// from the top of the function, because one of the hit callbacks above may have turned gravitation off
+		// during the move (the player's ledge climb does exactly that). Applying a whole frame of gravity on top
+		// of the speed such a callback just assigned would scale that speed with the frame rate, and since
+		// gravity stays off afterwards the actor would keep the reduced speed for as long as the move lasts.
+		if (currentGravity > 0.0f && (_state & ActorState::ApplyGravitation) == ActorState::ApplyGravitation) {
+			if (_speed.Y >= 0.0f) {
+				// Actor is going down
+				AABBf aabb = AABBInner;
+				aabb.B += CollisionCheckStep;
+				if (_levelHandler->IsPositionEmpty(this, aabb, params)) {
+					// There is still some space below - only apply gravity
+					SetState(ActorState::CanJump, false);
+					_speed.Y += GetGravityModifier(currentGravity, /*isRising:*/false) * timeMult;
+				} else {
+					// Actor is on the floor
+					OnHitFloor(timeMult);
+					if (currentElasticity != 0.0f) {
+						SetState(ActorState::CanJump, false);
+						_speed.Y = -(currentElasticity * effectiveSpeedY / timeMult);
+					} else {
+						SetState(ActorState::CanJump, true);
+						_speed.Y = 0.0f;
+					}
+				}
+			} else {
+				// Actor is going up - only apply gravity
+				SetState(ActorState::CanJump, false);
+				_speed.Y += GetGravityModifier(currentGravity, /*isRising:*/true) * timeMult;
+			}
+
+			_externalForce.Y = std::min(_externalForce.Y + currentGravity * 0.33f * timeMult, 0.0f);
+			_internalForceY = std::min(_internalForceY + currentGravity * 0.33f * timeMult, 0.0f);
+		}
+	}
+
+	bool ActorBase::IsSupportedAfterMove(float stepX, float stepY)
+	{
+		// Would the actor have ground under it after moving there? Used to tell a downhill slope, where the
+		// ground continues just below, from a gap, where nothing does - see TryMoveSubstep().
+		//
+		// Deliberately does not take the caller's TileCollisionParams: this is a question, not a move, and
+		// passing those through would let a probe destroy a tile or count as a weapon hit. It costs one
+		// extra tilemap query per downward candidate in the slope search, alongside the MoveInstantly() that
+		// candidate already needs, so the downward half of the search is about twice the work it was.
+		AABBf aabb = AABBInner + Vector2f(stepX, stepY);
+		aabb.T = aabb.B;
+		aabb.B += CollisionCheckStep;
+		TileCollisionParams probeParams = { TileDestructType::None, true };
+		return !_levelHandler->IsPositionEmpty(this, aabb, probeParams);
+	}
+
+	bool ActorBase::TryMoveSubstep(float stepX, float stepY, float currentGravity, float currentElasticity, TileCollisionParams& params, MovementResult& result)
+	{
+		if (GetState(ActorState::CanJump | ActorState::ApplyGravitation)) {
+			// All ground-bound movement is handled here. In the basic case, the actor
+			// moves horizontally, but it can also logically move up or down if it is
+			// moving across a slope. In here, angles between about 45 degrees down
+			// to 45 degrees up are attempted with some intervals to attempt to keep
+			// the actor attached to the slope in question.
+
+			// Always try values a bit over the 45 degree incline; subpixel coordinates
+			// may mean the actor actually needs to move a pixel up or down even though
+			// the speed wouldn't warrant that large of a change.
+			// Not doing this will cause hiccups with uphill slopes in particular.
+			// Beach tileset also has some spots where two properly set up adjacent
+			// tiles have a 2px jump, so adapt to that.
+			// The candidates are tried from the most downward angle upwards, so a downhill slope is followed
+			// rather than walked off. A downward candidate is only worth taking if there is actually ground
+			// under it, though: over a *gap* every one of them is free, so the first one tried wins and the
+			// actor is dropped by the full search range the instant the floor ends - and since the range
+			// grows with the horizontal step, running faster dropped the actor deeper instead of carrying it
+			// further. That made a two-tile gap uncrossable at full speed, where the original clears four.
+			// Requiring support turns those candidates down and leaves the fall to gravity, which is what
+			// the original does: `ys` goes straight into the fall gravity with no snap at all.
+			bool success = false;
+			float maxYDiff = std::max(3.0f, std::abs(stepX) + 2.5f);
+			for (float yDiff = maxYDiff + stepY; yDiff >= -maxYDiff + stepY; yDiff -= CollisionCheckStep) {
+				if (yDiff > stepY && !IsSupportedAfterMove(stepX, yDiff)) {
+					continue;
+				}
+				if (MoveInstantly(Vector2f(stepX, yDiff), MoveType::Relative, params)) {
+					success = true;
+					break;
+				}
+			}
+
+			if (success) {
+				return true;
+			}
+
+			// Also try to move horizontally as far as possible
+			float xDiff = std::abs(stepX);
+			if (xDiff > CollisionCheckStep) {
+				float sign = (stepX > 0.0f ? 1.0f : -1.0f);
+				for (; xDiff > CollisionCheckStep; xDiff -= CollisionCheckStep) {
+					if (MoveInstantly(Vector2f(xDiff * sign, 0.0f), MoveType::Relative, params)) {
+						// The actor slid up against a wall instead of going all the way, so this still counts
+						// as hitting it - the wall response was previously skipped in this case
+						success = true;
+						break;
+					}
+				}
+			}
+
+			// No angle worked, so the actor is facing a wall - it either couldn't move at all or only slid part
+			// of the way into it. Its horizontal speed is spent on the wall (or reflected off it for an elastic
+			// actor) just like in the airborne branch, otherwise it would keep pressing into the wall at full
+			// speed - and keep reporting the hit - for as long as the speed is applied.
+			if (xDiff > CollisionCheckStep || (xDiff > 0.0f && currentElasticity > 0.0f)) {
+				_speed.X = -(currentElasticity * _speed.X);
+				_externalForce.X = 0.0f;
+			}
+			result.HitWall = true;
+			return success;
+		}
+
+		// Airborne movement is handled here
+		// First, attempt to move directly based on the current speed values
+		if (MoveInstantly(Vector2f(stepX, stepY), MoveType::Relative, params)) {
+			return true;
+		}
+
+		// First, attempt to move horizontally as much as possible
+		float xDiff = std::abs(stepX);
+		// For mostly-horizontal airborne movement (e.g., Spaz/Lori sidekick), climb gentle upslopes
+		// instead of stopping at their foot: if the straight horizontal step is blocked, retry the
+		// full step with an increasing upward offset. Flat ground / open air succeed on the straight
+		// step, so there is no upward drift, and steep walls still block (xDiff stays full on success).
+		bool movedHorizontally = MoveInstantly(Vector2f(stepX, 0.0f), MoveType::Relative, params);
+		// The comparison has to include the equal case, and that is not a rounding nicety - it is the whole of
+		// "jumping into a 45 degree slope kills your momentum". A dashing jump travels 8 px across while rising
+		// at the applied cap of 8, so against a 45 degree face the two steps are *exactly* equal; a strict `>`
+		// turns the climb off at precisely the angle it exists for, the loop below then grinds the horizontal
+		// step down to nothing, this reports `HitWall`, and Player::OnHitWall() zeroes the speed. Measured
+		// (`sl_up45_jhold`): the original holds 16.0 px/tick the whole way up such a face, where this engine
+		// dropped to 1.0. Shared with Reforged rather than gated, like the other two collision fixes, because
+		// it makes the search cover the range the comment above it already claims - up to about 45 degrees.
+		if (!movedHorizontally && std::abs(stepX) >= std::abs(stepY)) {
+			float maxClimb = std::abs(stepX) + 2.5f;
+			// Coming down onto the edge of a ledge, the reach has to be the landing allowance the actor asks
+			// for rather than whatever the horizontal sub-step happens to be - see `_landingTolerance`. With
+			// only the sub-step to work with, a descending actor is caught by the ledge's side instead of
+			// being put on top of it, which lands a whole gap short of the original at every speed.
+			//
+			// It takes a real descent, not merely a non-negative one. One frame past the apex of a jump the
+			// step is a hair below zero (half a step of gravity and nothing else), so `stepY > 0.0f` was also
+			// true for a player rising against a wall and holding into it - which made every wall in the game
+			// `_landingTolerance` easier to mount than the jump arc allows, and put geometry a level author
+			// had deliberately placed out of reach back within it.
+			if (stepY > CollisionCheckStep && _landingTolerance > 0.0f) {
+				maxClimb = std::max(maxClimb, _landingTolerance);
+			}
+			for (float yUp = CollisionCheckStep; yUp <= maxClimb; yUp += CollisionCheckStep) {
+				if (MoveInstantly(Vector2f(stepX, -yUp), MoveType::Relative, params)) {
+					movedHorizontally = true;
+					break;
+				}
+			}
+		}
+		if (!movedHorizontally) {
+			for (; xDiff > std::numeric_limits<float>::epsilon(); xDiff -= CollisionCheckStep) {
+				if (MoveInstantly(Vector2f(std::copysign(xDiff, stepX), 0.0f), MoveType::Relative, params)) {
+					break;
+				}
+			}
+		}
+
+		// Then, try the same vertically
+		float yDiff = std::abs(stepY);
+		for (; yDiff > std::numeric_limits<float>::epsilon(); yDiff -= CollisionCheckStep) {
+			float yDiffSigned = std::copysign(yDiff, stepY);
+			if (MoveInstantly(Vector2f(0.0f, yDiffSigned), MoveType::Relative, params) ||
+				// Add horizontal tolerance
+				MoveInstantly(Vector2f(yDiff * 0.2f, yDiffSigned), MoveType::Relative, params) ||
+				MoveInstantly(Vector2f(yDiff * -0.2f, yDiffSigned), MoveType::Relative, params)) {
+				break;
+			}
+		}
+
+		if (stepY < 0.0f) {
+			if (-yDiff > stepY) {
+				// Reset speed and also internal force, mainly because of player jump
+				_speed.Y = 0.0f;
+				if (_internalForceY < 0.0f) {
+					_internalForceY = 0.0f;
+				}
+				result.HitCeiling = true;
+			}
+		} else if (stepY > 0.0f && yDiff < stepY && currentGravity <= 0.0f) {
+			// If there is no gravity and actor is touching floor, the callback wouldn't be called otherwise
+			result.HitFloor = true;
+		}
+
+		// If the actor didn't move all the way horizontally, it hit a wall (or was already touching it)
+		if (xDiff < std::abs(stepX) * 0.3f) {
+			if (xDiff > 0.0f && currentElasticity > 0.0f) {
+				_speed.X = -(currentElasticity * _speed.X);
+				_externalForce.X = 0.0f;
+			}
+			result.HitWall = true;
+		}
+
+		return (xDiff > std::numeric_limits<float>::epsilon() || yDiff > std::numeric_limits<float>::epsilon());
+	}
+
+	bool ActorBase::TryUnstuck()
+	{
+		if (_unstuckCooldown > 0.0f || !GetState(ActorState::CollideWithTileset)) {
+			return false;
+		}
+
+		// Only the lower part of the hitbox decides whether the actor is stuck - the upper part regularly
+		// overlaps a tile while the actor stands in a doorway or under a low ceiling, which is perfectly fine
+		AABBf aabb = AABBInner;
+		float t = aabb.B - 14.0f;
+		if (aabb.T < t) {
+			aabb.T = t;
+		}
+		TileCollisionParams paramsProbe = { TileDestructType::None, true };
+		if (_levelHandler->IsPositionEmpty(this, aabb, paramsProbe)) {
+			// Nearly every actor asking about this is standing perfectly fine, and this runs for all of them
+			// that are at rest, so the check itself is throttled as well. A few frames before an actor that
+			// just got trapped starts looking for a way out make no perceptible difference.
+			_unstuckCooldown = UnstuckRetryNotStuck;
+			return false;
+		}
+
+		// Probe outwards in growing distances and take the first free spot. Straight up comes first, because
+		// ending up on top of whatever the actor sank into is almost always the intended resolution, then
+		// sideways, then down; the diagonals cover corners where no single axis is free on its own. Unlike
+		// the old vertical-only search this also gets an actor out of a wall it was pushed into sideways.
+		static const Vector2f Directions[] = {
+			{ 0.0f, -1.0f }, { -1.0f, 0.0f }, { 1.0f, 0.0f }, { 0.0f, 1.0f },
+			{ -0.7f, -0.7f }, { 0.7f, -0.7f }, { -0.7f, 0.7f }, { 0.7f, 0.7f }
+		};
+
+		// Non-destructive, deliberately, and not the caller's params: this is a search for somewhere to stand,
+		// not a move the actor makes, and up to 8 directions x 12 distances of it. Handing it the caller's
+		// params let a single stuck frame carve destructible tiles out of everything within MaxUnstuckDistance
+		// in eight directions - and, because `TilesDestroyed` accumulates into the same struct, award the
+		// player score for a hole they never moved through. IsSupportedAfterMove() avoids this the same way.
+		TileCollisionParams paramsEscape = { TileDestructType::None, true };
+
+		for (float distance = 2.0f; distance <= MaxUnstuckDistance; distance += 2.0f) {
+			for (const Vector2f& direction : Directions) {
+				if (MoveInstantly(direction * distance, MoveType::Relative, paramsEscape)) {
+					// The escape is a forced relocation, not a path the actor took - it's expressed as a relative
+					// move only because the free spot is searched for around the actor - so nothing on the way to
+					// it was touched and the path has to be discarded (see ResetPathTracking())
+					ResetPathTracking();
+					_unstuckCooldown = UnstuckCooldown;
+					return true;
+				}
+			}
+		}
+
+		// Nowhere to go - wait before burning another full search, but retry sooner than after a successful
+		// escape, because whatever traps the actor may well move away on its own
+		_unstuckCooldown = UnstuckRetryTrapped;
+		return false;
+	}
+
+	void ActorBase::UpdateHitbox(std::int32_t w, std::int32_t h)
+	{
+		if (_currentAnimation == nullptr) {
+			return;
+		}
+
+		auto& base = _currentAnimation->Base;
+		if (base->Coldspot != Vector2i(ContentResolver::InvalidValue, ContentResolver::InvalidValue)) {
+			AABBInner = AABBf(
+				_pos.X - base->Hotspot.X + base->Coldspot.X - (w / 2),
+				_pos.Y - base->Hotspot.Y + base->Coldspot.Y - h,
+				_pos.X - base->Hotspot.X + base->Coldspot.X + (w / 2),
+				_pos.Y - base->Hotspot.Y + base->Coldspot.Y
+			);
+		} else {
+			// Collision base set to the bottom of the sprite - of its *pixels*, not of its frame. The frame carries
+			// a `GenericGraphicResource::FrameBorder` on every side and `FrameDimensions` counts it in, so resting
+			// an actor on the frame's edge rests it on that margin and leaves its artwork floating - reported as
+			// objects sitting a few pixels above the floor, which the original does not do.
+			//
+			// Three actors used to subtract it by hand - the weapon, shield and morph monitors, the weapon one
+			// commented as a fix for a single level - so they were right and everything else without a coldspot
+			// was not. Those three no longer do; this is the one place that knows what the frame is made of.
+			// An actor whose sheet carries a coldspot is unaffected: JJ2's own coldspot already accounts for it,
+			// which is why crates - whose sheets do carry one - were never part of this.
+			//
+			// `h` is counted up from here, so a box derived from the frame has to drop the margin at both ends or
+			// the move would just carry the error to the top edge and the player would stand that far above a
+			// crate - see where `ContentResolver` derives `Metadata::BoundingBox`.
+			AABBInner = AABBf(
+				_pos.X - (w / 2),
+				_pos.Y - base->Hotspot.Y + base->FrameDimensions.Y - GenericGraphicResource::FrameBorder - h,
+				_pos.X + (w / 2),
+				_pos.Y - base->Hotspot.Y + base->FrameDimensions.Y - GenericGraphicResource::FrameBorder
+			);
+		}
+	}
+
+	void ActorBase::CreateParticleDebrisOnPerish(ActorBase* collider)
+	{
+		ParticleDebrisEffect effect;
+		if (runtime_cast<Weapons::ToasterShot>(collider) || runtime_cast<Weapons::ShieldFireShot>(collider)) {
+			effect = ParticleDebrisEffect::Fire;
+		} else if (runtime_cast<Weapons::Thunderbolt>(collider)) {
+			effect = ParticleDebrisEffect::Lightning;
+		} else if (_pos.Y > _levelHandler->GetWaterLevel()) {
+			effect = ParticleDebrisEffect::StandardInWater;
+		} else if (_frozenTimeLeft > 0.0f) {
+			effect = ParticleDebrisEffect::Frozen;
+		} else {
+			effect = ParticleDebrisEffect::Standard;
+		}
+
+		Vector2f speed;
+		if (runtime_cast<Solid::Pole>(collider) || runtime_cast<Solid::PushableBox>(collider)) {
+			speed = Vector2f(0.0f, -1.0f);
+		} else if (runtime_cast<Weapons::Thunderbolt>(collider)) {
+			speed = _pos - collider->_pos;
+		} else if (collider != nullptr) {
+			speed = collider->_speed;;
+		}
+
+		CreateParticleDebrisOnPerish(effect, speed);
+	}
+
+	void ActorBase::CreateParticleDebrisOnPerish(ParticleDebrisEffect effect, Vector2f speed)
+	{
+		_levelHandler->HandleCreateParticleDebrisOnPerish(this, effect, speed);
+
+		auto tilemap = _levelHandler->TileMap();
+		if (tilemap == nullptr) {
+			return;
+		}
+
+		GraphicResource* res = (_currentTransition != nullptr ? _currentTransition : _currentAnimation);
+		Texture* texture = res->Base->TextureDiffuse.get();
+		if (texture == nullptr) {
+			return;
+		}
+		// The death sprite's texture is indexed now; recolor the manually-built debris through its palette offset (-1 = baked)
+		std::int32_t paletteDebrisOffset = (((res->Base->Flags & GenericGraphicResourceFlags::Indexed) == GenericGraphicResourceFlags::Indexed) ? (std::int32_t)res->PaletteOffset : -1);
+
+		float x = _pos.X - res->Base->Hotspot.X;
+		float y = _pos.Y - res->Base->Hotspot.Y;
+
+		if (effect == ParticleDebrisEffect::Fire) {
+			constexpr std::int32_t DebrisSize = 3;
+
+			Vector2i texSize = texture->GetSize();
+			// Walk the frame's own area - anything outside it belongs to another frame in the sheet - and
+			// spawn the particles where the trimmed frame is drawn, shifted by its offset inside the cell
+			const Recti debrisRect = res->Base->GetFrameRect(_renderer.CurrentFrame);
+			const Vector2i frameOffset = res->Base->GetFrameOffset(_renderer.CurrentFrame);
+
+			// A big sprite would emit over a thousand particles at the plain step, which the consoles cannot afford
+			const std::int32_t step = Tiles::TileMap::GetParticleDebrisStep(DebrisSize, debrisRect.W, debrisRect.H);
+			const float particleSize = (float)(step - 1);
+
+			for (std::int32_t fy = 0; fy < debrisRect.H; fy += step) {
+				for (std::int32_t fx = 0; fx < debrisRect.W; fx += step) {
+					float currentSize = particleSize * Random().FastFloat(0.8f, 1.1f);
+
+					Tiles::TileMap::DestructibleDebris debris{};
+					debris.Pos = Vector2f(x + (IsFacingLeft() ? res->Base->FrameDimensions.X - frameOffset.X - fx : frameOffset.X + fx), y + frameOffset.Y + fy);
+					debris.Depth = _renderer.layer();
+					debris.Size = Vector2f(currentSize, currentSize);
+					debris.Speed = Vector2f(((fx - debrisRect.W / 2) + Random().FastFloat(-2.0f, 2.0f)) * (IsFacingLeft() ? -1.0f : 1.0f) * Random().FastFloat(0.5f, 2.0f) / debrisRect.W,
+						 Random().FastFloat(0.0f, 0.2f));
+					debris.Acceleration = Vector2(0.0f, 0.06f);
+
+					debris.Scale = 1.0f;
+					debris.Alpha = 1.0f;
+					debris.AlphaSpeed = -0.001f;
+
+					debris.Time = 320.0f;
+
+					debris.TexScaleX = (currentSize / float(texSize.X));
+					debris.TexBiasX = ((float(debrisRect.X) + (float)fx) / float(texSize.X));
+					debris.TexScaleY = (currentSize / float(texSize.Y));
+					debris.TexBiasY = ((float(debrisRect.Y) + (float)fy) / float(texSize.Y));
+
+					debris.DiffuseTexture = texture;
+					debris.PaletteOffset = paletteDebrisOffset;
+					debris.Flags = Tiles::TileMap::DebrisFlags::Bounce;
+
+					tilemap->CreateDebris(debris);
+				}
+			}
+			return;
+		}
+
+		if (effect == ParticleDebrisEffect::Lightning) {
+			constexpr std::int32_t DebrisSize = 3;
+
+			Vector2i texSize = texture->GetSize();
+			// Walk the frame's own area - anything outside it belongs to another frame in the sheet - and
+			// spawn the particles where the trimmed frame is drawn, shifted by its offset inside the cell
+			const Recti debrisRect = res->Base->GetFrameRect(_renderer.CurrentFrame);
+			const Vector2i frameOffset = res->Base->GetFrameOffset(_renderer.CurrentFrame);
+
+			// A big sprite would emit over a thousand particles at the plain step, which the consoles cannot afford
+			const std::int32_t step = Tiles::TileMap::GetParticleDebrisStep(DebrisSize, debrisRect.W, debrisRect.H);
+			const float particleSize = (float)(step - 1);
+
+			for (std::int32_t fy = 0; fy < debrisRect.H; fy += step) {
+				for (std::int32_t fx = 0; fx < debrisRect.W; fx += step) {
+					float currentSize = particleSize * Random().FastFloat(0.4f, 1.1f);
+
+					Tiles::TileMap::DestructibleDebris debris{};
+					debris.Pos = Vector2f(x + (IsFacingLeft() ? res->Base->FrameDimensions.X - frameOffset.X - fx : frameOffset.X + fx), y + frameOffset.Y + fy);
+					debris.Depth = _renderer.layer();
+					debris.Size = Vector2f(currentSize, currentSize);
+					debris.Speed = Vector2f(((fx - debrisRect.W / 2) + Random().FastFloat(-2.0f, 2.0f)) * (IsFacingLeft() ? -1.0f : 1.0f) * Random().FastFloat(2.0f, 4.0f) / debrisRect.W,
+						 ((fy - debrisRect.H / 2) + Random().FastFloat(-2.0f, 2.0f)) * (IsFacingLeft() ? -1.0f : 1.0f) * Random().FastFloat(2.0f, 4.0f) / debrisRect.H);
+					debris.Acceleration = Vector2f::Zero;
+
+					debris.Scale = 1.0f;
+					debris.ScaleSpeed = -0.004f;
+					debris.Alpha = 1.0f;
+					debris.AlphaSpeed = -0.004f;
+
+					debris.Time = Random().FastFloat(10.0f, 50.0f);
+
+					debris.TexScaleX = (currentSize / float(texSize.X));
+					debris.TexBiasX = ((float(debrisRect.X) + (float)fx) / float(texSize.X));
+					debris.TexScaleY = (currentSize / float(texSize.Y));
+					debris.TexBiasY = ((float(debrisRect.Y) + (float)fy) / float(texSize.Y));
+
+					debris.DiffuseTexture = texture;
+					debris.PaletteOffset = paletteDebrisOffset;
+					debris.Flags = Tiles::TileMap::DebrisFlags::Disappear;
+
+					tilemap->CreateDebris(debris);
+				}
+			}
+			return;
+		}
+
+		if (effect == ParticleDebrisEffect::Dissolve) {
+			constexpr int DebrisSize = 2;
+
+			Vector2i texSize = texture->GetSize();
+			// Walk the frame's own area - anything outside it belongs to another frame in the sheet - and
+			// spawn the particles where the trimmed frame is drawn, shifted by its offset inside the cell
+			const Recti debrisRect = res->Base->GetFrameRect(_renderer.CurrentFrame);
+			const Vector2i frameOffset = res->Base->GetFrameOffset(_renderer.CurrentFrame);
+
+			float x = _pos.X - res->Base->Hotspot.X;
+			float y = _pos.Y - res->Base->Hotspot.Y;
+
+			// A big sprite would emit over a thousand particles at the plain step, which the consoles cannot afford
+			const std::int32_t step = Tiles::TileMap::GetParticleDebrisStep(DebrisSize, debrisRect.W, debrisRect.H);
+			const float particleSize = (float)(step - 1);
+
+			for (std::int32_t fy = 0; fy < debrisRect.H; fy += step) {
+				for (std::int32_t fx = 0; fx < debrisRect.W; fx += step) {
+					float currentSize = particleSize * Random().FastFloat(0.4f, 1.1f);
+
+					Tiles::TileMap::DestructibleDebris debris = { };
+					debris.Pos = Vector2f(x + (IsFacingLeft() ? res->Base->FrameDimensions.X - frameOffset.X - fx : frameOffset.X + fx), y + frameOffset.Y + fy);
+					debris.Depth = _renderer.layer();
+					debris.Size = Vector2f(currentSize, currentSize);
+					debris.Speed = Vector2f(((fx - debrisRect.W / 2) + Random().FastFloat(-2.0f, 2.0f)) * (IsFacingLeft() ? -1.0f : 1.0f) * Random().FastFloat(2.0f, 5.0f) / debrisRect.W,
+							((fy - debrisRect.H / 2) + Random().FastFloat(-2.0f, 2.0f)) * (IsFacingLeft() ? -1.0f : 1.0f) * Random().FastFloat(2.0f, 5.0f) / debrisRect.H);
+					debris.Acceleration = Vector2f::Zero;
+
+					debris.Scale = 1.2f;
+					debris.ScaleSpeed = -0.004f;
+					debris.Alpha = 1.0f;
+					debris.AlphaSpeed = -0.01f;
+
+					debris.Time = 280.0f;
+
+					debris.TexScaleX = (currentSize / float(texSize.X));
+					debris.TexBiasX = ((float(debrisRect.X) + (float)fx) / float(texSize.X));
+					debris.TexScaleY = (currentSize / float(texSize.Y));
+					debris.TexBiasY = ((float(debrisRect.Y) + (float)fy) / float(texSize.Y));
+
+					debris.DiffuseTexture = texture;
+					debris.PaletteOffset = paletteDebrisOffset;
+					debris.Flags = Tiles::TileMap::DebrisFlags::Disappear;
+
+					tilemap->CreateDebris(debris);
+				}
+			}
+			return;
+		}
+
+		if (effect == ParticleDebrisEffect::StandardInWater) {
+			constexpr std::int32_t DebrisSize = 3;
+
+			Vector2i texSize = texture->GetSize();
+			// Walk the frame's own area - anything outside it belongs to another frame in the sheet - and
+			// spawn the particles where the trimmed frame is drawn, shifted by its offset inside the cell
+			const Recti debrisRect = res->Base->GetFrameRect(_renderer.CurrentFrame);
+			const Vector2i frameOffset = res->Base->GetFrameOffset(_renderer.CurrentFrame);
+
+			// A big sprite would emit over a thousand particles at the plain step, which the consoles cannot afford
+			const std::int32_t step = Tiles::TileMap::GetParticleDebrisStep(DebrisSize, debrisRect.W, debrisRect.H);
+			const float particleSize = (float)(step - 1);
+
+			for (std::int32_t fy = 0; fy < debrisRect.H; fy += step) {
+				for (std::int32_t fx = 0; fx < debrisRect.W; fx += step) {
+					float currentSize = particleSize * Random().FastFloat(0.2f, 1.1f);
+
+					Tiles::TileMap::DestructibleDebris debris{};
+					debris.Pos = Vector2f(x + (IsFacingLeft() ? res->Base->FrameDimensions.X - frameOffset.X - fx : frameOffset.X + fx), y + frameOffset.Y + fy);
+					debris.Depth = _renderer.layer();
+					debris.Size = Vector2f(currentSize, currentSize);
+					debris.Speed = Vector2f(((fx - debrisRect.W / 2) + Random().FastFloat(-2.0f, 2.0f)) * (IsFacingLeft() ? -1.0f : 1.0f) * Random().FastFloat(1.0f, 3.0f) / debrisRect.W,
+						 ((fy - debrisRect.H / 2) + Random().FastFloat(-2.0f, 2.0f)) * (IsFacingLeft() ? -1.0f : 1.0f) * Random().FastFloat(1.0f, 3.0f) / debrisRect.H);
+					debris.Acceleration = Vector2f::Zero;
+
+					debris.Scale = 1.0f;
+					debris.Alpha = 1.0f;
+					debris.AlphaSpeed = -0.004f;
+
+					debris.Time = Random().FastFloat(300.0f, 340.0f);;
+
+					debris.TexScaleX = (currentSize / float(texSize.X));
+					debris.TexBiasX = ((float(debrisRect.X) + (float)fx) / float(texSize.X));
+					debris.TexScaleY = (currentSize / float(texSize.Y));
+					debris.TexBiasY = ((float(debrisRect.Y) + (float)fy) / float(texSize.Y));
+
+					debris.DiffuseTexture = texture;
+					debris.PaletteOffset = paletteDebrisOffset;
+					debris.Flags = Tiles::TileMap::DebrisFlags::Disappear;
+
+					tilemap->CreateDebris(debris);
+				}
+			}
+			return;
+		}
+
+		if (effect == ParticleDebrisEffect::Frozen) {
+			for (std::int32_t i = 0; i < 20; i++) {
+				Explosion::Create(_levelHandler, Vector3i((std::int32_t)_pos.X, (std::int32_t)_pos.Y, _renderer.layer() + 10), Explosion::Type::IceShrapnel);
+			}
+
+			_levelHandler->PlayCommonSfx("IceBreak"_s, Vector3f(_pos.X, _pos.Y, 0.0f));
+			return;
+		}
+
+		float length = speed.Length();
+		Vector2f force = (length > 0.0f ? (speed / length * 1.4f) : Vector2f::Zero);
+		tilemap->CreateParticleDebris(res, Vector3f(_pos.X, _pos.Y, (float)_renderer.layer()), force, _renderer.CurrentFrame, IsFacingLeft());
+	}
+
+	void ActorBase::CreateSpriteDebris(AnimState state, std::int32_t count)
+	{
+		_levelHandler->HandleCreateSpriteDebris(this, state, count);
+
+		auto* tilemap = _levelHandler->TileMap();
+		if (tilemap != nullptr && _metadata != nullptr) {
+			auto* res = _metadata->FindAnimation(state);
+			if (res != nullptr) {
+				tilemap->CreateSpriteDebris(res, Vector3f(_pos.X, _pos.Y, (float)_renderer.layer()), count);
+			}
+		}
+	}
+
+	float ActorBase::GetIceShrapnelScale() const
+	{
+		return 1.0f;
+	}
+
+	std::shared_ptr<AudioBufferPlayer> ActorBase::PlaySfx(StringView identifier, float gain, float pitch, SfxFlags flags)
+	{
+		auto it = _metadata->Sounds.find(String::nullTerminatedView(identifier));
+		if (it != _metadata->Sounds.end()) {
+			AudioBuffer* buffer;
+			// The samples may not be loaded yet (see ContentResolver::ResolveSound)
+			if (ContentResolver::Get().ResolveSound(it->second)) {
+				std::int32_t idx = (it->second.Buffers.size() > 1 ? Random().Next(0, (std::int32_t)it->second.Buffers.size()) : 0);
+				buffer = &it->second.Buffers[idx]->Buffer;
+			} else {
+				buffer = nullptr;
+			}
+
+			return _levelHandler->PlaySfx(this, identifier, buffer, Vector3f(_pos.X, _pos.Y, 0.0f), false, gain, pitch, flags);
+		}
+
+		return nullptr;
+	}
+
+	bool ActorBase::SetAnimation(AnimState state, bool skipAnimation)
+	{
+		if (_metadata == nullptr) {
+			LOGE("No metadata loaded");
+			return false;
+		}
+
+		if (_currentAnimation != nullptr && _currentAnimation->State == state) {
+			return true;
+		}
+
+		auto* anim = _metadata->FindAnimation(state);
+		if (anim == nullptr) {
+			//LOGE("No animation found for state 0x{:.8x}", state);
+			return false;
+		}
+
+		if (_currentTransition == nullptr || _currentTransitionCancellable) {
+			if (_currentTransition != nullptr) {
+				_currentTransition = nullptr;
+
+				if (_currentTransitionCallback) {
+					auto oldCallback = std::move(_currentTransitionCallback);
+					_currentTransitionCallback = nullptr;
+					oldCallback();
+				}
+			}
+
+			_currentAnimation = anim;
+			RefreshAnimation(skipAnimation);
+		} else {
+			// It will be set after active transition
+			_currentAnimation = anim;
+		}
+
+		return true;
+	}
+
+	bool ActorBase::SetTransition(AnimState state, bool cancellable, Function<void()>&& callback)
+	{
+		auto* anim = _metadata->FindAnimation(state);
+		if (anim == nullptr) {
+			if (callback) {
+				callback();
+			}
+			return false;
+		}
+
+		if (_currentTransitionCallback) {
+			auto oldCallback = std::move(_currentTransitionCallback);
+			_currentTransitionCallback = nullptr;
+			oldCallback();
+		}
+
+		_currentTransition = anim;
+		_currentTransitionCancellable = cancellable;
+		_currentTransitionCallback = std::move(callback);		
+		RefreshAnimation();
+
+		return true;
+	}
+
+	void ActorBase::CancelTransition()
+	{
+		if (_currentTransition != nullptr && _currentTransitionCancellable) {
+			if (_currentTransitionCallback) {
+				auto oldCallback = std::move(_currentTransitionCallback);
+				_currentTransitionCallback = nullptr;
+				oldCallback();
+			}
+
+			_currentTransition = nullptr;
+			RefreshAnimation();
+		}
+	}
+
+	void ActorBase::ForceCancelTransition()
+	{
+		if (_currentTransition != nullptr) {
+			_currentTransition = nullptr;
+			_currentTransitionCancellable = true;
+			_currentTransitionCallback = nullptr;
+			RefreshAnimation();
+		}
+	}
+
+	void ActorBase::OnAnimationStarted()
+	{
+		// Can be overriden
+	}
+
+	void ActorBase::OnAnimationFinished()
+	{
+		if (_currentTransition != nullptr) {
+			_currentTransition = nullptr;
+
+			RefreshAnimation();
+
+			if (_currentTransitionCallback) {
+				auto oldCallback = std::move(_currentTransitionCallback);
+				_currentTransitionCallback = nullptr;
+				oldCallback();
+			}
+		}
+	}
+
+	void ActorBase::OnPacketReceived(MemoryStream& packet)
+	{
+		LOGD("Packet wasn't handled by derived class");
+	}
+
+	void ActorBase::SendPacket(ArrayView<const std::uint8_t> data)
+	{
+		_levelHandler->SendPacket(this, data);
+	}
+
+	bool ActorBase::IsCollidingWith(ActorBase* other)
+	{
+		bool perPixel1 = (_state & ActorState::SkipPerPixelCollisions) != ActorState::SkipPerPixelCollisions;
+		bool perPixel2 = (other->_state & ActorState::SkipPerPixelCollisions) != ActorState::SkipPerPixelCollisions;
+
+		if ((perPixel1 && std::abs(_renderer.rotation()) > 0.1f) || (perPixel2 && std::abs(other->_renderer.rotation()) > 0.1f)) {
+			if (!perPixel1 && std::abs(other->_renderer.rotation()) > 0.1f) {
+				return other->IsCollidingWithAngled(AABBInner);
+			} else if (!perPixel2 && std::abs(_renderer.rotation()) > 0.1f) {
+				return IsCollidingWithAngled(other->AABBInner);
+			}
+			return IsCollidingWithAngled(other);
+		}
+
+		GraphicResource* res1 = (_currentTransition != nullptr ? _currentTransition : _currentAnimation);
+		GraphicResource* res2 = (other->_currentTransition != nullptr ? other->_currentTransition : other->_currentAnimation);
+		if (res1 == nullptr || res2 == nullptr) {
+			if (res1 != nullptr) {
+				return IsCollidingWith(other->AABBInner);
+			}
+			if (res2 != nullptr) {
+				return other->IsCollidingWith(AABBInner);
+			}
+			return false;
+		}
+
+		// The box has to describe the frame exactly as it is drawn, because the per-pixel test below turns a
+		// world coordinate into an offset into that frame's area of the sheet. Taking the animation's cell
+		// instead would leave the two in different coordinate spaces whenever a frame is packed tightly (its
+		// area is then smaller than the cell), and the mask would be sampled at the wrong place.
+		const std::int32_t maskFrame1 = std::min(_renderer.CurrentFrame, res1->FrameCount - 1);
+		const std::int32_t maskFrame2 = std::min(other->_renderer.CurrentFrame, res2->FrameCount - 1);
+		const bool facingLeft1 = GetState(ActorState::IsFacingLeft);
+		const bool facingLeft2 = other->GetState(ActorState::IsFacingLeft);
+		const Recti frameRect1 = res1->Base->GetFrameRect(maskFrame1);
+		const Recti frameRect2 = res2->Base->GetFrameRect(maskFrame2);
+		const Vector2i frameAnchor1 = res1->Base->GetFrameAnchor(maskFrame1, facingLeft1);
+		const Vector2i frameAnchor2 = res2->Base->GetFrameAnchor(maskFrame2, facingLeft2);
+
+		AABBf aabb1, aabb2;
+		if (!perPixel1) {
+			aabb1 = AABBInner;
+		} else {
+			aabb1 = AABBf(_pos.X - frameAnchor1.X, _pos.Y - frameAnchor1.Y,
+				(float)frameRect1.W, (float)frameRect1.H);
+			aabb1.B += aabb1.T;
+			aabb1.R += aabb1.L;
+		}
+		if (!perPixel2) {
+			aabb2 = other->AABBInner;
+		} else {
+			aabb2 = AABBf(other->_pos.X - frameAnchor2.X, other->_pos.Y - frameAnchor2.Y,
+				(float)frameRect2.W, (float)frameRect2.H);
+			aabb2.B += aabb2.T;
+			aabb2.R += aabb2.L;
+		}
+
+		// Bounding Box intersection
+		AABBf inter = AABBf::Intersect(aabb1, aabb2);
+		if (inter.R <= 0 || inter.B <= 0) {
+			return false;
+		}
+
+		if (!perPixel1 || !perPixel2) {
+			if (perPixel1 == perPixel2) {
+				return true;
+			}
+
+			//PixelData p;
+			uint8_t* p;
+			GraphicResource* res;
+			bool isFacingLeftCurrent;
+			std::int32_t x1, y1, x2, y2, xs, dx, dy, stride, frameWidth;
+			if (perPixel1) {
+				res = res1;
+				p = res->Base->Mask.get();
+
+				isFacingLeftCurrent = facingLeft1;
+
+				x1 = (std::int32_t)std::max(inter.L, other->AABBInner.L);
+				y1 = (std::int32_t)std::max(inter.T, other->AABBInner.T);
+				x2 = (std::int32_t)std::min(inter.R, other->AABBInner.R);
+				y2 = (std::int32_t)std::min(inter.B, other->AABBInner.B);
+
+				xs = (std::int32_t)aabb1.L;
+
+				dx = frameRect1.X;
+				dy = frameRect1.Y - (std::int32_t)aabb1.T;
+				frameWidth = frameRect1.W;
+
+			} else {
+				res = res2;
+				p = res->Base->Mask.get();
+
+				isFacingLeftCurrent = facingLeft2;
+
+				x1 = (std::int32_t)std::max(inter.L, AABBInner.L);
+				y1 = (std::int32_t)std::max(inter.T, AABBInner.T);
+				x2 = (std::int32_t)std::min(inter.R, AABBInner.R);
+				y2 = (std::int32_t)std::min(inter.B, AABBInner.B);
+
+				xs = (std::int32_t)aabb2.L;
+
+				dx = frameRect2.X;
+				dy = frameRect2.Y - (std::int32_t)aabb2.T;
+				frameWidth = frameRect2.W;
+			}
+
+			stride = res->Base->GetMaskStride();
+
+			// A resource loaded without a mask has nothing to sample. Degrading to the inner hitboxes is
+			// exactly what an actor with SkipPerPixelCollisions already gets, so the pairing keeps working.
+			if (p == nullptr) {
+				return AABBInner.Overlaps(other->AABBInner);
+			}
+
+			// Per-pixel collision check
+			for (std::int32_t i = x1; i < x2; i += PerPixelCollisionStep) {
+				for (std::int32_t j = y1; j < y2; j += PerPixelCollisionStep) {
+					std::int32_t i1 = i - xs;
+					if (isFacingLeftCurrent) {
+						// Mirrored within the frame's own width, which a tightly packed frame determines
+						i1 = frameWidth - i1 - 1;
+					}
+
+					if (IsMaskPixelSolid(p, ((j + dy) * stride) + i1 + dx)) {
+						return true;
+					}
+				}
+			}
+		} else {
+			std::int32_t x1 = (std::int32_t)inter.L;
+			std::int32_t y1 = (std::int32_t)inter.T;
+			std::int32_t x2 = (std::int32_t)inter.R;
+			std::int32_t y2 = (std::int32_t)inter.B;
+
+			std::int32_t x1s = (std::int32_t)aabb1.L;
+			std::int32_t x2s = (std::int32_t)aabb2.L;
+
+			std::int32_t dx1 = frameRect1.X;
+			std::int32_t dy1 = frameRect1.Y - (std::int32_t)aabb1.T;
+			std::int32_t stride1 = res1->Base->GetMaskStride();
+
+			std::int32_t dx2 = frameRect2.X;
+			std::int32_t dy2 = frameRect2.Y - (std::int32_t)aabb2.T;
+			std::int32_t stride2 = res2->Base->GetMaskStride();
+
+			// Per-pixel collision check
+			auto p1 = res1->Base->Mask.get();
+			auto p2 = res2->Base->Mask.get();
+			if (p1 == nullptr || p2 == nullptr) {
+				return AABBInner.Overlaps(other->AABBInner);
+			}
+
+			for (std::int32_t i = x1; i < x2; i += PerPixelCollisionStep) {
+				for (std::int32_t j = y1; j < y2; j += PerPixelCollisionStep) {
+					std::int32_t i1 = i - x1s;
+					if (GetState(ActorState::IsFacingLeft)) {
+						i1 = frameRect1.W - i1 - 1;
+					}
+					std::int32_t i2 = i - x2s;
+					if (other->GetState(ActorState::IsFacingLeft)) {
+						i2 = frameRect2.W - i2 - 1;
+					}
+
+					if (IsMaskPixelSolid(p1, ((j + dy1) * stride1) + i1 + dx1) && IsMaskPixelSolid(p2, ((j + dy2) * stride2) + i2 + dx2)) {
+						return true;
+					}
+				}
+			}
+		}
+
+		return false;
+	}
+
+	bool ActorBase::IsCollidingWith(const AABBf& aabb)
+	{
+		bool perPixel = (_state & ActorState::SkipPerPixelCollisions) != ActorState::SkipPerPixelCollisions;
+		if (!perPixel) {
+			return aabb.Overlaps(AABBInner);
+		} else if (std::abs(_renderer.rotation()) > 0.1f) {
+			return IsCollidingWithAngled(aabb);
+		}
+
+		GraphicResource* res = (_currentTransition != nullptr ? _currentTransition : _currentAnimation);
+		if (res == nullptr) {
+			return false;
+		}
+
+		// Sized and placed exactly like the drawn frame, so the per-pixel test below can turn a world
+		// coordinate straight into an offset into that frame's area of the sheet (see IsCollidingWith above)
+		const std::int32_t maskFrame = std::min(_renderer.CurrentFrame, res->FrameCount - 1);
+		const bool facingLeft = GetState(ActorState::IsFacingLeft);
+		const Recti frameRectSelf = res->Base->GetFrameRect(maskFrame);
+		const Vector2i frameAnchorSelf = res->Base->GetFrameAnchor(maskFrame, facingLeft);
+
+		AABBf aabbSelf = AABBf(_pos.X - frameAnchorSelf.X, _pos.Y - frameAnchorSelf.Y,
+			(float)frameRectSelf.W, (float)frameRectSelf.H);
+		aabbSelf.B += aabbSelf.T;
+		aabbSelf.R += aabbSelf.L;
+
+		// Bounding Box intersection
+		AABBf inter = AABBf::Intersect(aabb, aabbSelf);
+		if (inter.R <= 0 || inter.B <= 0) {
+			return false;
+		}
+
+		std::int32_t x1 = (std::int32_t)std::max(inter.L, aabb.L);
+		std::int32_t y1 = (std::int32_t)std::max(inter.T, aabb.T);
+		std::int32_t x2 = (std::int32_t)std::min(inter.R, aabb.R);
+		std::int32_t y2 = (std::int32_t)std::min(inter.B, aabb.B);
+
+		std::int32_t xs = (std::int32_t)aabbSelf.L;
+
+		std::int32_t dx = frameRectSelf.X;
+		std::int32_t dy = frameRectSelf.Y - (std::int32_t)aabbSelf.T;
+		std::int32_t stride = res->Base->GetMaskStride();
+
+		// Per-pixel collision check
+		auto p = res->Base->Mask.get();
+		if (p == nullptr) {
+			return aabb.Overlaps(AABBInner);
+		}
+
+		for (std::int32_t i = x1; i < x2; i += PerPixelCollisionStep) {
+			for (std::int32_t j = y1; j < y2; j += PerPixelCollisionStep) {
+				std::int32_t i1 = i - xs;
+				if (GetState(ActorState::IsFacingLeft)) {
+					i1 = frameRectSelf.W - i1 - 1;
+				}
+
+				if (IsMaskPixelSolid(p, ((j + dy) * stride) + i1 + dx)) {
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	bool ActorBase::IsCollidingWithAngled(ActorBase* other)
+	{
+		GraphicResource* res1 = (_currentTransition != nullptr ? _currentTransition : _currentAnimation);
+		GraphicResource* res2 = (other->_currentTransition != nullptr ? other->_currentTransition : other->_currentAnimation);
+		if (res1 == nullptr || res2 == nullptr) {
+			return false;
+		}
+
+		// The loop below walks the frame's own area and samples the mask at the matching offset, so the
+		// transform has to map that area - not the animation's cell - into the world. The mirroring stays
+		// geometric here (the Scaling below), so the anchor is taken unflipped.
+		const std::int32_t maskFrame1 = std::min(_renderer.CurrentFrame, res1->FrameCount - 1);
+		const std::int32_t maskFrame2 = std::min(other->_renderer.CurrentFrame, res2->FrameCount - 1);
+		const Recti frameRect1 = res1->Base->GetFrameRect(maskFrame1);
+		const Recti frameRect2 = res2->Base->GetFrameRect(maskFrame2);
+		const Vector2i frameAnchor1 = res1->Base->GetFrameAnchor(maskFrame1);
+		const Vector2i frameAnchor2 = res2->Base->GetFrameAnchor(maskFrame2);
+
+		Matrix4x4f transform1 = Matrix4x4f::Translation((float)-frameAnchor1.X, (float)-frameAnchor1.Y, 0.0f);
+		if (GetState(ActorState::IsFacingLeft)) {
+			transform1 = Matrix4x4f::Scaling(-1.0f, 1.0f, 1.0f) * transform1;
+		}
+		transform1 = Matrix4x4f::Translation(_pos.X, _pos.Y, 0.0f) * Matrix4x4f::RotationZ(_renderer.rotation()) * transform1;
+
+		Matrix4x4f transform2 = Matrix4x4f::Translation((float)-frameAnchor2.X, (float)-frameAnchor2.Y, 0.0f);
+		if (other->GetState(ActorState::IsFacingLeft)) {
+			transform2 = Matrix4x4f::Scaling(-1.0f, 1.0f, 1.0f) * transform2;
+		}
+		transform2 = Matrix4x4f::Translation(other->_pos.X, other->_pos.Y, 0.0f) * Matrix4x4f::RotationZ(other->_renderer.rotation()) * transform2;
+
+		std::int32_t width1 = frameRect1.W;
+		std::int32_t height1 = frameRect1.H;
+		std::int32_t width2 = frameRect2.W;
+		std::int32_t height2 = frameRect2.H;
+
+		// Bounding Box intersection
+		AABBf aabb1, aabb2;
+		{
+			Vector3f tl = Vector3f::Zero * transform1;
+			Vector3f tr = Vector3f((float)width1, 0.0f, 0.0f) * transform1;
+			Vector3f bl = Vector3f(0.0f, (float)height1, 0.0f) * transform1;
+			Vector3f br = Vector3f((float)width1, (float)height1, 0.0f) * transform1;
+
+			float minX = std::min(std::min(tl.X, tr.X), std::min(bl.X, br.X));
+			float minY = std::min(std::min(tl.Y, tr.Y), std::min(bl.Y, br.Y));
+			float maxX = std::max(std::max(tl.X, tr.X), std::max(bl.X, br.X));
+			float maxY = std::max(std::max(tl.Y, tr.Y), std::max(bl.Y, br.Y));
+
+			aabb1 = AABBf(floorFast(minX), floorFast(minY), ceilFast(maxX), ceilFast(maxY));
+		}
+		{
+			Vector3f tl = Vector3f::Zero * transform2;
+			Vector3f tr = Vector3f((float)width2, 0.0f, 0.0f) * transform2;
+			Vector3f bl = Vector3f(0.0f, (float)height2, 0.0f) * transform2;
+			Vector3f br = Vector3f((float)width2, (float)height2, 0.0f) * transform2;
+
+			float minX = std::min(std::min(tl.X, tr.X), std::min(bl.X, br.X));
+			float minY = std::min(std::min(tl.Y, tr.Y), std::min(bl.Y, br.Y));
+			float maxX = std::max(std::max(tl.X, tr.X), std::max(bl.X, br.X));
+			float maxY = std::max(std::max(tl.Y, tr.Y), std::max(bl.Y, br.Y));
+
+			aabb2 = AABBf(floorFast(minX), floorFast(minY), ceilFast(maxX), ceilFast(maxY));
+		}
+
+		if (!aabb1.Overlaps(aabb2)) {
+			return false;
+		}
+
+		// Per-pixel collision check
+		Matrix4x4f transformAToB = transform2.Inverse() * transform1;
+
+		// TransformNormal with [1, 0] and [0, 1] vectors
+		Vector3f stepX = Vector3f(transformAToB[0][0], transformAToB[0][1], 0.0f) * PerPixelCollisionStep;
+		Vector3f stepY = Vector3f(transformAToB[1][0], transformAToB[1][1], 0.0f) * PerPixelCollisionStep;
+
+		Vector3f yPosIn2 = Vector3f::Zero * transformAToB;
+
+		std::int32_t dx1 = frameRect1.X;
+		std::int32_t dy1 = frameRect1.Y;
+		std::int32_t stride1 = res1->Base->GetMaskStride();
+
+		std::int32_t dx2 = frameRect2.X;
+		std::int32_t dy2 = frameRect2.Y;
+		std::int32_t stride2 = res2->Base->GetMaskStride();
+
+		auto p1 = res1->Base->Mask.get();
+		auto p2 = res2->Base->Mask.get();
+		if (p1 == nullptr || p2 == nullptr) {
+			return AABBInner.Overlaps(other->AABBInner);
+		}
+
+		for (std::int32_t y1 = 0; y1 < height1; y1 += PerPixelCollisionStep) {
+			Vector3f posIn2 = yPosIn2;
+
+			for (std::int32_t x1 = 0; x1 < width1; x1 += PerPixelCollisionStep) {
+				std::int32_t x2 = (std::int32_t)roundFast(posIn2.X);
+				std::int32_t y2 = (std::int32_t)roundFast(posIn2.Y);
+
+				if (x2 >= 0 && x2 < width2 && y2 >= 0 && y2 < height2) {
+					if (IsMaskPixelSolid(p1, ((y1 + dy1) * stride1) + x1 + dx1) && IsMaskPixelSolid(p2, ((y2 + dy2) * stride2) + x2 + dx2)) {
+						return true;
+					}
+				}
+				posIn2 += stepX;
+			}
+			yPosIn2 += stepY;
+		}
+
+		return false;
+	}
+
+	bool ActorBase::IsCollidingWithAngled(const AABBf& aabb)
+	{
+		GraphicResource* res = (_currentTransition != nullptr ? _currentTransition : _currentAnimation);
+		if (res == nullptr) {
+			return false;
+		}
+
+		// As above: the loop walks the frame's own area, so the transform maps that area into the world
+		const std::int32_t maskFrame = std::min(_renderer.CurrentFrame, res->FrameCount - 1);
+		const Recti frameRectSelf = res->Base->GetFrameRect(maskFrame);
+		const Vector2i frameAnchorSelf = res->Base->GetFrameAnchor(maskFrame);
+
+		Matrix4x4f transform = Matrix4x4f::Translation((float)-frameAnchorSelf.X, (float)-frameAnchorSelf.Y, 0.0f);
+		if (GetState(ActorState::IsFacingLeft)) {
+			transform = Matrix4x4f::Scaling(-1.0f, 1.0f, 1.0f) * transform;
+		}
+		transform = Matrix4x4f::Translation(_pos.X, _pos.Y, 0.0f) * Matrix4x4f::RotationZ(_renderer.rotation()) * transform;
+
+		std::int32_t width = frameRectSelf.W;
+		std::int32_t height = frameRectSelf.H;
+
+		// Bounding Box intersection
+		AABBf aabbSelf;
+		{
+			Vector3f tl = Vector3f::Zero * transform;
+			Vector3f tr = Vector3f((float)width, 0.0f, 0.0f) * transform;
+			Vector3f bl = Vector3f(0.0f, (float)height, 0.0f) * transform;
+			Vector3f br = Vector3f((float)width, (float)height, 0.0f) * transform;
+
+			float minX = std::min(std::min(tl.X, tr.X), std::min(bl.X, br.X));
+			float minY = std::min(std::min(tl.Y, tr.Y), std::min(bl.Y, br.Y));
+			float maxX = std::max(std::max(tl.X, tr.X), std::max(bl.X, br.X));
+			float maxY = std::max(std::max(tl.Y, tr.Y), std::max(bl.Y, br.Y));
+
+			aabbSelf = AABBf(floorFast(minX), floorFast(minY), ceilFast(maxX), ceilFast(maxY));
+		}
+
+		if (!aabb.Overlaps(aabbSelf)) {
+			return false;
+		}
+
+		// TransformNormal with [1, 0] and [0, 1] vectors
+		Vector3f stepX = Vector3f(transform[0][0], transform[0][1], 0.0f) * PerPixelCollisionStep;
+		Vector3f stepY = Vector3f(transform[1][0], transform[1][1], 0.0f) * PerPixelCollisionStep;
+
+		Vector3f yPosInAABB = Vector3f::Zero * transform;
+
+		std::int32_t frame = std::min(_renderer.CurrentFrame, res->FrameCount - 1);
+		std::int32_t dx = frameRectSelf.X;
+		std::int32_t dy = frameRectSelf.Y;
+		std::int32_t stride = res->Base->GetMaskStride();
+
+		auto p = res->Base->Mask.get();
+		if (p == nullptr) {
+			return aabb.Overlaps(AABBInner);
+		}
+
+		for (std::int32_t y1 = 0; y1 < height; y1 += PerPixelCollisionStep) {
+			Vector3f posInAABB = yPosInAABB;
+
+			for (std::int32_t x1 = 0; x1 < width; x1 += PerPixelCollisionStep) {
+				std::int32_t x2 = (std::int32_t)roundFast(posInAABB.X);
+				std::int32_t y2 = (std::int32_t)roundFast(posInAABB.Y);
+
+				if (IsMaskPixelSolid(p, ((y1 + dy) * stride) + x1 + dx) &&
+					x2 >= aabb.L && x2 < aabb.R && y2 >= aabb.T && y2 < aabb.B) {
+					return true;
+				}
+
+				posInAABB += stepX;
+			}
+			yPosInAABB += stepY;
+		}
+
+		return false;
+	}
+
+	bool ActorBase::HasCrossedOver(const ActorBase* other) const
+	{
+		Vector2f delta = _pos - _frameStartPos;
+
+		// Anything that moved less than a single collision step per frame cannot have skipped over the other
+		// object - the plain overlap test would have caught it - so the common case costs nothing. A forced
+		// relocation covers no distance at all here, it resets the path (see ResetPathTracking()).
+		if (std::max(std::abs(delta.X), std::abs(delta.Y)) <= MaxMovementStep) {
+			return false;
+		}
+
+		// The hitbox swept along the path that was taken, tested as the segment its center travelled against the
+		// other hitbox grown by this one's half extents (a Minkowski sum). Stretching the hitbox backwards on
+		// each axis on its own would instead cover the whole bounding rectangle of the path and report a hit in
+		// the two corners a diagonal move never passed through - corners as large as the move itself, so at a
+		// low frame rate the object would collect and hit things it visibly flew past. Note this is a box test
+		// even for objects that normally collide per pixel: the object crossed the other one entirely, so which
+		// pixels happen to line up where it ended up says nothing about whether the two met.
+		Vector2f extents = AABBInner.GetExtents();
+		AABBf expanded = AABBf(other->AABBInner.L - extents.X, other->AABBInner.T - extents.Y,
+			other->AABBInner.R + extents.X, other->AABBInner.B + extents.Y);
+
+		// Clipping the segment against the box one axis at a time (the slab test). The parameter is kept inside
+		// [0, 1], the part of the path that was really travelled, so a hit is never reported for a point the
+		// object would only reach by carrying on. An axis that didn't move has no slab to clip against, only
+		// the standing coordinate to keep inside the box - and dividing by its zero delta would yield a NaN
+		// that the comparisons below silently swallow.
+		Vector2f end = AABBInner.GetCenter();
+		Vector2f start = end - delta;
+		float tMin = 0.0f;
+		float tMax = 1.0f;
+
+		if (delta.X == 0.0f) {
+			if (start.X < expanded.L || start.X > expanded.R) {
+				return false;
+			}
+		} else {
+			float t1 = (expanded.L - start.X) / delta.X;
+			float t2 = (expanded.R - start.X) / delta.X;
+			tMin = std::max(tMin, std::min(t1, t2));
+			tMax = std::min(tMax, std::max(t1, t2));
+		}
+
+		if (delta.Y == 0.0f) {
+			if (start.Y < expanded.T || start.Y > expanded.B) {
+				return false;
+			}
+		} else {
+			float t1 = (expanded.T - start.Y) / delta.Y;
+			float t2 = (expanded.B - start.Y) / delta.Y;
+			tMin = std::max(tMin, std::min(t1, t2));
+			tMax = std::min(tMax, std::max(t1, t2));
+		}
+
+		return (tMin <= tMax);
+	}
+
+	void ActorBase::UpdateRendererPosition()
+	{
+		// A position that is NaN, infinite or far outside any level is a bug in whatever wrote it, but it is fatal
+		// only on the Nintendo 64: floorFast() below converts it to an integer, and the R4300 traps on that
+		// unconditionally, while x86 yields INT_MIN and carries on with an invisible actor. The actor is put back
+		// where it started the frame, stopped, and named in the log, so the next occurrence tells which one it was.
+		if DEATH_UNLIKELY(!IsUsablePosition(_pos)) {
+			RestoreFromInvalidPosition();
+		}
+
+		Vector2f pos = _pos;
+		if (!PreferencesCache::UnalignedViewport || (_state & ActorState::IsDirty) != ActorState::IsDirty) {
+			pos.X = floorFast(pos.X);
+			pos.Y = floorFast(pos.Y);
+		}
+
+		// LevelHandler::OnEndFrame() calls this again for every actor in the level, to catch the ones that were
+		// moved after they had already updated themselves - carried by a platform, most visibly. For all the
+		// rest the value is the one that was just assigned, and setting it again would re-dirty the node's
+		// transform and bounding box for a bit-identical result, on every actor, every frame.
+		if (_renderer.position() == pos) {
+			return;
+		}
+		_renderer.setPosition(pos.X, pos.Y);
+	}
+
+	void ActorBase::RestoreFromInvalidPosition()
+	{
+		// The log gets the raw bits, formatting a NaN as a float would trap there just the same
+		Vector2f fallback = (IsUsablePosition(_frameStartPos) ? _frameStartPos : _renderer.position());
+		LOGE("Actor \"{}\" moved to an invalid position (bits {}, {} with speed bits {}, {}), restored to [{}, {}]",
+			(_metadata != nullptr ? StringView(_metadata->Path) : "<no metadata>"_s), FloatBits(_pos.X), FloatBits(_pos.Y),
+			FloatBits(_speed.X), FloatBits(_speed.Y), fallback.X, fallback.Y);
+		_pos = fallback;
+		_speed = Vector2f::Zero;
+		_externalForce = Vector2f::Zero;
+		// The update derived the hitbox from the invalid position, and the collision checks use it next frame
+		UpdateAABB();
+	}
+
+	void ActorBase::UpdateAABB()
+	{
+		if ((_state & (ActorState::CollideWithOtherActors | ActorState::CollideWithSolidObjects | ActorState::IsSolidObject)) == ActorState::None) {
+			// Collisions are deactivated
+			return;
+		}
+
+		if ((_state & ActorState::SkipPerPixelCollisions) != ActorState::SkipPerPixelCollisions) {
+			GraphicResource* res = (_currentTransition != nullptr ? _currentTransition : _currentAnimation);
+			if (res == nullptr) {
+				return;
+			}
+
+			Vector2i hotspot = res->Base->Hotspot;
+			Vector2i size = res->Base->FrameDimensions;
+
+			if (std::abs(_renderer.rotation()) > 0.1f) {
+				Matrix4x4f transform = Matrix4x4f::Translation((float)-hotspot.X, (float)-hotspot.Y, 0.0f);
+				if (GetState(ActorState::IsFacingLeft)) {
+					transform = Matrix4x4f::Scaling(-1.0f, 1.0f, 1.0f) * transform;
+				}
+				transform = Matrix4x4f::Translation(_pos.X, _pos.Y, 0.0f) * Matrix4x4f::RotationZ(_renderer.rotation()) * transform;
+
+				Vector3f tl = Vector3f::Zero * transform;
+				Vector3f tr = Vector3f((float)size.X, 0.0f, 0.0f) * transform;
+				Vector3f bl = Vector3f(0.0f, (float)size.Y, 0.0f) * transform;
+				Vector3f br = Vector3f((float)size.X, (float)size.Y, 0.0f) * transform;
+
+				float minX = std::min(std::min(tl.X, tr.X), std::min(bl.X, br.X));
+				float minY = std::min(std::min(tl.Y, tr.Y), std::min(bl.Y, br.Y));
+				float maxX = std::max(std::max(tl.X, tr.X), std::max(bl.X, br.X));
+				float maxY = std::max(std::max(tl.Y, tr.Y), std::max(bl.Y, br.Y));
+
+				AABB.L = minX;
+				AABB.T = minY;
+				AABB.R = maxX;
+				AABB.B = maxY;
+			} else {
+				AABB.L = (IsFacingLeft() ? (_pos.X + hotspot.X - size.X) : (_pos.X - hotspot.X));
+				AABB.T = _pos.Y - hotspot.Y;
+				AABB.R = AABB.L + size.X;
+				AABB.B = AABB.T + size.Y;
+			}
+		} else {
+			OnUpdateHitbox(); 
+			AABB = AABBInner;
+		}
+	}
+
+	void ActorBase::RefreshAnimation(bool skipAnimation)
+	{
+		GraphicResource* res = (_currentTransition != nullptr ? _currentTransition : _currentAnimation);
+		if (res == nullptr) {
+			return;
+		}
+
+		_renderer.FrameConfiguration = res->Base->FrameConfiguration;
+		_renderer.FrameDimensions = res->Base->FrameDimensions;
+		_renderer.FrameSource = res->Base;
+		if (res->AnimDuration < 0.0f) {
+			if (res->FrameCount > 1) {
+				_renderer.FirstFrame = res->FrameOffset + nCine::Random().Next(0, res->FrameCount);
+			} else {
+				_renderer.FirstFrame = res->FrameOffset;
+			}
+
+			_renderer.LoopMode = AnimationLoopMode::FixedSingle;
+		} else {
+			_renderer.FirstFrame = res->FrameOffset;
+			_renderer.LoopMode = res->LoopMode;
+		}
+
+		_renderer.FrameCount = res->FrameCount;
+		_renderer.AnimDuration = res->AnimDuration;
+		_renderer.AnimTime = (skipAnimation && res->AnimDuration >= 0.0f && _renderer.LoopMode != AnimationLoopMode::FixedSingle ? _renderer.AnimDuration : 0.0f);
+
+		_renderer.Hotspot.X = static_cast<float>(res->Base->Hotspot.X);
+		_renderer.Hotspot.Y = static_cast<float>(res->Base->Hotspot.Y);
+
+		_renderer.setTexture(res->Base->TextureDiffuse.get());
+		// Indexed graphics must be drawn through the palette shader (recolored at draw time); plain ones keep the
+		// default sprite path. The animation's palette offset selects the palette region (0 for most, gem rows for
+		// gems); a recolor override set via SetPalette still takes precedence.
+		_renderer.SetIndexed((res->Base->Flags & GenericGraphicResourceFlags::Indexed) == GenericGraphicResourceFlags::Indexed, res->PaletteOffset);
+		_renderer.UpdateVisibleFrames();
+
+		OnAnimationStarted();
+
+		if ((_state & ActorState::ForceDisableCollisions) != ActorState::ForceDisableCollisions) {
+			_state |= ActorState::IsDirty;
+		}
+	}
+
+	void ActorBase::PreloadMetadataAsync(StringView path)
+	{
+		ContentResolver::Get().PreloadMetadataAsync(path);
+	}
+
+	void ActorBase::RequestMetadata(StringView path, bool forceIndexed)
+	{
+		_metadata = ContentResolver::Get().RequestMetadata(path, forceIndexed);
+	}
+
+#if !defined(WITH_COROUTINES)
+	void ActorBase::RequestMetadataAsync(StringView path, bool forceIndexed)
+	{
+		_metadata = ContentResolver::Get().RequestMetadata(path, forceIndexed);
+	}
+#endif
+
+	void ActorBase::UpdateFrozenState(float timeMult)
+	{
+		if (_frozenTimeLeft > 0.0f) {
+			_frozenTimeLeft -= timeMult;
+			if (_frozenTimeLeft > 0.0f) {
+				// Cannot be directly in `ActorBase::HandleFrozenStateChange()` due to bug in `BaseSprite::updateRenderCommand()`,
+				// it would be called before `BaseSprite::updateRenderCommand()` but after `SceneNode::transform()`
+				_renderer.Initialize(ActorRendererType::FrozenMask);
+			} else {
+				_renderer.AnimPaused = false;
+				_renderer.Initialize(ActorRendererType::Default);
+
+				float scale = GetIceShrapnelScale();
+				for (std::int32_t i = 0; i < 10; i++) {
+					Explosion::Create(_levelHandler, Vector3i((std::int32_t)_pos.X, (std::int32_t)_pos.Y, _renderer.layer() + 10), Explosion::Type::IceShrapnel, scale);
+				}
+
+				Explosion::Create(_levelHandler, Vector3i((std::int32_t)_pos.X, (std::int32_t)_pos.Y, _renderer.layer() + 90), Explosion::Type::SmokeWhite, scale);
+
+				_levelHandler->PlayCommonSfx("IceBreak"_s, Vector3f(_pos.X, _pos.Y, 0.0f));
+			}
+		}
+	}
+
+	void ActorBase::HandleFrozenStateChange(ActorBase* shot)
+	{
+		if (auto* freezerShot = runtime_cast<Weapons::FreezerShot>(shot)) {
+			if (runtime_cast<ActorBase>(freezerShot->GetOwner()) != this) {
+				_frozenTimeLeft = freezerShot->FrozenDuration();
+				_renderer.AnimPaused = true;
+				freezerShot->DecreaseHealth(INT32_MAX);
+			}
+		} else if (runtime_cast<Weapons::ToasterShot>(shot) || runtime_cast<Weapons::ShieldFireShot>(shot) ||
+				   runtime_cast<Weapons::Thunderbolt>(shot)) {
+			_frozenTimeLeft = std::min(1.0f, _frozenTimeLeft);
+		}
+	}
+
+	bool ActorBase::IsInvulnerable()
+	{
+		return GetState(ActorState::IsInvulnerable);
+	}
+
+	std::int32_t ActorBase::GetHealth()
+	{
+		return _health;
+	}
+
+	void ActorBase::SetHealth(std::int32_t value)
+	{
+		_health = value;
+	}
+
+	std::int32_t ActorBase::GetMaxHealth()
+	{
+		return _maxHealth;
+	}
+
+	void ActorBase::DecreaseHealth(std::int32_t amount, ActorBase* collider)
+	{
+		if (amount == 0) {
+			return;
+		}
+
+		if (amount > _health) {
+			_health = 0;
+		} else {
+			_health -= amount;
+		}
+
+		if (_health <= 0) {
+			OnPerish(collider);
+		} else {
+			OnHealthChanged(collider);
+		}
+	}
+
+	bool ActorBase::MoveInstantly(Vector2f pos, MoveType type, TileCollisionParams& params)
+	{
+		Vector2f newPos;
+		AABBf aabb;
+		if ((type & MoveType::Relative) == MoveType::Relative) {
+			if (pos == Vector2f::Zero) {
+				return true;
+			}
+			newPos = _pos + pos;
+			aabb = AABBInner + pos;
+		} else {
+			newPos = pos;
+			aabb = AABBInner + (pos - _pos);
+		}
+
+		bool free = ((type & MoveType::Force) == MoveType::Force || _levelHandler->IsPositionEmpty(this, aabb, params));
+		if (free) {
+			AABBInner = aabb;
+			_pos = newPos;
+			if ((type & MoveType::Relative) != MoveType::Relative) {
+				// An absolute move places the object somewhere instead of walking it there, so nothing between
+				// the two positions was touched, however far apart they are (see ResetPathTracking())
+				ResetPathTracking();
+			}
+			if ((_state & ActorState::ForceDisableCollisions) != ActorState::ForceDisableCollisions) {
+				_state |= ActorState::IsDirty;
+			}
+		}
+		return free;
+	}
+
+	void ActorBase::AddExternalForce(float x, float y)
+	{
+		_externalForce.X += x;
+		_externalForce.Y += y;
+	}
+
+	ActorBase::ActorRenderer::ActorRenderer(ActorBase* owner)
+		: BaseSprite(nullptr, nullptr, 0.0f, 0.0f), AnimPaused(false), FrameSource(nullptr), LoopMode(AnimationLoopMode::Loop), FirstFrame(0),
+			FrameCount(0), AnimDuration(0.0f), AnimTime(0.0f), CurrentFrame(0), _owner(owner),
+			_rendererType((ActorRendererType)-1), _rendererTransition(0.0f), _paletteOffset(-1), _baseIndexed(false), _basePaletteOffset(0)
+	{
+		_type = ObjectType::Sprite;
+		_renderCommand.SetType(RenderCommand::Type::Sprite);
+		Initialize(ActorRendererType::Default);
+	}
+
+	void ActorBase::ActorRenderer::Initialize(ActorRendererType type)
+	{
+		if (_rendererType == type) {
+			return;
+		}
+
+		const ActorRendererType previousType = _rendererType;
+		_rendererType = type;
+
+		auto& resolver = ContentResolver::Get();
+		if (resolver.IsHeadless()) {
+			return;
+		}
+
+		// Each render type picks the palette-aware shader variant when the sprite is indexed (a recolor override or
+		// an indexed graphic) - otherwise an indexed sprite would read raw palette indices as near-black. The shared
+		// palette texture and per-instance offset are bound below, after shaderHasChanged().
+		bool hasPalette = (_paletteOffset >= 0 || _baseIndexed);
+		bool shaderChanged;
+		switch (type) {
+			case ActorRendererType::Outline: shaderChanged = _renderCommand.GetMaterial().SetShader(resolver.GetShader(hasPalette ? PrecompiledShader::OutlinePalette : PrecompiledShader::Outline)); break;
+			case ActorRendererType::WhiteMask: shaderChanged = _renderCommand.GetMaterial().SetShader(resolver.GetShader(hasPalette ? PrecompiledShader::WhiteMaskPalette : PrecompiledShader::WhiteMask)); break;
+			case ActorRendererType::PartialWhiteMask: shaderChanged = _renderCommand.GetMaterial().SetShader(resolver.GetShader(hasPalette ? PrecompiledShader::PartialWhiteMaskPalette : PrecompiledShader::PartialWhiteMask)); break;
+			case ActorRendererType::FrozenMask: shaderChanged = _renderCommand.GetMaterial().SetShader(resolver.GetShader(hasPalette ? PrecompiledShader::FrozenMaskPalette : PrecompiledShader::FrozenMask)); break;
+			default:
+				// Default state has no precompiled "palette-off" shader - it uses the built-in Sprite program instead
+				shaderChanged = (hasPalette
+					? _renderCommand.GetMaterial().SetShader(resolver.GetShader(PrecompiledShader::PaletteRemap))
+					: _renderCommand.GetMaterial().SetShaderProgramType(Material::ShaderProgramType::Sprite));
+				break;
+		}
+		if (shaderChanged) {
+			shaderHasChanged();
+			_renderCommand.GetGeometry().SetDrawParameters(PrimitiveType::TriangleStrip, 0, 4);
+
+			if (type == ActorRendererType::Outline || type == ActorRendererType::FrozenMask) {
+				_rendererTransition = 0.0f;
+				if (_texture != nullptr) {
+					Vector2i texSize = _texture->GetSize();
+					setColor(Colorf(1.0f / texSize.X, 1.0f / texSize.Y, 1.0f, _rendererTransition));
+				}
+			} else {
+				// Outline and FrozenMask took the whole color above - RGB for the texel size, alpha for their own
+				// transition - so alpha coming out of one of them means nothing here. Every other type leaves it as
+				// the actor's own fade, and the mask shaders replace the sprite's RGB with a flash colour without
+				// touching its alpha, so a fade already in progress has to survive a switch between any two of them.
+				const bool alphaIsActorFade = (KeepsActorFadeInAlpha(previousType) && KeepsActorFadeInAlpha(type));
+				setColor(Colorf(1.0f, 1.0f, 1.0f, alphaIsActorFade ? color().A : 1.0f));
+			}
+		}
+
+		// Bind the shared palette texture to unit 1 for the palette-aware shaders (PaletteRemap / OutlinePalette /
+		// the *MaskPalette variants) and upload the per-instance palette offset (which palette row to sample). Done
+		// after shaderHasChanged() (which (re)allocates the uniform data and resets uTexture to unit 0) so the
+		// sampler/texture binding sticks. Every render type has a palette variant now.
+		if (hasPalette) {
+			RHI::UniformCache* paletteUniform = _renderCommand.GetMaterial().Uniform("uTexturePalette");
+			if (paletteUniform != nullptr) {
+				paletteUniform->SetIntValue(1); // GL_TEXTURE1
+			}
+			Texture* paletteTexture = resolver.GetPaletteTexture();
+			if (paletteTexture != nullptr) {
+				_renderCommand.GetMaterial().SetTexture(1, *paletteTexture);
+			}
+			// A recolor override (>= 0) wins; otherwise the sprite samples its own palette region (offset 0 for most
+			// sprites, the gem-gradient rows for gems)
+			setPaletteOffset((float)(_paletteOffset >= 0 ? _paletteOffset : _basePaletteOffset));
+		} else {
+			setPaletteOffset(0.0f);
+		}
+	}
+
+	void ActorBase::ActorRenderer::SetPalette(std::int32_t paletteOffset)
+	{
+		if (_paletteOffset == paletteOffset) {
+			return;
+		}
+
+		_paletteOffset = paletteOffset;
+		ReinitializeCurrentType();
+	}
+
+	void ActorBase::ActorRenderer::SetIndexed(bool indexed, std::int32_t basePaletteOffset)
+	{
+		if (_baseIndexed == indexed && _basePaletteOffset == basePaletteOffset) {
+			return;
+		}
+
+		_baseIndexed = indexed;
+		_basePaletteOffset = basePaletteOffset;
+		ReinitializeCurrentType();
+	}
+
+	void ActorBase::ActorRenderer::ReinitializeCurrentType()
+	{
+		// Re-run the current state's setup so the shader switches to/from its palette-aware variant (with the proper
+		// shaderHasChanged() handling) and the palette texture is (un)bound / the offset re-uploaded. Every render
+		// type has a palette variant now, so this works whether the renderer is in Default or a mask state.
+		if (_rendererType != (ActorRendererType)-1 && !ContentResolver::Get().IsHeadless()) {
+			ActorRendererType current = _rendererType;
+			_rendererType = (ActorRendererType)-1;
+			Initialize(current);
+		}
+	}
+
+	void ActorBase::ActorRenderer::OnUpdate(float timeMult)
+	{
+		// Remember where the frame started, so whatever the update does with the position, the path the object
+		// took stays available to the swept tests that run afterwards (see ActorBase::HasCrossedOver())
+		_owner->_frameStartPos = _owner->_pos;
+
+		_owner->OnUpdate(timeMult);
+
+		_owner->UpdateRendererPosition();
+
+		if (IsAnimationRunning()) {
+			switch (LoopMode) {
+				case AnimationLoopMode::Loop:
+					AnimTime += timeMult * FrameTimer::SecondsPerFrame;
+					if (AnimTime > AnimDuration) {
+						if DEATH_LIKELY(AnimDuration > 0.0f) {
+							std::int32_t n = (std::int32_t)(AnimTime / AnimDuration);
+							AnimTime -= AnimDuration * n;
+						} else {
+							// A looping animation of no duration still reaches this - IsAnimationRunning()
+							// only asks whether it is paused - and dividing by that zero is not survivable
+							// on every target (see GraphicResource::GetFrameForTime())
+							AnimTime = 0.0f;
+						}
+						_owner->OnAnimationFinished();
+					}
+					break;
+				case AnimationLoopMode::Once:
+					float newAnimTime = AnimTime + timeMult * FrameTimer::SecondsPerFrame;
+					if (AnimTime > AnimDuration) {
+						_owner->OnAnimationFinished();
+					}
+					AnimTime = newAnimTime;
+					break;
+			}
+
+			UpdateVisibleFrames();
+		}
+
+		switch (_rendererType) {
+			case ActorRendererType::Outline:
+				if (_rendererTransition < 0.8f) {
+					_rendererTransition = std::min(_rendererTransition + timeMult * 0.06f, 0.8f);
+					if (_texture != nullptr) {
+						Vector2i texSize = _texture->GetSize();
+						setColor(Colorf(1.0f / texSize.X, 1.0f / texSize.Y, 1.0f, _rendererTransition));
+					}
+				}
+				break;
+			case ActorRendererType::FrozenMask:
+				if (_rendererTransition < 1.0f) {
+					_rendererTransition = std::min(_rendererTransition + timeMult * 0.14f, 1.0f);
+					if (_texture != nullptr) {
+						Vector2i texSize = _texture->GetSize();
+						setColor(Colorf(1.0f / texSize.X, 1.0f / texSize.Y, 1.0f, _rendererTransition));
+					}
+				}
+				break;
+		}
+
+		BaseSprite::OnUpdate(timeMult);
+	}
+
+	bool ActorBase::ActorRenderer::OnDraw(RenderQueue& renderQueue)
+	{
+		if (_owner->OnDraw(renderQueue)) {
+			return true;
+		}
+
+		return BaseSprite::OnDraw(renderQueue);
+	}
+
+	void ActorBase::ActorRenderer::textureHasChanged(Texture* newTexture)
+	{
+		if (_rendererType == ActorRendererType::Outline || _rendererType == ActorRendererType::FrozenMask) {
+			if (newTexture != nullptr) {
+				Vector2i texSize = newTexture->GetSize();
+				setColor(Colorf(1.0f / texSize.X, 1.0f / texSize.Y, 1.0f, _rendererTransition));
+			}
+		}
+	}
+
+	bool ActorBase::ActorRenderer::IsAnimationRunning()
+	{
+		if (FrameCount <= 0) {
+			return false;
+		}
+
+		switch (LoopMode) {
+			case AnimationLoopMode::FixedSingle:
+				return false;
+			case AnimationLoopMode::Loop:
+				return !AnimPaused;
+			case AnimationLoopMode::Once:
+				return !AnimPaused && AnimTime < AnimDuration;
+			default:
+				return false;
+		}
+	}
+
+	ActorRendererType ActorBase::ActorRenderer::GetRendererType() const
+	{
+		return _rendererType;
+	}
+
+	void ActorBase::ActorRenderer::UpdateVisibleFrames()
+	{
+		// Calculate visible frames
+		CurrentFrame = 0;
+		if (FrameCount > 0 && AnimDuration > 0.0f) {
+			// Calculate currently visible frame
+			float frameTemp = (FrameCount * AnimTime) / AnimDuration;
+			CurrentFrame = (std::int32_t)frameTemp;
+
+			// Normalize current frame when exceeding anim duration
+			if (LoopMode == AnimationLoopMode::Once || LoopMode == AnimationLoopMode::FixedSingle) {
+				CurrentFrame = std::clamp<std::int32_t>(CurrentFrame, 0, FrameCount - 1);
+			} else {
+				CurrentFrame = NormalizeFrame(CurrentFrame, 0, FrameCount);
+			}
+		}
+		CurrentFrame = FirstFrame + std::clamp<std::int32_t>(CurrentFrame, 0, FrameCount - 1);
+
+		// Set current animation frame rectangle
+		// A tightly packed sheet gives every frame its own area and its own hotspot within it, so both the
+		// sampled rectangle and the anchor follow the frame (setTexRect() sizes the sprite from the rect)
+		setTexRect(FrameSource != nullptr ? FrameSource->GetFrameRect(CurrentFrame)
+			: Recti(FrameDimensions.X * (CurrentFrame % FrameConfiguration.X),
+				FrameDimensions.Y * (CurrentFrame / FrameConfiguration.X), FrameDimensions.X, FrameDimensions.Y));
+		UpdateAnchor();
+	}
+
+	void ActorBase::ActorRenderer::UpdateAnchor()
+	{
+		// The sprite's quad covers the frame's own area, and flipping mirrors the texture inside that quad,
+		// so a mirrored hotspot has to be measured from the same area. On a regular grid the area is the
+		// whole cell, which is why mirroring within FrameDimensions is right there and wrong for a packed
+		// sheet, where the frame keeps only the space its pixels need.
+		if (FrameSource != nullptr) {
+			const Vector2i anchor = FrameSource->GetFrameAnchor(CurrentFrame, isFlippedX(), isFlippedY());
+			setAbsAnchorPoint((float)anchor.X, (float)anchor.Y);
+		} else {
+			setAbsAnchorPoint(isFlippedX() ? (float)FrameDimensions.X - Hotspot.X : Hotspot.X,
+				isFlippedY() ? (float)FrameDimensions.Y - Hotspot.Y : Hotspot.Y);
+		}
+	}
+
+	std::int32_t ActorBase::ActorRenderer::NormalizeFrame(std::int32_t frame, std::int32_t min, std::int32_t max)
+	{
+		if (frame >= min && frame < max) {
+			return frame;
+		} else if (frame < min) {
+			return max + ((frame - min) % max);
+		} else {
+			return min + (frame % (max - min));
+		}
+	}
+}

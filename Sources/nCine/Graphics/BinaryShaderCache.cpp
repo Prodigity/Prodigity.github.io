@@ -1,0 +1,254 @@
+#include "BinaryShaderCache.h"
+#include "RHI/IRhiCapabilities.h"
+#include "../ServiceLocator.h"
+#include "../Base/Algorithms.h"
+#include "../Base/HashFunctions.h"
+#include "../../Main.h"
+
+#include <IO/FileSystem.h>
+#include <IO/Stream.h>
+#include <IO/Compression/DeflateStream.h>
+
+using namespace Death::Containers::Literals;
+using namespace Death::IO;
+using namespace Death::IO::Compression;
+
+static constexpr std::uint8_t Signature[] = { 0xEF, 0xBB, 0xBF, 0xF0, 0x9F, 0x8C, 0xAA, 0x20 };
+static constexpr std::uint16_t Version = 1 | 0x1000;
+
+namespace nCine
+{
+#if defined(WITH_RHI_GL) && !defined(DEATH_TARGET_VITA)
+	namespace
+	{
+		std::uint32_t bufferSize = 0;
+		std::unique_ptr<std::uint8_t[]> bufferPtr;
+	}
+#endif
+
+	BinaryShaderCache::BinaryShaderCache(StringView path)
+		: _isAvailable(false), _platformHash(0)
+	{
+#if !defined(WITH_RHI_GL) || defined(DEATH_TARGET_VITA)
+		// The software backend compiles no shaders, the Direct3D 11 backend does not use GL program binaries,
+		// and the Vulkan backend runs from pre-compiled SPIR-V shader modules (no GL program binary exists to
+		// cache), so there is nothing to cache on any of these. Stay silently disabled (_isAvailable is already
+		// false, so every cache operation is a no-op) instead of querying GL capabilities and logging a
+		// missing-extension warning that does not apply here.
+#else
+		if (path.empty()) {
+			LOGD("Binary shader cache is disabled");
+			return;
+		}
+
+		const RHI::IRhiCapabilities& caps = theServiceLocator().GetRhiCapabilities();
+#	if defined(RHI_GL_PROFILE_ES) && !defined(DEATH_TARGET_EMSCRIPTEN) && !defined(DEATH_TARGET_SWITCH) && !defined(DEATH_TARGET_UNIX) && !defined(DEATH_TARGET_IOS)
+		const bool isSupported = caps.HasExtension(RHI::IRhiCapabilities::Extensions::ArbGetProgramBinary) ||
+								 caps.HasExtension(RHI::IRhiCapabilities::Extensions::OesGetProgramBinary);
+#	else
+		const bool isSupported = caps.HasExtension(RHI::IRhiCapabilities::Extensions::ArbGetProgramBinary);
+#	endif
+		if (!isSupported) {
+			LOGW("GL_ARB_get_program_binary extensions not supported, binary shader cache is disabled");
+			return;
+		}
+
+#	if defined(RHI_GL_PROFILE_ES) && !defined(DEATH_TARGET_EMSCRIPTEN) && !defined(DEATH_TARGET_SWITCH) && !defined(DEATH_TARGET_UNIX) && !defined(DEATH_TARGET_IOS) && (!defined(DEATH_TARGET_WINDOWS_RT) || defined(WITH_ANGLE))
+		// (iOS is left out as well: Apple's OpenGL|ES headers have no OES_get_program_binary spelling, only the core one)
+		if (caps.HasExtension(RHI::IRhiCapabilities::Extensions::OesGetProgramBinary)) {
+			_glGetProgramBinary = glGetProgramBinaryOES;
+			_glProgramBinary = glProgramBinaryOES;
+			_glProgramBinaryLength = GL_PROGRAM_BINARY_LENGTH_OES;
+		} else
+#	endif
+		{
+#if defined(RHI_GL_PROFILE_ES2)
+			// The core program-binary entry points (glGetProgramBinary/glProgramBinary) and GL_PROGRAM_BINARY_LENGTH
+			// are ES 3.0 / ARB - strict ES 2.0 only has the OES_get_program_binary spelling, which isSupported()
+			// above already requires on RHI_GL_PROFILE_ES, so this core/ARB fallback is unreachable on this profile
+			LOGW("Program binary retrieval is unavailable without OES_get_program_binary, binary shader cache is disabled");
+			return;
+#else
+			_glGetProgramBinary = glGetProgramBinary;
+			_glProgramBinary = glProgramBinary;
+			_glProgramBinaryLength = GL_PROGRAM_BINARY_LENGTH;
+#endif
+		}
+
+		const auto& infoStrings = caps.GetInfoStrings();
+
+		_platformHash =
+			xxHash3(infoStrings.renderer, std::strlen(infoStrings.renderer),
+				xxHash3(infoStrings.apiVersion, std::strlen(infoStrings.apiVersion)));
+
+		char platformHashString[24];
+		std::size_t platformHashLength = formatInto(platformHashString, "{:.16x}", _platformHash);
+		_path = fs::CombinePath(path, { platformHashString, platformHashLength });
+		fs::CreateDirectories(_path);
+
+		bufferSize = 64 * 1024;
+		bufferPtr = std::make_unique<std::uint8_t[]>(bufferSize);
+
+		const bool pathExists = fs::DirectoryExists(_path);
+		_isAvailable = (isSupported && pathExists);
+#endif
+	}
+
+	String BinaryShaderCache::GetCachedShaderPath(const char* shaderName)
+	{
+		if (!_isAvailable || shaderName == nullptr || shaderName[0] == '\0') {
+			return {};
+		}
+
+		std::uint64_t shaderNameHash = xxHash3(shaderName, std::strlen(shaderName));
+
+		char filename[32];
+		std::size_t filenameLength = formatInto(filename, "{:.16x}.shader", shaderNameHash);
+		return fs::CombinePath(_path, { filename, filenameLength });
+	}
+
+	bool BinaryShaderCache::LoadFromCache(const char* shaderName, std::uint64_t shaderVersion, RHI::ShaderProgram* program, RHI::ShaderProgram::Introspection introspection)
+	{
+#if !defined(WITH_RHI_GL) || defined(DEATH_TARGET_VITA)
+		// No GL program binaries exist on these backends and the cache is permanently disabled (see the constructor)
+		return false;
+#else
+		String cachePath = GetCachedShaderPath(shaderName);
+		if (cachePath.empty()) {
+			return false;
+		}
+
+		std::unique_ptr<Stream> s = fs::Open(cachePath, FileAccess::Read);
+		std::int64_t fileSize = s->GetSize();
+		if (fileSize <= 20 || fileSize > 16 * 1024 * 1024) {
+			if (s->IsValid()) {
+				LOGW("Invalid .shader file");
+			}
+			return false;
+		}
+
+		std::uint8_t signature[sizeof(Signature)];
+		s->Read(signature, sizeof(signature));
+		if (std::memcmp(signature, Signature, sizeof(Signature)) != 0) {
+			LOGW("Invalid .shader file");
+			return false;
+		}
+
+		std::uint16_t fileVersion = s->ReadValueAsLE<std::uint16_t>();
+		if (fileVersion != Version) {
+			LOGW("Unsupported .shader file version");
+			return false;
+		}
+
+		std::uint64_t fileShaderVersion = s->ReadVariableUint64();
+		// Shader version must be the same
+		if (fileShaderVersion != shaderVersion) {
+			return false;
+		}
+
+		std::uint32_t fileBinaryFormat = s->ReadVariableUint32();
+		std::uint32_t fileBatchSize = s->ReadVariableUint32();
+		std::uint32_t fileShaderLength = s->ReadVariableUint32();
+		DEATH_ASSERT(fileShaderLength > 0, "Invalid .shader file", false);
+
+		if (bufferSize < fileShaderLength) {
+			bufferSize = fileShaderLength;
+			bufferPtr = std::make_unique<std::uint8_t[]>(bufferSize);
+		}
+
+		DeflateStream ds(*s);
+		std::int64_t bytesRead = ds.Read(bufferPtr.get(), std::int64_t(fileShaderLength));
+		DEATH_ASSERT(bytesRead == fileShaderLength, "Failed to read binary shader data", false);
+
+		_glProgramBinary(program->GetGLHandle(), fileBinaryFormat, bufferPtr.get(), std::int64_t(fileShaderLength));
+		program->SetBatchSize(fileBatchSize);
+		return program->FinalizeAfterLinking(introspection);
+#endif
+	}
+
+	bool BinaryShaderCache::SaveToCache(const char* shaderName, std::uint64_t shaderVersion, RHI::ShaderProgram* program)
+	{
+#if !defined(WITH_RHI_GL) || defined(DEATH_TARGET_VITA)
+		// No GL program binaries exist on these backends and the cache is permanently disabled (see the constructor)
+		return false;
+#else
+		String cachePath = GetCachedShaderPath(shaderName);
+		if (cachePath.empty()) {
+			return false;
+		}
+
+		GLint shaderLength = 0;
+		glGetProgramiv(program->GetGLHandle(), _glProgramBinaryLength, &shaderLength);
+		if (shaderLength <= 0) {
+			return false;
+		}
+
+		if (bufferSize < std::uint32_t(shaderLength)) {
+			bufferSize = std::uint32_t(shaderLength);
+			bufferPtr = std::make_unique<std::uint8_t[]>(bufferSize);
+		} 
+
+		shaderLength = 0;
+		unsigned int binaryFormat = 0;
+		_glGetProgramBinary(program->GetGLHandle(), bufferSize, &shaderLength, &binaryFormat, bufferPtr.get());
+		if (shaderLength <= 0 || std::uint32_t(shaderLength) > bufferSize) {
+			return false;
+		}
+
+		std::unique_ptr<Stream> s = fs::Open(cachePath, FileAccess::Write);
+		if (!s->IsValid()) {
+			return false;
+		}
+
+		s->Write(Signature, sizeof(Signature));
+		s->WriteValueAsLE<std::uint16_t>(Version);
+		s->WriteVariableUint64(shaderVersion);
+		s->WriteVariableUint32(binaryFormat);
+		s->WriteVariableUint32(program->GetBatchSize());
+		s->WriteVariableUint32(shaderLength);
+
+		DeflateWriter dw(*s);
+		dw.Write(bufferPtr.get(), shaderLength);
+
+		return true;
+#endif
+	}
+
+	std::uint32_t BinaryShaderCache::Prune()
+	{
+		auto platformHashString = fs::GetFileName(_path);
+
+		std::uint32_t directoriesRemoved = 0;
+		for (auto shaderPath : fs::Directory(fs::GetDirectoryName(_path))) {
+			if (fs::DirectoryExists(shaderPath)) {
+				StringView filename = fs::GetFileName(shaderPath);
+				if (filename != platformHashString) {
+					fs::RemoveDirectoryRecursive(shaderPath);
+					directoriesRemoved++;
+				}
+			} else if (fs::GetExtension(shaderPath) == "shader"_s) {
+				// Remove stray .shader files that are not in a platform directory
+				fs::RemoveFile(shaderPath);
+			}
+		}
+
+		return directoriesRemoved;
+	}
+
+	bool BinaryShaderCache::Clear()
+	{
+		bool success = fs::RemoveDirectoryRecursive(_path);
+		fs::CreateDirectories(_path);
+		return success;
+	}
+
+	bool BinaryShaderCache::SetPath(StringView path)
+	{
+		if (!fs::DirectoryExists(path) || !fs::IsWritable(path)) {
+			return false;
+		}
+
+		_path = path;
+		return true;
+	}
+}

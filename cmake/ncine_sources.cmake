@@ -1,0 +1,518 @@
+# The platform-neutral base layer (containers, IO, logging). Kept in its own variable so the offline
+# AssetPacker tool can reuse exactly the same set without pulling in the engine.
+set(SHARED_SOURCES
+	${NCINE_SOURCE_DIR}/Shared/Environment.cpp
+	${NCINE_SOURCE_DIR}/Shared/Cpu.cpp
+	${NCINE_SOURCE_DIR}/Shared/Utf8.cpp
+	${NCINE_SOURCE_DIR}/Shared/Base/Format.cpp
+	${NCINE_SOURCE_DIR}/Shared/Containers/DateTime.cpp
+	${NCINE_SOURCE_DIR}/Shared/Containers/SmallVector.cpp
+	${NCINE_SOURCE_DIR}/Shared/Containers/String.cpp
+	${NCINE_SOURCE_DIR}/Shared/Containers/StringUtils.cpp
+	${NCINE_SOURCE_DIR}/Shared/Containers/StringView.cpp
+	${NCINE_SOURCE_DIR}/Shared/Core/Logger.cpp
+	${NCINE_SOURCE_DIR}/Shared/Cryptography/xxHash.cpp
+	${NCINE_SOURCE_DIR}/Shared/IO/AndroidAssetStream.cpp
+	${NCINE_SOURCE_DIR}/Shared/IO/BoundedFileStream.cpp
+	${NCINE_SOURCE_DIR}/Shared/IO/EmscriptenFileStream.cpp
+	${NCINE_SOURCE_DIR}/Shared/IO/FileStream.cpp
+	${NCINE_SOURCE_DIR}/Shared/IO/FileSystem.cpp
+	${NCINE_SOURCE_DIR}/Shared/IO/MemoryStream.cpp
+	${NCINE_SOURCE_DIR}/Shared/IO/PakFile.cpp
+	${NCINE_SOURCE_DIR}/Shared/IO/Stream.cpp
+	${NCINE_SOURCE_DIR}/Shared/IO/WebRequest.cpp
+	${NCINE_SOURCE_DIR}/Shared/IO/Compression/DeflateStream.cpp
+	${NCINE_SOURCE_DIR}/Shared/IO/Compression/Lz4Stream.cpp
+	${NCINE_SOURCE_DIR}/Shared/IO/Compression/ZstdStream.cpp
+	${NCINE_SOURCE_DIR}/Shared/Threading/Implementation/WaitOnAddress.cpp
+)
+
+set(SOURCES ${SHARED_SOURCES})
+
+# The original-data converters, shared with the AssetPacker tool
+set(CONVERTER_SOURCES
+	${NCINE_SOURCE_DIR}/Jazz2/Compatibility/AnimSetMapping.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Compatibility/AssetConverter.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Compatibility/EventConverter.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Compatibility/J2vRecompressor.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Compatibility/JJ2Anims.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Compatibility/JJ2Block.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Compatibility/JJ2Data.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Compatibility/JJ2Episode.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Compatibility/JJ2Level.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Compatibility/JJ2Strings.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Compatibility/JJ2Tileset.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Formats/LevelFile.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Formats/TileSetFile.cpp
+	${NCINE_SOURCE_DIR}/nCine/Base/Algorithms.cpp
+)
+
+list(APPEND SOURCES ${CONVERTER_SOURCES})
+
+list(APPEND SOURCES
+	${NCINE_SOURCE_DIR}/Dependencies/jsoncpp/reader.cpp
+	${NCINE_SOURCE_DIR}/Dependencies/jsoncpp/value.cpp
+	${NCINE_SOURCE_DIR}/Dependencies/jsoncpp/writer.cpp
+)
+
+list(APPEND SOURCES
+	${NCINE_SOURCE_DIR}/nCine/AppConfiguration.cpp
+	${NCINE_SOURCE_DIR}/nCine/Application.cpp
+	${NCINE_SOURCE_DIR}/nCine/I18n.cpp
+	${NCINE_SOURCE_DIR}/nCine/ServiceLocator.cpp
+	${NCINE_SOURCE_DIR}/nCine/Audio/AudioBuffer.cpp
+	${NCINE_SOURCE_DIR}/nCine/Audio/AudioStream.cpp
+	${NCINE_SOURCE_DIR}/nCine/Audio/IAudioLoader.cpp
+	${NCINE_SOURCE_DIR}/nCine/Audio/IAudioPlayer.cpp
+	${NCINE_SOURCE_DIR}/nCine/Base/BitArray.cpp
+	${NCINE_SOURCE_DIR}/nCine/Base/Clock.cpp
+	${NCINE_SOURCE_DIR}/nCine/Base/FrameStatistics.cpp
+	${NCINE_SOURCE_DIR}/nCine/Base/FrameTimer.cpp
+	${NCINE_SOURCE_DIR}/nCine/Base/HashFunctions.cpp
+	${NCINE_SOURCE_DIR}/nCine/Base/Object.cpp
+	${NCINE_SOURCE_DIR}/nCine/Base/Random.cpp
+	${NCINE_SOURCE_DIR}/nCine/Base/Timer.cpp
+	${NCINE_SOURCE_DIR}/nCine/Base/TimeStamp.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/AnimatedSprite.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/BaseSprite.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/BinaryShaderCache.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/Camera.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/DrawableNode.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/Geometry.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/IGfxDevice.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RhiCapabilitiesBase.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/ITextureLoader.cpp
+	#${NCINE_SOURCE_DIR}/nCine/Graphics/ITextureSaver.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/Material.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/MeshSprite.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/Particle.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/ParticleAffectors.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/ParticleInitializer.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/ParticleSystem.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/RectAnimation.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/RenderBatcher.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/RenderBuffersManager.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/RenderCommand.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/RenderCommandPool.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/RenderQueue.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/RenderResources.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/RenderStatistics.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/RenderVaoPool.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/SceneNode.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/ScreenViewport.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/Shader.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/ShaderState.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/Sprite.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/Texture.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/TextureFormat.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderDds.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderKtx.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderPvr.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderRaw.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderPng.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/TextureLoaderQoi.cpp
+	${NCINE_SOURCE_DIR}/nCine/Graphics/Viewport.cpp
+	${NCINE_SOURCE_DIR}/nCine/Input/IInputManager.cpp
+	${NCINE_SOURCE_DIR}/nCine/Input/JoyMapping.cpp
+	${NCINE_SOURCE_DIR}/nCine/Primitives/Color.cpp
+	${NCINE_SOURCE_DIR}/nCine/Primitives/Colorf.cpp
+	${NCINE_SOURCE_DIR}/nCine/Primitives/Half.cpp
+	${NCINE_SOURCE_DIR}/nCine/Threading/Thread.cpp
+	# Runtime part of ShaderCompiler, shared with the offline tool - enables loading ".shader" files at runtime
+	${NCINE_SOURCE_DIR}/Utilities/ShaderCompiler/ConstFold.cpp
+	${NCINE_SOURCE_DIR}/Utilities/ShaderCompiler/GlslReflect.cpp
+	${NCINE_SOURCE_DIR}/Utilities/ShaderCompiler/RuntimeShader.cpp
+	${NCINE_SOURCE_DIR}/Utilities/ShaderCompiler/ShaderParser.cpp
+)
+
+if(NCINE_RHI_GL_PROFILE STREQUAL "ES2")
+	# The OpenGL|ES 2.0 profile additionally links the offline ShaderCompiler's ESSL 100 emitter into the
+	# engine, so runtime-compiled (".shader") shaders get the same lowering the precompiled ones receive
+	# offline (Shader.cpp calls Essl100Emitter::Transform under RHI_GL_PROFILE_ES2). The other profiles and
+	# the non-GL backends never reference or compile this file.
+	list(APPEND SOURCES ${NCINE_SOURCE_DIR}/Utilities/ShaderCompiler/Essl100.cpp)
+endif()
+
+if(NCINE_PREFERRED_RHI STREQUAL "Software")
+	# CPU software rendering backend
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Software/SwBuffer.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Software/SwDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Software/SwRaster.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Software/SwRenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Software/SwShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Software/SwShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Software/SwTexture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Software/SwTileRasterizer.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Software/SwTileRenderer.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Software/SwUniformCache.cpp
+	)
+elseif(NCINE_PREFERRED_RHI STREQUAL "GX")
+	# Nintendo GameCube/Wii fixed-function GX rendering backend (libogc)
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GX/GxBuffer.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GX/GxDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GX/GxRenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GX/GxShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GX/GxShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GX/GxTexture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GX/GxUniformCache.cpp
+	)
+elseif(NCINE_PREFERRED_RHI STREQUAL "PICA")
+	# Nintendo 3DS fixed-function PICA200 rendering backend (citro3d)
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PICA/PicaBuffer.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PICA/PicaDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PICA/PicaRenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PICA/PicaShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PICA/PicaShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PICA/PicaTexture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PICA/PicaUniformCache.cpp
+	)
+elseif(NCINE_PREFERRED_RHI STREQUAL "PVR")
+	# Sega Dreamcast fixed-function PowerVR rendering backend (KallistiOS)
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PVR/PvrBuffer.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PVR/PvrDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PVR/PvrRenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PVR/PvrShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PVR/PvrShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PVR/PvrTexture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/PVR/PvrUniformCache.cpp
+	)
+elseif(NCINE_PREFERRED_RHI STREQUAL "GS")
+	# PlayStation 2 fixed-function Graphics Synthesizer rendering backend (PS2SDK)
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GS/GsBuffer.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GS/GsDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GS/GsRenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GS/GsShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GS/GsShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GS/GsTexture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GS/GsUniformCache.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GS/GsVram.cpp
+	)
+elseif(NCINE_PREFERRED_RHI STREQUAL "GU")
+	# PlayStation Portable fixed-function GE rendering backend (PSPSDK sceGu)
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GU/GuBuffer.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GU/GuDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GU/GuRenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GU/GuShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GU/GuShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GU/GuTexture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GU/GuUniformCache.cpp
+	)
+elseif(NCINE_PREFERRED_RHI STREQUAL "LegacyGL")
+	# Fixed-function OpenGL 1.x rendering backend (MorphOS' TinyGL, and any desktop GL for testing it)
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/LegacyGL/LegacyGlBuffer.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/LegacyGL/LegacyGlDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/LegacyGL/LegacyGlRenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/LegacyGL/LegacyGlShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/LegacyGL/LegacyGlShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/LegacyGL/LegacyGlTexture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/LegacyGL/LegacyGlUniformCache.cpp
+	)
+elseif(NCINE_PREFERRED_RHI STREQUAL "RDP")
+	# Nintendo 64 fixed-function RDP rendering backend (libdragon rdpq)
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RDP/RdpBuffer.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RDP/RdpDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RDP/RdpRenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RDP/RdpShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RDP/RdpShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RDP/RdpTexture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RDP/RdpUniformCache.cpp
+	)
+elseif(NCINE_PREFERRED_RHI STREQUAL "RSX")
+	# PlayStation 3 native RSX rendering backend (PSL1GHT librsx/libgcm_sys). A shader backend like GXM
+	# rather than a fixed-function one - RsxVram owns the GDDR3/XDR suballocation the way GsVram owns the
+	# Graphics Synthesizer's local memory, and RsxShaderProgram binds the microcode cgcomp produced offline.
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RSX/RsxBufferObject.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RSX/RsxDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RSX/RsxRenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RSX/RsxShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RSX/RsxShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RSX/RsxTexture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RSX/RsxUniformCache.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/RSX/RsxVram.cpp
+	)
+elseif(NCINE_PREFERRED_RHI STREQUAL "GXM")
+	# PS Vita native sceGxm rendering backend
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GXM/GxmBufferObject.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GXM/GxmDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GXM/GxmMemory.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GXM/GxmRenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GXM/GxmShaderCache.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GXM/GxmShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GXM/GxmShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GXM/GxmTexture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GXM/GxmUniformCache.cpp
+	)
+elseif(NCINE_PREFERRED_RHI STREQUAL "D3D11")
+	# Direct3D 11 rendering backend
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/D3D11/D3D11BufferObject.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/D3D11/D3D11Device.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/D3D11/D3D11RenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/D3D11/D3D11ShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/D3D11/D3D11ShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/D3D11/D3D11Texture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/D3D11/D3D11UniformCache.cpp
+	)
+elseif(NCINE_PREFERRED_RHI STREQUAL "Vulkan")
+	# Vulkan rendering backend
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Vulkan/VulkanBufferObject.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Vulkan/VulkanDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Vulkan/VulkanRenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Vulkan/VulkanShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Vulkan/VulkanShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Vulkan/VulkanTexture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Vulkan/VulkanUniformCache.cpp
+	)
+elseif(NCINE_PREFERRED_RHI STREQUAL "Metal")
+	# Metal rendering backend (macOS). MetalLayerBridge.mm is the backend's one Objective-C++ file: the
+	# CAMetalLayer operations metal-cpp does not wrap (OBJCXX is enabled for it in ncine_extra_sources.cmake)
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Metal/MetalBufferObject.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Metal/MetalDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Metal/MetalLayerBridge.mm
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Metal/MetalRenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Metal/MetalShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Metal/MetalShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Metal/MetalTexture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/Metal/MetalUniformCache.cpp
+	)
+else()
+	# OpenGL/WebGL is the default rendering backend
+	list(APPEND SOURCES
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLAttribute.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLBlending.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLBufferObject.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLClearColor.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLCullFace.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLDebug.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLDevice.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLDepthTest.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLFramebuffer.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLRenderbuffer.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLRenderTarget.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLRhiCapabilities.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLScissorTest.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLShader.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLShaderProgram.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLShaderUniformBlocks.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLShaderUniforms.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLTexture.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLTextureFormat.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLUniform.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLUniformBlock.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLUniformBlockCache.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLUniformCache.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLVertexArrayObject.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLVertexFormat.cpp
+		${NCINE_SOURCE_DIR}/nCine/Graphics/RHI/GL/GLViewport.cpp
+	)
+endif()
+
+list(APPEND SOURCES
+	${NCINE_SOURCE_DIR}/Main.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/ContentResolver.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/LevelHandler.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/LevelInitialization.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/PreferencesCache.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Resources.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/ActorBase.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Player.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/PlayerCorpse.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/SolidObjectBase.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Collectibles/AmmoCollectible.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Collectibles/CarrotCollectible.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Collectibles/CarrotFlyCollectible.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Collectibles/CarrotInvincibleCollectible.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Collectibles/CoinCollectible.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Collectibles/CollectibleBase.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Collectibles/FastFireCollectible.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Collectibles/FoodCollectible.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Collectibles/GemCollectible.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Collectibles/GemGiant.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Collectibles/GemRing.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Collectibles/OneUpCollectible.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Collectibles/Stopwatch.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Bat.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Bee.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Caterpillar.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Crab.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Demon.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Doggy.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Dragon.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Dragonfly.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/FatChick.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Fencer.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Fish.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/EnemyBase.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Helmut.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/LabRat.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Lizard.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/LizardFloat.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/MadderHatter.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Monkey.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Rapier.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Raven.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Skeleton.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Sparks.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Sucker.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/SuckerFloat.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Turtle.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/TurtleShell.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/TurtleTough.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/TurtleTube.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Witch.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Bosses/BossBase.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Bosses/Bilsy.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Bosses/Bolly.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Bosses/Bubba.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Bosses/Devan.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Bosses/DevanRemote.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Bosses/Queen.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Bosses/Robot.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Bosses/TurtleBoss.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Enemies/Bosses/Uterus.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Batteryman/BatteryAnims.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Batteryman/BatteryObject.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Batteryman/BatteryPickups.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Batteryman/BatteryParticles.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Batteryman/BatteryMovers.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Batteryman/BatteryBoss.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Batteryman/BatteryWorld.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Batteryman/BatterymanPlayer.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Batteryman/StubObject.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/AirboardGenerator.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/AmbientBubbles.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/AmbientSound.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/Bird.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/BirdCage.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/Bomb.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/BonusWarp.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/Checkpoint.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/Copter.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/EndOfLevel.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/Eva.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/IceBlock.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/Moth.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/RollingRock.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/Spring.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/SteamNote.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Environment/SwingingVine.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Explosion.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Lighting/FlickerLight.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Lighting/PulsatingRadialLight.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Lighting/StaticRadialLight.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/AmmoBarrel.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/AmmoCrate.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/BarrelContainer.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/Bridge.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/CrateContainer.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/GenericContainer.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/GemBarrel.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/GemCrate.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/MovingPlatform.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/PinballBumper.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/PinballPaddle.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/Pole.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/PowerUpMorphMonitor.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/PowerUpShieldMonitor.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/PowerUpWeaponMonitor.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/PushableBox.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/SpikeBall.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Solid/TriggerCrate.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/BlasterShot.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/BouncerShot.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/ElectroShot.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/FreezerShot.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/PepperShot.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/RFShot.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/SeekerShot.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/ShieldFireShot.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/ShieldLightningShot.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/ShieldWaterShot.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/ShotBase.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/Thunderbolt.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/ToasterShot.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Actors/Weapons/TNT.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Collisions/DynamicTree.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Collisions/DynamicTreeBroadPhase.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Events/EventMap.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Events/EventSpawner.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Input/ControlScheme.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Input/RgbLights.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Input/RumbleProcessor.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Rendering/BlurRenderPass.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Rendering/CombineRenderer.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Rendering/LightingRenderer.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Rendering/PlayerViewport.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Rendering/PolylineRenderer.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Rendering/UpscaleRenderPass.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Rendering/XRayMaskRenderer.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Scripting/JJ2PlusDefinitions.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Scripting/LevelScriptLoader.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Scripting/RegisterArray.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Scripting/RegisterDictionary.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Scripting/RegisterImGuiBindings.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Scripting/RegisterMath.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Scripting/RegisterRef.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Scripting/RegisterString.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Scripting/ScriptActorWrapper.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Scripting/ScriptLoader.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Scripting/ScriptPlayerWrapper.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Tiles/TileMap.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/Tiles/TileSet.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Canvas.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Cinematics.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/DiscordRpcClient.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Font.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/FormattedTextBlock.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/BatteryHUD.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/BatteryFrontEnd.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/HUD.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/InGameConsole.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/LoadingHandler.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/PerformanceOverlay.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/AboutSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/BeginSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/ControlsOptionsSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/CustomLevelSelectSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/EpisodeSelectSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/FirstRunSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/GameplayEnhancementsSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/GameplayOptionsSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/GraphicsOptionsSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/SafeAreaOptionsSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/HighscoresSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/IMenuContainer.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/ImportSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/InGameMenu.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/InputDiagnosticsSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/LanguageSelectSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/MainMenu.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/MenuContainerBase.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/MenuSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/MenuTransition.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/MenuWidgets.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/OptionsSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/PauseSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/RefreshCacheSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/RemapControlsSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/RescaleModeSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/SimpleMessageSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/SoundsOptionsSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/StartGameOptionsSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/TouchControlsOptionsSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/UserProfileOptionsSection.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/TextInputBuffer.cpp
+	${NCINE_SOURCE_DIR}/Jazz2/UI/Menu/WidgetSection.cpp
+)

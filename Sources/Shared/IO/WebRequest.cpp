@@ -1,0 +1,3413 @@
+#include "WebRequest.h"
+
+#include "FileStream.h"
+#include "FileSystem.h"
+#include "MemoryStream.h"
+#include "../Environment.h"
+#include "../Utf8.h"
+#include "../Containers/GrowableArray.h"
+#include "../Containers/StringConcatenable.h"
+#include "../Containers/StringUtils.h"
+
+#include <atomic>
+#include <cstdio>
+#include <map>
+#include <mutex>
+#include <vector>
+
+#if defined(DEATH_TARGET_WINDOWS)
+#	include <winhttp.h>
+#elif defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_SWITCH) || \
+		defined(DEATH_TARGET_3DS) || defined(DEATH_TARGET_PSP) || defined(DEATH_TARGET_VITA) || defined(DEATH_TARGET_UNIX)
+#	include <thread>
+#	include <unordered_map>
+#	include <unistd.h>
+#	include <curl/curl.h>
+#endif
+
+using namespace Death::Containers;
+using namespace Death::Containers::Literals;
+
+namespace Death { namespace IO {
+//###==##====#=====--==~--~=~- --- -- -  -  -   -
+
+	class IRefCounted
+	{
+	public:
+		// The first reference belongs to the smart pointer the instance is handed to --- `ComPtr` takes
+		// a reference of its own when it's constructed from a raw pointer, so starting at one would leave
+		// every request and response owning itself forever, and the transfer handle underneath it (with
+		// the socket of its keep-alive connection) would never be released
+		IRefCounted()
+			: _count(0) {
+		}
+
+		void AddRef() {
+			++_count;
+		}
+		void Release() {
+			if (--_count == 0) {
+				delete this;
+			}
+		}
+
+	protected:
+		virtual ~IRefCounted() = default;
+
+	private:
+		std::atomic_int32_t _count;
+	};
+
+	using WebRequestHeaderMap = std::map<String, String>;
+
+	class WebAuthChallengeImpl : public IRefCounted
+	{
+	public:
+		~WebAuthChallengeImpl() override = default;
+
+		WebAuthChallenge::Source GetSource() const {
+			return _source;
+		}
+
+		virtual void SetCredentials(const WebCredentials& cred) = 0;
+
+	protected:
+		explicit WebAuthChallengeImpl(WebAuthChallenge::Source source)
+			: _source(source) {}
+
+	private:
+		const WebAuthChallenge::Source _source;
+	};
+
+	class WebResponseImpl;
+
+	class WebRequestImpl : public IRefCounted
+	{
+		friend class WebResponseImpl;
+
+	public:
+		using Result = WebRequestAsync::Result;
+
+		bool IsAsync() const {
+			return (_session != nullptr);
+		}
+
+		~WebRequestImpl() override = default;
+
+		WebRequestImpl(const WebRequestImpl&) = delete;
+		WebRequestImpl& operator=(const WebRequestImpl&) = delete;
+
+		void SetHeader(StringView name, StringView value) {
+			_headers[name] = value;
+		}
+
+		void SetMethod(StringView method) {
+			_method = method;
+		}
+
+		void SetData(StringView text, StringView contentType);
+
+		bool SetData(std::unique_ptr<Stream> dataStream, StringView contentType, std::int64_t dataSize = -1);
+
+		void SetStorage(WebRequestAsync::Storage storage) {
+			_storage = storage;
+		}
+
+		WebRequestAsync::Storage GetStorage() const {
+			return _storage;
+		}
+
+		virtual Result Execute() = 0;
+
+		virtual void Run() = 0;
+
+		void Cancel();
+
+		virtual WebResponseImplPtr GetResponse() const = 0;
+
+		virtual WebAuthChallengeImplPtr GetAuthChallenge() const = 0;
+
+		std::int32_t GetId() const {
+			return _id;
+		}
+
+		WebSessionAsync& GetSession() const {
+			return *_session;
+		}
+
+		WebSessionImpl& GetSessionImpl() const {
+			return *_sessionImpl;
+		}
+
+		WebRequest::State GetState() const {
+			return _state;
+		}
+
+		virtual std::int64_t GetBytesSent() const = 0;
+		virtual std::int64_t GetBytesExpectedToSend() const = 0;
+		virtual std::int64_t GetBytesReceived() const;
+		virtual std::int64_t GetBytesExpectedToReceive() const;
+
+		virtual WebRequestHandle GetNativeHandle() const = 0;
+
+		void MakeInsecure(WebRequestBase::Ignore flags) {
+			_securityFlags = flags;
+		}
+
+		WebRequestBase::Ignore GetSecurityFlags() const {
+			return _securityFlags;
+		}
+
+		void SetState(WebRequest::State state, StringView failMessage = {});
+		void ReportDataReceived(std::size_t sizeReceived);
+
+	protected:
+		WebRequest::Storage _storage;
+		WebRequestBase::Ignore _securityFlags;
+		String _method;
+		WebRequestHeaderMap _headers;
+		std::int64_t _dataSize;
+		std::unique_ptr<Stream> _dataStream;
+
+		WebRequestImpl(WebSessionAsync& session, WebSessionImpl& sessionImpl, Function<void(WebRequestEvent&)>&& callback, std::int32_t id);
+
+		explicit WebRequestImpl(WebSessionImpl& sessionImpl);
+
+		bool WasCancelled() const {
+			return _cancelled;
+		}
+
+		String GetHTTPMethod() const;
+
+		static Result GetResultFromHTTPStatus(const WebResponseImplPtr& response);
+
+		void SetFinalStateFromStatus() {
+			HandleResult(GetResultFromHTTPStatus(GetResponse()));
+		}
+
+		void HandleResult(const Result& result) {
+			SetState(result.state, result.error);
+		}
+
+		bool CheckResult(const Result& result) {
+			if (!result) {
+				HandleResult(result);
+				return false;
+			}
+			return true;
+		}
+
+	private:
+		WebSessionImplPtr _sessionImpl;
+		WebSessionAsync* const _session;
+		Function<void(WebRequestEvent&)> _callback;
+		const std::int32_t _id;
+		// Written on whichever thread drives the transfer, read from any thread polling the request
+		std::atomic<WebRequest::State> _state;
+		std::atomic<std::int64_t> _bytesReceived;
+		String _dataText;
+		std::atomic<bool> _cancelled;
+
+		virtual void DoCancel() = 0;
+
+		void ProcessStateEvent(WebRequest::State prevState, WebRequest::State state, StringView failMsg);
+	};
+
+	class WebResponseImpl : public IRefCounted
+	{
+	public:
+		~WebResponseImpl() override;
+
+		virtual std::int64_t GetContentLength() const = 0;
+
+		virtual String GetURL() const = 0;
+
+		virtual String GetHeader(StringView name) const = 0;
+
+		virtual Array<String> GetAllHeaderValues(StringView name) const = 0;
+
+		virtual String GetMimeType() const;
+
+		virtual String GetContentType() const;
+
+		virtual std::int32_t GetStatus() const = 0;
+
+		virtual String GetStatusText() const = 0;
+
+		virtual Stream* GetStream() const;
+
+		virtual String GetSuggestedFileName() const;
+
+		String AsString() const;
+
+		virtual String GetDataFile() const;
+
+		WebRequest::Result InitializeFileStorage();
+
+		void ReportDataReceived(std::size_t sizeReceived);
+
+		void Finalize();
+
+	protected:
+		WebRequestImpl& _request;
+
+		explicit WebResponseImpl(WebRequestImpl& request);
+
+		void* GetDataBuffer(std::size_t sizeNeeded);
+		void PreAllocateBuffer(std::size_t sizeNeeded);
+
+	private:
+		SmallVector<char, 0> _readBuffer;
+		mutable std::unique_ptr<FileStream> _file;
+		mutable std::unique_ptr<Stream> _stream;
+	};
+
+	class WebSessionFactory
+	{
+	public:
+		virtual WebSessionImpl* Create() = 0;
+		virtual WebSessionImpl* CreateAsync() = 0;
+
+		virtual bool Initialize() {
+			return true;
+		}
+
+		virtual ~WebSessionFactory() = default;
+	};
+
+	class WebSessionImpl : public IRefCounted
+	{
+		friend class WebRequest;
+
+	public:
+		enum class Mode {
+			Async,
+			Sync
+		};
+
+		~WebSessionImpl() override;
+
+		virtual WebRequestImplPtr CreateRequest(WebSession& session, StringView url) = 0;
+		virtual WebRequestImplPtr CreateRequestAsync(WebSessionAsync& session, StringView url, Function<void(WebRequestEvent&)>&& callback, std::int32_t id) = 0;
+
+		void AddCommonHeader(StringView name, StringView value) {
+			_headers[name] = value;
+		}
+
+		String GetTempDirectory() const;
+
+		void SetTempDirectory(StringView path) {
+			_tempDir = path;
+		}
+
+		virtual bool SetProxy(const WebProxy& proxy) {
+			_proxy = proxy; return true;
+		}
+		const WebProxy& GetProxy() const {
+			return _proxy;
+		}
+
+		const WebRequestHeaderMap& GetHeaders() const noexcept {
+			return _headers;
+		}
+
+		virtual WebSessionHandle GetNativeHandle() const noexcept = 0;
+
+		virtual bool EnablePersistentStorage(bool enable) {
+			return false;
+		}
+
+	protected:
+		explicit WebSessionImpl(Mode mode);
+
+		bool IsAsync() const {
+			return (_mode == Mode::Async);
+		}
+
+	private:
+		const Mode _mode;
+		WebRequestHeaderMap _headers;
+		String _tempDir;
+		WebProxy _proxy{WebProxy::Default()};
+	};
+
+	namespace
+	{
+		inline WebSessionImplPtr FromOwned(WebSessionImpl& impl)
+		{
+			// The returned pointer takes the reference on its own, the session must not be referenced twice
+			return WebSessionImplPtr{&impl};
+		}
+	}
+
+	WebAuthChallenge::WebAuthChallenge() = default;
+
+	WebAuthChallenge::WebAuthChallenge(const WebAuthChallengeImplPtr& impl)
+		: _impl(impl) {}
+
+	WebAuthChallenge::WebAuthChallenge(const WebAuthChallenge&) = default;
+
+	WebAuthChallenge& WebAuthChallenge::operator=(const WebAuthChallenge&) = default;
+
+	WebAuthChallenge::~WebAuthChallenge() = default;
+
+	WebAuthChallenge::Source WebAuthChallenge::GetSource() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", Source::Server);
+
+		return _impl->GetSource();
+	}
+
+	void WebAuthChallenge::SetCredentials(const WebCredentials& cred)
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", );
+
+		_impl->SetCredentials(cred);
+	}
+
+	WebRequestImpl::WebRequestImpl(WebSessionAsync& session, WebSessionImpl& sessionImpl, Function<void(WebRequestEvent&)>&& callback, std::int32_t id)
+		: _storage(WebRequest::Storage::Memory), _headers(sessionImpl.GetHeaders()), _dataSize(0), _securityFlags(WebRequestBase::Ignore::None),
+			_sessionImpl(FromOwned(sessionImpl)), _session(&session), _callback(Death::move(callback)), _id(id), _state(WebRequest::State::Idle),
+			_bytesReceived(0), _cancelled(false)
+	{
+	}
+
+	WebRequestImpl::WebRequestImpl(WebSessionImpl& sessionImpl)
+		: _storage(WebRequest::Storage::Memory), _headers(sessionImpl.GetHeaders()), _dataSize(0), _securityFlags(WebRequestBase::Ignore::None),
+			_sessionImpl(FromOwned(sessionImpl)), _session(nullptr), _id(-1), _state(WebRequest::State::Idle),
+			_bytesReceived(0), _cancelled(false)
+	{
+	}
+
+	void WebRequestImpl::Cancel()
+	{
+		DEATH_DEBUG_ASSERT(IsAsync());
+
+		// Atomic exchange, so two concurrent cancellations can't both reach DoCancel()
+		if (_cancelled.exchange(true)) {
+			return;
+		}
+
+		switch (GetState()) {
+			case WebRequest::State::Idle:
+				// The request was never started, so there is no transfer to abort - it reaches its
+				// final state right away, which is also what notifies the callback
+				SetState(WebRequest::State::Cancelled);
+				break;
+
+			case WebRequest::State::Active:
+			case WebRequest::State::Unauthorized:
+				// Only a transfer the backend already knows about has to be aborted down there, and
+				// the final state is recorded when it actually stops
+				DoCancel();
+				break;
+
+			case WebRequest::State::Completed:
+			case WebRequest::State::Failed:
+			case WebRequest::State::Cancelled:
+				// The request has already finished, there is nothing left to cancel
+				break;
+		}
+	}
+
+	String WebRequestImpl::GetHTTPMethod() const
+	{
+		if (!_method.empty()) {
+			return StringUtils::uppercase(_method);
+		}
+		return (_dataSize ? "POST"_s : "GET"_s);
+	}
+
+	WebRequest::Result WebRequestImpl::GetResultFromHTTPStatus(const WebResponseImplPtr& resp)
+	{
+		DEATH_ASSERT(resp, "Cannot be called with an uninitialized object", Result::Error("No response object"_s));
+
+		const std::int32_t status = resp->GetStatus();
+
+		if (status == 401 || status == 407) {
+			return Result::Unauthorized(resp->GetStatusText());
+		} else if (status >= 400) {
+			char errorMessage[64];
+			std::size_t length = formatInto(errorMessage, "Error {} ({})", status, resp->GetStatusText());
+			return Result::Error({ errorMessage, length });
+		} else {
+			return Result::Ok(WebRequest::State::Completed);
+		}
+	}
+
+	void WebRequestImpl::SetData(StringView text, StringView contentType)
+	{
+		_dataText = text;
+
+		SetData(std::make_unique<MemoryStream>(InPlaceInit, _dataText), contentType);
+	}
+
+	bool WebRequestImpl::SetData(std::unique_ptr<Stream> dataStream, StringView contentType, std::int64_t dataSize)
+	{
+		_dataStream = Death::move(dataStream);
+
+		if (_dataStream != nullptr) {
+			DEATH_ASSERT(_dataStream->IsValid(), "Cannot attach invalid stream", false);
+
+			if (dataSize == -1) {
+				_dataSize = _dataStream->GetSize();
+				if (_dataSize < 0) {
+					return false;
+				}
+				_dataStream->Seek(0, SeekOrigin::Begin);
+			} else {
+				_dataSize = dataSize;
+			}
+		} else {
+			_dataSize = 0;
+		}
+
+		SetHeader("Content-Type"_s, contentType);
+		return true;
+	}
+
+	std::int64_t WebRequestImpl::GetBytesReceived() const
+	{
+		return _bytesReceived;
+	}
+
+	std::int64_t WebRequestImpl::GetBytesExpectedToReceive() const
+	{
+		auto resp = GetResponse();
+		return (resp ? resp->GetContentLength() : -1);
+	}
+
+	void WebRequestImpl::SetState(WebRequest::State state, StringView failMessage)
+	{
+		if (state == WebRequest::State::Active) {
+			// An in-flight transfer keeps itself alive, so that dropping the last public handle can't
+			// destroy the request underneath the thread that is running it. The reference is taken
+			// before the state is published, otherwise a thread that sees Active could reach a final
+			// state and give the reference back before it was ever taken.
+			AddRef();
+		}
+
+		// Only the Active state holds that reference, so the state it replaces says whether there is one
+		// to give back. Reading and replacing it in one step keeps two threads that reach a final state
+		// at the same time from both trying to.
+		WebRequest::State prevState = _state.exchange(state);
+		DEATH_DEBUG_ASSERT(prevState != state);
+
+		ProcessStateEvent(prevState, state, failMessage);
+	}
+
+	void WebRequestImpl::ReportDataReceived(std::size_t sizeReceived)
+	{
+		_bytesReceived += std::int64_t(sizeReceived);
+	}
+
+	namespace
+	{
+		String SplitParameters(StringView s, WebRequestHeaderMap& parameters)
+		{
+			SmallVector<char, 64> value;
+			auto it = s.begin();
+			auto end = s.end();
+			while (it != end && *it == ' ') {
+				++it;
+			}
+			while (it != end && *it != ';') {
+				value.push_back(*it++);
+			}
+			StringView valueView = value;
+			valueView = valueView.trimmed();
+			if (it != end) {
+				++it;
+			}
+			parameters.clear();
+			SmallVector<char, 32> pname;
+			SmallVector<char, 64> pvalue;
+			while (it != end) {
+				pname.clear();
+				pvalue.clear();
+				while (it != end && *it == ' ') {
+					++it;
+				}
+				while (it != end && *it != '=' && *it != ';') {
+					pname.push_back(*it++);
+				}
+				StringView pnameView = pname;
+				pnameView = pnameView.trimmed();
+
+				if (it != end && *it != ';') {
+					++it;
+				}
+				while (it != end && *it == ' ') {
+					++it;
+				}
+				while (it != end && *it != ';') {
+					if (*it == '"') {
+						++it;
+						while (it != end && *it != '"') {
+							if (*it == '\\') {
+								++it;
+								if (it != end) {
+									pvalue.push_back(*it++);
+								}
+							} else {
+								pvalue.push_back(*it++);
+							}
+						}
+						if (it != end) {
+							++it;
+						}
+					} else if (*it == '\\') {
+						++it;
+						if (it != end) {
+							pvalue.push_back(*it++);
+						}
+					} else {
+						pvalue.push_back(*it++);
+					}
+				}
+
+				StringView pvalueView = pvalue;
+				pvalueView = pvalueView.trimmed();
+
+				if (!pname.empty()) {
+					parameters[pnameView] = pvalueView;
+				}
+				if (it != end) {
+					++it;
+				}
+			}
+
+			return valueView;
+		}
+	}
+
+	void WebRequestImpl::ProcessStateEvent(WebRequest::State prevState, WebRequest::State state, StringView failMsg)
+	{
+		// Keeps the instance alive for the duration of the callback, so that the `Release()` below can
+		// drop the self-reference that `SetState(State::Active)` took without pulling the ground away
+		const WebRequestImplPtr request(this);
+
+		const WebResponseImplPtr& response = GetResponse();
+
+		WebRequestEvent e(GetId(), state, WebRequestAsync(request), WebResponse(response), failMsg);
+
+		StringView dataFile;
+		bool shouldRelease = false;
+		switch (state) {
+			case WebRequest::State::Idle:
+				// Unreachable state
+				break;
+
+			case WebRequest::State::Active:
+				break;
+
+			case WebRequest::State::Unauthorized:
+				shouldRelease = true;
+				break;
+
+			case WebRequest::State::Completed:
+				if (_storage == WebRequest::Storage::File) {
+					dataFile = response->GetDataFile();
+					e.SetDataFile(dataFile);
+				}
+				DEATH_FALLTHROUGH
+
+			case WebRequest::State::Failed:
+			case WebRequest::State::Cancelled:
+				if (response) {
+					response->Finalize();
+				}
+				shouldRelease = true;
+				break;
+		}
+
+		if (_callback) {
+			_callback(e);
+		}
+
+		if (!dataFile.empty() && FileSystem::FileExists(dataFile)) {
+			FileSystem::RemoveFile(dataFile);
+		}
+
+		// The self-reference is given back when the transfer leaves the active state --- a request that
+		// failed while it was still being prepared never took one
+		if (shouldRelease && prevState == WebRequest::State::Active) {
+			Release();
+		}
+	}
+
+	WebRequestBase::WebRequestBase() = default;
+
+	WebRequestBase::WebRequestBase(const WebRequestImplPtr& impl)
+		: _impl(impl) {}
+
+	WebRequestBase::WebRequestBase(const WebRequestBase&) = default;
+
+	WebRequestBase& WebRequestBase::operator=(const WebRequestBase&) = default;
+
+	WebRequestBase::~WebRequestBase() = default;
+
+	void WebRequestBase::SetHeader(StringView name, StringView value)
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", );
+
+		_impl->SetHeader(name, value);
+	}
+
+	void WebRequestBase::SetMethod(StringView method)
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", );
+
+		_impl->SetMethod(method);
+	}
+
+	void WebRequestBase::SetData(StringView text, StringView contentType)
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", );
+
+		_impl->SetData(text, contentType);
+	}
+
+	bool WebRequestBase::SetData(std::unique_ptr<Stream> dataStream, StringView contentType, std::int64_t dataSize)
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", false);
+
+		return _impl->SetData(Death::move(dataStream), contentType, dataSize);
+	}
+
+	WebRequestBase::Storage WebRequestBase::GetStorage() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", Storage::None);
+
+		return _impl->GetStorage();
+	}
+
+	void WebRequestBase::SetStorage(Storage storage)
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", );
+
+		_impl->SetStorage(storage);
+	}
+
+	WebRequest::Result WebRequest::Execute() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", Result::Error("Invalid session object"_s));
+
+		return _impl->Execute();
+	}
+
+	void WebRequestAsync::Run()
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", );
+		DEATH_ASSERT(_impl->GetState() == State::Idle, "Completed requests cannot be restarted", );
+
+		_impl->Run();
+	}
+
+	void WebRequestAsync::Cancel()
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", );
+
+		_impl->Cancel();
+	}
+
+	WebResponse WebRequestBase::GetResponse() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return WebResponse(_impl->GetResponse());
+	}
+
+	WebAuthChallenge WebRequestAsync::GetAuthChallenge() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return WebAuthChallenge(_impl->GetAuthChallenge());
+	}
+
+	std::int32_t WebRequestAsync::GetId() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", -1);
+
+		return _impl->GetId();
+	}
+
+	WebSessionAsync& WebRequestAsync::GetSession() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", WebSessionAsync::GetDefault());
+
+		return _impl->GetSession();
+	}
+
+	WebRequest::State WebRequestAsync::GetState() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", State::Failed);
+
+		return _impl->GetState();
+	}
+
+	std::int64_t WebRequestBase::GetBytesSent() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", -1);
+
+		return _impl->GetBytesSent();
+	}
+
+	std::int64_t WebRequestBase::GetBytesExpectedToSend() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", -1);
+
+		return _impl->GetBytesExpectedToSend();
+	}
+
+	std::int64_t WebRequestBase::GetBytesReceived() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", -1);
+
+		return _impl->GetBytesReceived();
+	}
+
+	std::int64_t WebRequestBase::GetBytesExpectedToReceive() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", -1);
+
+		return _impl->GetBytesExpectedToReceive();
+	}
+
+	WebRequestHandle WebRequestBase::GetNativeHandle() const noexcept
+	{
+		return (_impl ? _impl->GetNativeHandle() : nullptr);
+	}
+
+	void WebRequestBase::MakeInsecure(Ignore flags)
+	{
+		_impl->MakeInsecure(flags);
+	}
+
+	WebRequestBase::Ignore WebRequestBase::GetSecurityFlags() const
+	{
+		return _impl->GetSecurityFlags();
+	}
+
+	WebResponseImpl::WebResponseImpl(WebRequestImpl& request)
+		: _request(request) {}
+
+	WebResponseImpl::~WebResponseImpl()
+	{
+		// Only file storage has a temporary file to discard, memory-backed responses never open one
+		if (_file == nullptr) {
+			return;
+		}
+
+		String path = _file->GetPath();
+
+		// Both handles have to be closed before the file can be removed
+		_stream = nullptr;
+		_file = nullptr;
+
+		if (FileSystem::FileExists(path)) {
+			FileSystem::RemoveFile(path);
+		}
+	}
+
+	WebRequest::Result WebResponseImpl::InitializeFileStorage()
+	{
+		if (_request.GetStorage() == WebRequest::Storage::File) {
+			String tempDir = _request.GetSessionImpl().GetTempDirectory();
+			std::uint64_t hash = Environment::QueryUnbiasedInterruptTime() * 11400714819323198485ULL;
+			for (std::int32_t i = 0; i < 10; i++) {
+				char fileName[64];
+				std::size_t length = formatInto(fileName, "Dx-{:.8x}-{:.8x}", std::uint32_t((hash >> 32) & 0xffffffff), std::uint32_t(hash & 0xffffffff));
+				_file = std::make_unique<FileStream>(FileSystem::CombinePath(tempDir, { fileName, length }), FileAccess::Write);
+				if (_file->IsValid()) {
+					break;
+				}
+
+				_file = nullptr;
+				hash ^= hash >> 33;
+				hash *= 0xFF51AFD7ED558CCDULL;
+			}
+
+			if (_file == nullptr || !_file->IsValid()) {
+				return WebRequest::Result::Error("Failed to create temporary file");
+			}
+		}
+
+		return WebRequest::Result::Ok();
+	}
+
+	String WebResponseImpl::GetMimeType() const
+	{
+		StringView contentType = GetContentType();
+		return contentType.prefix(contentType.findOr(';', contentType.end()).begin());
+	}
+
+	String WebResponseImpl::GetContentType() const
+	{
+		return GetHeader("Content-Type"_s);
+	}
+
+	Stream* WebResponseImpl::GetStream() const
+	{
+		if (_stream == nullptr) {
+			switch (_request.GetStorage()) {
+				case WebRequest::Storage::Memory: {
+					_stream = std::make_unique<MemoryStream>(_readBuffer.data(), _readBuffer.size());
+					break;
+				}
+				case WebRequest::Storage::File: {
+					_stream = std::make_unique<FileStream>(_file->GetPath(), FileAccess::Read);
+					break;
+				}
+				case WebRequest::Storage::None: {
+					// Stream is disabled
+					break;
+				}
+			}
+		}
+
+		return _stream.get();
+	}
+
+	String WebResponseImpl::GetSuggestedFileName() const
+	{
+		String suggestedFilename;
+
+		// Try to determine filename from "Content-Disposition" header
+		String contentDisp = GetHeader("Content-Disposition"_s);
+		WebRequestHeaderMap params;
+		String disp = SplitParameters(contentDisp, params);
+		if (disp == "attachment"_s) {
+			suggestedFilename = params["filename"_s];
+		}
+
+		if (suggestedFilename.empty()) {
+			String uri = GetURL();
+			StringView fileName = uri.trimmedSuffix("/"_s);
+			suggestedFilename = fileName.suffix(fileName.findLastOr('/', fileName.begin()).end());
+			suggestedFilename = suggestedFilename.prefix(suggestedFilename.findOr('?', suggestedFilename.end()).begin());
+		}
+
+		return suggestedFilename;
+	}
+
+	String WebResponseImpl::AsString() const
+	{
+		if (_request.GetStorage() == WebRequest::Storage::Memory) {
+			return arrayView(_readBuffer);
+		}
+
+		return {};
+	}
+
+	void WebResponseImpl::ReportDataReceived(std::size_t sizeReceived)
+	{
+		_readBuffer.resize_for_overwrite(_readBuffer.size() + sizeReceived);
+		_request.ReportDataReceived(sizeReceived);
+
+		switch (_request.GetStorage()) {
+			case WebRequest::Storage::Memory: {
+				// The destination buffer is used directly
+				break;
+			}
+			case WebRequest::Storage::File: {
+				_file->Write(_readBuffer.data(), std::int64_t(_readBuffer.size()));
+				_readBuffer.clear();
+				break;
+			}
+			case WebRequest::Storage::None: {
+				if (!_request.IsAsync()) {
+					break;
+				}
+
+				// Both pointers take a reference of their own, keeping the pair alive for the callback
+				const WebRequestImplPtr request(&_request);
+				const WebResponseImplPtr response(this);
+
+				if (_request._callback) {
+					WebRequestEvent evt(_request.GetId(), WebRequest::State::Active, WebRequestAsync(request), WebResponse(response));
+					evt.SetDataBuffer(_readBuffer);
+					_request._callback(evt);
+				}
+
+				_readBuffer.clear();
+				break;
+			}
+		}
+	}
+
+	void* WebResponseImpl::GetDataBuffer(std::size_t sizeNeeded)
+	{
+		std::size_t prevSize = _readBuffer.size();
+		_readBuffer.reserve(prevSize + sizeNeeded);
+		return _readBuffer.data() + prevSize;
+	}
+
+	void WebResponseImpl::PreAllocateBuffer(std::size_t sizeNeeded)
+	{
+		_readBuffer.reserve(_readBuffer.size() + sizeNeeded);
+	}
+
+	String WebResponseImpl::GetDataFile() const
+	{
+		return _file->GetPath();
+	}
+
+	void WebResponseImpl::Finalize()
+	{
+		if (_request.GetStorage() == WebRequest::Storage::File) {
+			_file->Dispose();
+		}
+	}
+
+	WebResponse::WebResponse() = default;
+
+	WebResponse::WebResponse(const WebResponseImplPtr& impl)
+		: _impl(impl) {}
+
+	WebResponse::WebResponse(const WebResponse&) = default;
+
+	WebResponse& WebResponse::operator=(const WebResponse&) = default;
+
+	WebResponse::~WebResponse() = default;
+
+	std::int64_t WebResponse::GetContentLength() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", -1);
+
+		return _impl->GetContentLength();
+	}
+
+	String WebResponse::GetURL() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return _impl->GetURL();
+	}
+
+	String WebResponse::GetHeader(StringView name) const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return _impl->GetHeader(name);
+	}
+
+	Array<String> WebResponse::GetAllHeaderValues(StringView name) const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return _impl->GetAllHeaderValues(name);
+	}
+
+	String WebResponse::GetMimeType() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return _impl->GetMimeType();
+	}
+
+	String WebResponse::GetContentType() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return _impl->GetContentType();
+	}
+
+	std::int32_t WebResponse::GetStatus() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", -1);
+
+		return _impl->GetStatus();
+	}
+
+	String WebResponse::GetStatusText() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return _impl->GetStatusText();
+	}
+
+	Stream* WebResponse::GetStream() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", nullptr);
+
+		return _impl->GetStream();
+	}
+
+	String WebResponse::GetSuggestedFileName() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return _impl->GetSuggestedFileName();
+	}
+
+	String WebResponse::AsString() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return _impl->AsString();
+	}
+
+	String WebResponse::GetDataFile() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return _impl->GetDataFile();
+	}
+
+	WebProxy::WebProxy(Type type, Containers::StringView url)
+		: _type(type), _url(url) {}
+
+	WebProxy::Type WebProxy::GetType() const
+	{
+		return _type;
+	}
+
+	Containers::StringView WebProxy::GetURL() const
+	{
+		DEATH_DEBUG_ASSERT(_type == Type::URL);
+		return _url;
+	}
+
+#if defined(DEATH_TARGET_WINDOWS)
+
+	class WebSessionWinHTTP;
+	class WebRequestWinHTTP;
+
+	class WebResponseWinHTTP : public WebResponseImpl
+	{
+	public:
+		WebResponseWinHTTP(WebRequestWinHTTP& request);
+
+		std::int64_t GetContentLength() const override {
+			return _contentLength;
+		}
+
+		String GetURL() const override;
+
+		String GetHeader(StringView name) const override;
+
+		Array<String> GetAllHeaderValues(StringView name) const override;
+
+		std::int32_t GetStatus() const override;
+
+		String GetStatusText() const override;
+
+		bool ReadData(DWORD* bytesRead = nullptr);
+
+	private:
+		HINTERNET _requestHandle;
+		std::int64_t _contentLength;
+	};
+
+	class WebAuthChallengeWinHTTP : public WebAuthChallengeImpl
+	{
+	public:
+		WebAuthChallengeWinHTTP(WebAuthChallenge::Source source, WebRequestWinHTTP& request);
+
+		WebAuthChallengeWinHTTP(const WebAuthChallengeWinHTTP&) = delete;
+		WebAuthChallengeWinHTTP& operator=(const WebAuthChallengeWinHTTP&) = delete;
+
+		bool Initialize();
+
+		WebRequest::Result DoSetCredentials(const WebCredentials& cred);
+
+		void SetCredentials(const WebCredentials& cred) override;
+
+	private:
+		WebRequestWinHTTP& _request;
+		DWORD _target;
+		DWORD _selectedScheme;
+	};
+
+	class WebRequestWinHTTP : public WebRequestImpl
+	{
+		friend class WebAuthChallengeWinHTTP;
+
+	public:
+		WebRequestWinHTTP(WebSessionAsync& session, WebSessionWinHTTP& sessionImpl, StringView url, Function<void(WebRequestEvent&)>&& callback, std::int32_t id);
+		WebRequestWinHTTP(WebSessionWinHTTP& sessionImpl, StringView url);
+
+		~WebRequestWinHTTP();
+
+		WebRequest::Result Execute() override;
+
+		void Run() override;
+
+		WebResponseImplPtr GetResponse() const override {
+			return _response;
+		}
+
+		WebAuthChallengeImplPtr GetAuthChallenge() const override {
+			return _authChallenge;
+		}
+
+		std::int64_t GetBytesSent() const override {
+			return _dataWritten;
+		}
+
+		std::int64_t GetBytesExpectedToSend() const override {
+			return _dataSize;
+		}
+
+		void HandleCallback(DWORD dwInternetStatus, LPVOID lpvStatusInformation, DWORD dwStatusInformationLength);
+
+		HINTERNET GetHandle() const noexcept {
+			return _request;
+		}
+
+		WebRequestHandle GetNativeHandle() const noexcept override {
+			return (WebRequestHandle)GetHandle();
+		}
+
+	private:
+		WebSessionWinHTTP& _sessionImpl;
+		String _url;
+		HINTERNET _connect;
+		// Cleared by DoCancel() from an arbitrary thread while callback threads may be reading it
+		std::atomic<HINTERNET> _request;
+		ComPtr<WebResponseWinHTTP> _response;
+		ComPtr<WebAuthChallengeWinHTTP> _authChallenge;
+		SmallVector<char, 0> _dataWriteBuffer;
+		std::atomic<std::int64_t> _dataWritten;
+		WebCredentials _credentialsFromURL;
+		bool _tryCredentialsFromURL;
+		bool _tryProxyCredentials;
+
+		void DoCancel() override;
+
+		Result DoPrepareRequest();
+
+		Result DoWriteData(DWORD* bytesWritten = nullptr);
+
+		Result SendRequest();
+
+		void WriteData();
+
+		Result CreateResponse();
+
+		Result InitializeAuthIfNeeded();
+
+		Result Fail(StringView operation, DWORD errorCode);
+
+		Result FailWithLastError(StringView operation) {
+			return Fail(operation, ::GetLastError());
+		}
+
+		void SetFailed(StringView operation, DWORD errorCode) {
+			return HandleResult(Fail(operation, errorCode));
+		}
+
+		void SetFailedWithLastError(StringView operation) {
+			return HandleResult(FailWithLastError(operation));
+		}
+	};
+
+	class WebSessionWinHTTP : public WebSessionImpl
+	{
+	public:
+		explicit WebSessionWinHTTP(Mode mode);
+
+		~WebSessionWinHTTP();
+
+		static bool Initialize();
+
+		WebRequestImplPtr CreateRequest(WebSession& session, StringView url) override;
+		WebRequestImplPtr CreateRequestAsync(WebSessionAsync& session, StringView url, Function<void(WebRequestEvent&)>&& callback, std::int32_t id) override;
+
+		bool SetProxy(const WebProxy& proxy) override;
+
+		HINTERNET GetHandle() const noexcept {
+			return _handle.load(std::memory_order_acquire);
+		}
+
+		WebSessionHandle GetNativeHandle() const noexcept override {
+			return (WebSessionHandle)GetHandle();
+		}
+
+		bool HasProxyCredentials() const {
+			return !_proxyCredentials.GetUser().empty();
+		}
+
+		const WebCredentials& GetProxyCredentials() const {
+			return _proxyCredentials;
+		}
+
+	private:
+		// The default session is shared process-wide and requests can be created from any thread, so
+		// the lazily opened session handle is published atomically (see Open())
+		std::atomic<HINTERNET> _handle;
+		WebCredentials _proxyCredentials;
+		String _proxyURLWithoutCredentials;
+
+		bool Open();
+	};
+
+	class WebSessionFactoryWinHTTP : public WebSessionFactory
+	{
+	public:
+		WebSessionImpl* Create() override {
+			return new WebSessionWinHTTP(WebSessionImpl::Mode::Sync);
+		}
+
+		WebSessionImpl* CreateAsync() override {
+			return new WebSessionWinHTTP(WebSessionImpl::Mode::Async);
+		}
+
+		bool Initialize() override {
+			return WebSessionWinHTTP::Initialize();
+		}
+	};
+
+#elif defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_SWITCH) || \
+		defined(DEATH_TARGET_3DS) || defined(DEATH_TARGET_PSP) || defined(DEATH_TARGET_VITA) || defined(DEATH_TARGET_UNIX)
+
+	class WebAuthChallengeCURL;
+	class WebRequestCURL;
+	class WebSessionCURL;
+	class WebSessionAsyncCURL;
+
+	class WebResponseCURL : public WebResponseImpl
+	{
+	public:
+		explicit WebResponseCURL(WebRequestCURL& request);
+
+		WebResponseCURL(const WebResponseCURL&) = delete;
+		WebResponseCURL& operator=(const WebResponseCURL&) = delete;
+
+		std::int64_t GetContentLength() const override;
+
+		String GetURL() const override;
+
+		String GetHeader(StringView name) const override;
+
+		Array<String> GetAllHeaderValues(StringView name) const override;
+
+		std::int32_t GetStatus() const override;
+
+		String GetStatusText() const override {
+			return _statusText;
+		}
+
+		// Methods called from libcurl callbacks
+		std::size_t CURLOnWrite(void* buffer, std::size_t size);
+		std::size_t CURLOnHeader(const char* buffer, std::size_t size);
+		std::int32_t CURLOnProgress(curl_off_t);
+
+	private:
+		using AllHeadersMap = std::map<String, SmallVector<String, 1>>;
+		AllHeadersMap _headers;
+		String _statusText;
+		std::int64_t _knownDownloadSize;
+
+		CURL* GetHandle() const;
+	};
+
+	class WebRequestCURL : public WebRequestImpl
+	{
+	public:
+		WebRequestCURL(WebSessionCURL& sessionImpl, StringView url);
+		WebRequestCURL(WebSessionAsync& session, WebSessionAsyncCURL& sessionImpl, StringView url, Function<void(WebRequestEvent&)>&& callback, std::int32_t id);
+
+		~WebRequestCURL() override;
+
+		WebRequestCURL(const WebRequestCURL&) = delete;
+		WebRequestCURL& operator=(const WebRequestCURL&) = delete;
+
+		WebRequest::Result Execute() override;
+
+		void Run() override;
+
+		WebResponseImplPtr GetResponse() const override;
+
+		WebAuthChallengeImplPtr GetAuthChallenge() const override ;
+
+		std::int64_t GetBytesSent() const override;
+
+		std::int64_t GetBytesExpectedToSend() const override;
+
+		CURL* GetHandle() const noexcept {
+			return _handle;
+		}
+
+		WebRequestHandle GetNativeHandle() const noexcept override {
+			return (WebRequestHandle)GetHandle();
+		}
+
+		bool StartRequest();
+
+		void HandleCompletion(CURLcode result);
+
+		String GetError() const;
+
+		// Methods called from libcurl callbacks
+		std::size_t CURLOnRead(char* buffer, std::size_t size);
+		int CURLOnSeek(curl_off_t offset, int origin);
+
+	private:
+		// This is only used for async requests
+		WebSessionAsyncCURL* const _sessionCURL;
+
+		// Always owned by this object, so requests running in parallel never share libcurl state
+		CURL* const _handle;
+		char _errorBuffer[CURL_ERROR_SIZE];
+		// How the transfer ended, which is not always what the error buffer describes - see GetError()
+		CURLcode _result = CURLE_OK;
+		struct curl_slist* _headerList = nullptr;
+		ComPtr<WebResponseCURL> _response;
+		ComPtr<WebAuthChallengeCURL> _authChallenge;
+		// Written by the transfer thread in the read callback, read from any thread polling progress
+		std::atomic<std::int64_t> _bytesSent;
+
+		void DoStartPrepare(StringView url);
+		WebRequest::Result DoFinishPrepare();
+		WebRequest::Result DoHandleCompletion();
+		void DoCancel() override;
+	};
+
+	class WebSessionBaseCURL : public WebSessionImpl
+	{
+	public:
+		explicit WebSessionBaseCURL(Mode mode);
+
+		static bool CurlRuntimeAtLeastVersion(std::uint32_t major, std::uint32_t minor, std::uint32_t patch);
+
+	protected:
+		static std::uint32_t _runtimeVersion;
+
+		/** @brief Initializes libcurl and the shared caches exactly once for the whole process */
+		static void EnsureGlobalInitialized();
+	};
+
+	class WebSessionCURL : public WebSessionBaseCURL
+	{
+	public:
+		WebSessionCURL();
+
+		WebSessionCURL(const WebSessionCURL&) = delete;
+		WebSessionCURL& operator=(const WebSessionCURL&) = delete;
+
+		WebRequestImplPtr CreateRequest(WebSession& session, StringView url) override;
+		WebRequestImplPtr CreateRequestAsync(WebSessionAsync& session, StringView url, Function<void(WebRequestEvent&)>&& callback, std::int32_t id) override;
+
+		WebSessionHandle GetNativeHandle() const noexcept override {
+			// Synchronous sessions hold no native object of their own, every request owns its handle
+			return nullptr;
+		}
+	};
+
+	class WebSessionAsyncCURL : public WebSessionBaseCURL
+	{
+	public:
+		WebSessionAsyncCURL();
+		~WebSessionAsyncCURL() override;
+
+		WebSessionAsyncCURL(const WebSessionAsyncCURL&) = delete;
+		WebSessionAsyncCURL& operator=(const WebSessionAsyncCURL&) = delete;
+
+		WebRequestImplPtr CreateRequest(WebSession& session, StringView url) override;
+		WebRequestImplPtr CreateRequestAsync(WebSessionAsync& session, StringView url, Function<void(WebRequestEvent&)>&& callback, std::int32_t id = -1) override;
+
+		WebSessionHandle GetNativeHandle() const noexcept override {
+			return (WebSessionHandle)_handle;
+		}
+
+		bool StartRequest(WebRequestCURL& request);
+		void CancelRequest(WebRequestCURL* request);
+		void RequestHasTerminated(WebRequestCURL* request);
+
+	private:
+		// The worker thread is the only thread that ever touches the multi handle - every other thread
+		// files its work into _pendingActions and pokes the worker with WakeWorker(), which uses
+		// curl_multi_wakeup(), the one multi function documented as callable from any thread
+		struct PendingAction {
+			CURL* handle;
+			WebRequestCURL* request;
+			bool add;
+		};
+
+		CURLM* _handle;
+		std::mutex _mutex;
+		// Both containers hold a reference to their requests (released by the worker), so a request
+		// that is still queued or transferring can never be destroyed underneath the worker
+		std::vector<PendingAction> _pendingActions;
+		std::unordered_map<CURL*, WebRequestCURL*> _activeTransfers;
+		bool _workerRunning;
+		bool _quit;
+		std::thread _workerThread;
+
+		void WakeWorker();
+
+		static void OnWorkerThread(WebSessionAsyncCURL* _this);
+	};
+
+	class WebSessionFactoryCURL : public WebSessionFactory
+	{
+	public:
+		WebSessionImpl* Create() override {
+			return new WebSessionCURL();
+		}
+
+		WebSessionImpl* CreateAsync() override {
+			return new WebSessionAsyncCURL();
+		}
+	};
+
+#endif
+
+	WebSessionImpl::WebSessionImpl(Mode mode)
+		: _mode(mode)
+	{
+		AddCommonHeader("User-Agent"_s, "Death::IO::WebRequest"_s);
+	}
+
+	WebSessionImpl::~WebSessionImpl() = default;
+
+	String WebSessionImpl::GetTempDirectory() const
+	{
+		if (_tempDir.empty()) {
+			return FileSystem::GetTempDirectory();
+		}
+
+		return _tempDir;
+	}
+
+	WebSessionBase::WebSessionBase() = default;
+
+	WebSessionBase::WebSessionBase(const WebSessionImplPtr& impl)
+		: _impl(impl) {}
+
+	WebSessionBase::WebSessionBase(const WebSessionBase&) = default;
+
+	WebSessionBase& WebSessionBase::operator=(const WebSessionBase&) = default;
+
+	WebSessionBase::~WebSessionBase() = default;
+
+	WebSession& WebSession::GetDefault()
+	{
+		static WebSession defaultSession = WebSession::New();
+		return defaultSession;
+	}
+
+	WebSessionAsync& WebSessionAsync::GetDefault()
+	{
+		static WebSessionAsync defaultSessionAsync = WebSessionAsync::New();
+		return defaultSessionAsync;
+	}
+
+	WebSessionFactory* WebSessionBase::FindFactory()
+	{
+		static std::unique_ptr<WebSessionFactory> factory = []() -> std::unique_ptr<WebSessionFactory> {
+			std::unique_ptr<WebSessionFactory> result;
+#if defined(DEATH_TARGET_WINDOWS)
+			result = std::make_unique<WebSessionFactoryWinHTTP>();
+#elif defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_SWITCH) || \
+		defined(DEATH_TARGET_3DS) || defined(DEATH_TARGET_PSP) || defined(DEATH_TARGET_VITA) || defined(DEATH_TARGET_UNIX)
+			result = std::make_unique<WebSessionFactoryCURL>();
+#else
+#	pragma message("Unsupported platform for Death::IO::WebRequest")
+#endif
+			if (result != nullptr && !result->Initialize()) {
+				result = nullptr;
+			}
+			return result;
+		}();
+
+		return factory.get();
+	}
+
+	WebSession WebSession::New()
+	{
+		WebSessionImplPtr impl;
+
+		WebSessionFactory* factory = FindFactory();
+		if (factory != nullptr) {
+			impl = factory->Create();
+		}
+
+		return WebSession(impl);
+	}
+
+	WebSessionAsync WebSessionAsync::New()
+	{
+		WebSessionImplPtr impl;
+
+		WebSessionFactory* factory = FindFactory();
+		if (factory != nullptr) {
+			impl = factory->CreateAsync();
+		}
+
+		return WebSessionAsync(impl);
+	}
+
+	bool WebSessionBase::IsBackendAvailable()
+	{
+		WebSessionFactory* factory = FindFactory();
+		return (factory != nullptr);
+	}
+
+	WebRequest WebSession::CreateRequest(StringView url)
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return WebRequest(_impl->CreateRequest(*this, url));
+	}
+
+	WebRequestAsync WebSessionAsync::CreateRequest(StringView url, Function<void(WebRequestEvent&)>&& callback, std::int32_t id)
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return WebRequestAsync(_impl->CreateRequestAsync(*this, url, Death::move(callback), id));
+	}
+
+	void WebSessionBase::AddCommonHeader(StringView name, StringView value)
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", );
+
+		_impl->AddCommonHeader(name, value);
+	}
+
+	String WebSessionBase::GetTempDirectory() const
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", {});
+
+		return _impl->GetTempDirectory();
+	}
+
+	void WebSessionBase::SetTempDirectory(StringView path)
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", );
+
+		_impl->SetTempDirectory(path);
+	}
+
+	bool WebSessionBase::SetProxy(const WebProxy& proxy)
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", false);
+
+		return _impl->SetProxy(proxy);
+	}
+
+	bool WebSessionBase::IsOpened() const noexcept
+	{
+		return _impl;
+	}
+
+	void WebSessionBase::Dispose()
+	{
+		_impl.reset(nullptr);
+	}
+
+	WebSessionHandle WebSessionBase::GetNativeHandle() const noexcept
+	{
+		return (_impl ? _impl->GetNativeHandle() : nullptr);
+	}
+
+	bool WebSessionBase::EnablePersistentStorage(bool enable)
+	{
+		DEATH_ASSERT(_impl != nullptr, "Cannot be called with an uninitialized object", false);
+
+		return _impl->EnablePersistentStorage(enable);
+	}
+
+	WebRequestEvent::WebRequestEvent(std::int32_t id, WebRequest::State state, const WebRequestAsync& request,
+		const WebResponse& response, Containers::StringView errorDesc)
+		: _id(id), _state(state), _request(request), _response(response), _errorDescription(errorDesc) {}
+
+	WebRequestAsync::State WebRequestEvent::GetState() const
+	{
+		return _state;
+	}
+
+	const WebRequestAsync& WebRequestEvent::GetRequest() const
+	{
+		return _request;
+	}
+
+	const WebResponse& WebRequestEvent::GetResponse() const
+	{
+		return _response;
+	}
+
+	Containers::StringView WebRequestEvent::GetErrorDescription() const
+	{
+		return _errorDescription;
+	}
+
+	Containers::StringView WebRequestEvent::GetDataFile() const
+	{
+		return _dataFile;
+	}
+
+	void WebRequestEvent::SetDataFile(Containers::StringView dataFile)
+	{
+		_dataFile = dataFile;
+	}
+
+	Containers::ArrayView<char> WebRequestEvent::GetDataBuffer() const
+	{
+		return _dataBuffer;
+	}
+
+	void WebRequestEvent::SetDataBuffer(Containers::ArrayView<char> dataBuffer)
+	{
+		_dataBuffer = dataBuffer;
+	}
+
+	// Bounds how long a request can be stuck, shared by all backends - an unreachable or stalled
+	// endpoint must not be able to park a background thread (and with it the whole shutdown) forever.
+	// No overall timeout is imposed, transfers may take as long as they need while they keep making
+	// progress: "connect" covers name resolution, connecting and sending the request, "stalled" is
+	// an inactivity bound while receiving the response.
+	constexpr std::int32_t WebRequestConnectTimeoutSecs = 30;
+	constexpr std::int32_t WebRequestStalledTimeoutSecs = 120;
+
+#if defined(DEATH_TARGET_WINDOWS)
+
+	constexpr std::int32_t WebRequestBufferSize = 64 * 1024;
+
+	class WinHTTP
+	{
+	public:
+		static bool LoadLibrary() {
+			_winhttp = ::LoadLibrary(L"winhttp.dll");
+			if (_winhttp == NULL) {
+				return false;
+			}
+
+			bool result = true;
+
+			#define LoadFunction(name)									\
+				name = (name ## _t)::GetProcAddress(_winhttp, #name);	\
+				result &= (name != nullptr);
+
+			LoadFunction(WinHttpQueryOption)
+			LoadFunction(WinHttpQueryHeaders)
+			LoadFunction(WinHttpSetOption)
+			LoadFunction(WinHttpWriteData)
+			LoadFunction(WinHttpCloseHandle)
+			LoadFunction(WinHttpReceiveResponse)
+			LoadFunction(WinHttpCrackUrl)
+			LoadFunction(WinHttpCreateUrl)
+			LoadFunction(WinHttpConnect)
+			LoadFunction(WinHttpOpenRequest)
+			LoadFunction(WinHttpSetStatusCallback)
+			LoadFunction(WinHttpSendRequest)
+			LoadFunction(WinHttpReadData)
+			LoadFunction(WinHttpQueryAuthSchemes)
+			LoadFunction(WinHttpSetCredentials)
+			LoadFunction(WinHttpSetTimeouts)
+			LoadFunction(WinHttpOpen)
+
+			#undef LoadFunction
+
+			if (!result) {
+				::FreeLibrary(_winhttp);
+			}
+
+			return result;
+		}
+
+		typedef BOOL(WINAPI* WinHttpQueryOption_t)(HINTERNET, DWORD, LPVOID, LPDWORD);
+		static WinHttpQueryOption_t WinHttpQueryOption;
+		typedef BOOL(WINAPI* WinHttpQueryHeaders_t)(HINTERNET, DWORD, LPCWSTR, LPVOID, LPDWORD, LPDWORD);
+		static WinHttpQueryHeaders_t WinHttpQueryHeaders;
+		typedef BOOL(WINAPI* WinHttpSetOption_t)(HINTERNET, DWORD, LPVOID, DWORD);
+		static WinHttpSetOption_t WinHttpSetOption;
+		typedef BOOL(WINAPI* WinHttpWriteData_t)(HINTERNET, LPCVOID, DWORD, LPDWORD);
+		static WinHttpWriteData_t WinHttpWriteData;
+		typedef BOOL(WINAPI* WinHttpCloseHandle_t)(HINTERNET);
+		static WinHttpCloseHandle_t WinHttpCloseHandle;
+		typedef BOOL(WINAPI* WinHttpReceiveResponse_t)(HINTERNET, LPVOID);
+		static WinHttpReceiveResponse_t WinHttpReceiveResponse;
+		typedef BOOL(WINAPI* WinHttpCrackUrl_t)(LPCWSTR, DWORD, DWORD, LPURL_COMPONENTS);
+		static WinHttpCrackUrl_t WinHttpCrackUrl;
+		typedef BOOL(WINAPI* WinHttpCreateUrl_t)(LPURL_COMPONENTS, DWORD, LPWSTR, LPDWORD);
+		static WinHttpCreateUrl_t WinHttpCreateUrl;
+		typedef HINTERNET(WINAPI* WinHttpConnect_t)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+		static WinHttpConnect_t WinHttpConnect;
+		typedef HINTERNET(WINAPI* WinHttpOpenRequest_t)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR*, DWORD);
+		static WinHttpOpenRequest_t WinHttpOpenRequest;
+		typedef WINHTTP_STATUS_CALLBACK(WINAPI* WinHttpSetStatusCallback_t)(HINTERNET, WINHTTP_STATUS_CALLBACK, DWORD, DWORD_PTR);
+		static WinHttpSetStatusCallback_t WinHttpSetStatusCallback;
+		typedef BOOL(WINAPI* WinHttpSendRequest_t)(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR);
+		static WinHttpSendRequest_t WinHttpSendRequest;
+		typedef BOOL(WINAPI* WinHttpReadData_t)(HINTERNET, LPVOID, DWORD, LPDWORD);
+		static WinHttpReadData_t WinHttpReadData;
+		typedef BOOL(WINAPI* WinHttpQueryAuthSchemes_t)(HINTERNET, LPDWORD, LPDWORD, LPDWORD);
+		static WinHttpQueryAuthSchemes_t WinHttpQueryAuthSchemes;
+		typedef BOOL(WINAPI* WinHttpSetCredentials_t)(HINTERNET, DWORD, DWORD, LPCWSTR, LPCWSTR, LPVOID);
+		static WinHttpSetCredentials_t WinHttpSetCredentials;
+		typedef BOOL(WINAPI* WinHttpSetTimeouts_t)(HINTERNET, int, int, int, int);
+		static WinHttpSetTimeouts_t WinHttpSetTimeouts;
+		typedef HINTERNET(WINAPI* WinHttpOpen_t)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+		static WinHttpOpen_t WinHttpOpen;
+
+	private:
+		static HMODULE _winhttp;
+	};
+
+	HMODULE WinHTTP::_winhttp;
+	WinHTTP::WinHttpQueryOption_t WinHTTP::WinHttpQueryOption;
+	WinHTTP::WinHttpQueryHeaders_t WinHTTP::WinHttpQueryHeaders;
+	WinHTTP::WinHttpSetOption_t WinHTTP::WinHttpSetOption;
+	WinHTTP::WinHttpWriteData_t WinHTTP::WinHttpWriteData;
+	WinHTTP::WinHttpCloseHandle_t WinHTTP::WinHttpCloseHandle;
+	WinHTTP::WinHttpReceiveResponse_t WinHTTP::WinHttpReceiveResponse;
+	WinHTTP::WinHttpCrackUrl_t WinHTTP::WinHttpCrackUrl;
+	WinHTTP::WinHttpCreateUrl_t WinHTTP::WinHttpCreateUrl;
+	WinHTTP::WinHttpConnect_t WinHTTP::WinHttpConnect;
+	WinHTTP::WinHttpOpenRequest_t WinHTTP::WinHttpOpenRequest;
+	WinHTTP::WinHttpSetStatusCallback_t WinHTTP::WinHttpSetStatusCallback;
+	WinHTTP::WinHttpSendRequest_t WinHTTP::WinHttpSendRequest;
+	WinHTTP::WinHttpReadData_t WinHTTP::WinHttpReadData;
+	WinHTTP::WinHttpQueryAuthSchemes_t WinHTTP::WinHttpQueryAuthSchemes;
+	WinHTTP::WinHttpSetCredentials_t WinHTTP::WinHttpSetCredentials;
+	WinHTTP::WinHttpSetTimeouts_t WinHTTP::WinHttpSetTimeouts;
+	WinHTTP::WinHttpOpen_t WinHTTP::WinHttpOpen;
+
+	// Define potentially missing constants
+	#if !defined(WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY)
+	#	define WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY 4
+	#endif
+	#if !defined(WINHTTP_PROTOCOL_FLAG_HTTP2)
+	#	define WINHTTP_PROTOCOL_FLAG_HTTP2 0x1
+	#endif
+	#if !defined(WINHTTP_PROTOCOL_FLAG_HTTP3)
+	#	define WINHTTP_PROTOCOL_FLAG_HTTP3 0x2
+	#endif
+	#if !defined(WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL)
+	#	define WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL 133
+	#endif
+	#if !defined(WINHTTP_DECOMPRESSION_FLAG_ALL)
+	#	define WINHTTP_DECOMPRESSION_FLAG_GZIP 0x00000001
+	#	define WINHTTP_DECOMPRESSION_FLAG_DEFLATE 0x00000002
+	#	define WINHTTP_DECOMPRESSION_FLAG_ALL (			\
+				WINHTTP_DECOMPRESSION_FLAG_GZIP |		\
+				WINHTTP_DECOMPRESSION_FLAG_DEFLATE)
+	#endif
+	#if !defined(WINHTTP_OPTION_DECOMPRESSION)
+	#	define WINHTTP_OPTION_DECOMPRESSION 118
+	#endif
+	#if !defined(WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1)
+	#	define WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 0x00000200
+	#endif
+	#if !defined(WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2)
+	#	define WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 0x00000800
+	#endif
+
+	namespace
+	{
+		struct URLComponents : URL_COMPONENTS
+		{
+			URLComponents() {
+				std::memset(this, 0, sizeof(*this));
+				dwStructSize = sizeof(URL_COMPONENTS);
+				dwSchemeLength =
+					dwHostNameLength =
+					dwUserNameLength =
+					dwPasswordLength =
+					dwUrlPathLength =
+					dwExtraInfoLength = DWORD(-1);
+			}
+
+			bool HasCredentials() const {
+				return (dwUserNameLength > 0);
+			}
+
+			WebCredentials GetCredentials() const {
+				return WebCredentials(Utf8::FromUtf16(lpszUserName, dwUserNameLength),
+					Utf8::FromUtf16(lpszPassword, dwPasswordLength));
+			}
+		};
+
+		Array<String> WinHTTPQueryAllHeaderStrings(HINTERNET hRequest, DWORD dwInfoLevel, LPCWSTR pwszName = WINHTTP_HEADER_NAME_BY_INDEX)
+		{
+			Array<String> result;
+			DWORD nextIndex = 0;
+			do {
+				DWORD bufferLen = 0;
+				DWORD currentIndex = nextIndex;
+				WinHTTP::WinHttpQueryHeaders(hRequest, dwInfoLevel, pwszName, nullptr, &bufferLen, &nextIndex);
+				if (::GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+					if (bufferLen == 0 || (bufferLen % sizeof(wchar_t)) != 0) {
+						return {};
+					}
+
+					SmallVector<wchar_t, 1000> resBuf(bufferLen / sizeof(wchar_t));
+					if (WinHTTP::WinHttpQueryHeaders(hRequest, dwInfoLevel, pwszName, resBuf.data(), &bufferLen, &nextIndex)) {
+						arrayAppend(result, Utf8::FromUtf16(resBuf.data(), bufferLen));
+					}
+				}
+
+				if (nextIndex <= currentIndex) {
+					break;
+				}
+			} while (::GetLastError() != ERROR_WINHTTP_HEADER_NOT_FOUND);
+
+			return result;
+		}
+
+		String WinHTTPQueryHeaderString(HINTERNET hRequest, DWORD dwInfoLevel, LPCWSTR pwszName = WINHTTP_HEADER_NAME_BY_INDEX)
+		{
+			auto result = WinHTTPQueryAllHeaderStrings(hRequest, dwInfoLevel, pwszName);
+			return (result.empty() ? String{} : result.back());
+		}
+
+		String WinHTTPQueryOptionString(HINTERNET hInternet, DWORD dwOption)
+		{
+			String result;
+			DWORD bufferLength = 0;
+			WinHTTP::WinHttpQueryOption(hInternet, dwOption, nullptr, &bufferLength);
+			if (::GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+				if (bufferLength == 0 || (bufferLength % sizeof(wchar_t)) != 0) {
+					return {};
+				}
+
+				SmallVector<wchar_t, 1000> buffer(bufferLength / sizeof(wchar_t));
+				if (WinHTTP::WinHttpQueryOption(hInternet, dwOption, buffer.data(), &bufferLength)) {
+					result = Utf8::FromUtf16(buffer.data(), bufferLength);
+				}
+			}
+
+			return result;
+		}
+
+		inline void WinHTTPSetOption(HINTERNET hInternet, DWORD dwOption, DWORD dwValue)
+		{
+			WinHTTP::WinHttpSetOption(hInternet, dwOption, &dwValue, sizeof(dwValue));
+		}
+
+		void CALLBACK RequestStatusCallback(HINTERNET hInternet, DWORD_PTR dwContext, DWORD dwInternetStatus, LPVOID lpvStatusInformation, DWORD dwStatusInformationLength)
+		{
+			if (dwContext != NULL) {
+				WebRequestWinHTTP* request = reinterpret_cast<WebRequestWinHTTP*>(dwContext);
+				request->HandleCallback(dwInternetStatus, lpvStatusInformation, dwStatusInformationLength);
+			}
+		}
+	}
+
+	WebRequestWinHTTP::WebRequestWinHTTP(WebSessionAsync& session, WebSessionWinHTTP& sessionImpl, StringView url, Function<void(WebRequestEvent&)>&& callback, std::int32_t id)
+		: WebRequestImpl(session, sessionImpl, Death::move(callback), id), _sessionImpl(sessionImpl), _url(url),
+			_connect(NULL), _request(NULL), _dataWritten(0), _tryCredentialsFromURL(false),
+			_tryProxyCredentials(sessionImpl.HasProxyCredentials())
+	{
+	}
+
+	WebRequestWinHTTP::WebRequestWinHTTP(WebSessionWinHTTP& sessionImpl, StringView url)
+		: WebRequestImpl(sessionImpl), _sessionImpl(sessionImpl), _url(url), _connect(NULL), _request(NULL),
+			_dataWritten(0), _tryCredentialsFromURL(false), _tryProxyCredentials(sessionImpl.HasProxyCredentials())
+	{
+	}
+
+	WebRequestWinHTTP::~WebRequestWinHTTP()
+	{
+		if (_request != NULL) {
+			WinHTTP::WinHttpCloseHandle(_request);
+		}
+		if (_connect != NULL) {
+			WinHTTP::WinHttpCloseHandle(_connect);
+		}
+	}
+
+	void WebRequestWinHTTP::HandleCallback(DWORD dwInternetStatus, LPVOID lpvStatusInformation, DWORD dwStatusInformationLength)
+	{
+		switch (dwInternetStatus) {
+			case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE: {
+				WriteData();
+				break;
+			}
+			case WINHTTP_CALLBACK_STATUS_READ_COMPLETE: {
+				if (dwStatusInformationLength > 0) {
+					_response->ReportDataReceived(dwStatusInformationLength);
+					if (!_response->ReadData() && !WasCancelled()) {
+						SetFailedWithLastError("Reading data"_s);
+					}
+				} else {
+					SetFinalStateFromStatus();
+				}
+				break;
+			}
+			case WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE: {
+				DWORD bytesWritten = *(reinterpret_cast<LPDWORD>(lpvStatusInformation));
+				_dataWritten += bytesWritten;
+				WriteData();
+				break;
+			}
+			case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR: {
+				LPWINHTTP_ASYNC_RESULT asyncResult = reinterpret_cast<LPWINHTTP_ASYNC_RESULT>(lpvStatusInformation);
+				if (asyncResult->dwError == ERROR_WINHTTP_OPERATION_CANCELLED && WasCancelled()) {
+					SetState(WebRequest::State::Cancelled);
+				} else {
+					SetFailed("Async request"_s, asyncResult->dwError);
+				}
+				break;
+			}
+		}
+	}
+
+	void WebRequestWinHTTP::WriteData()
+	{
+		if (_dataWritten == _dataSize) {
+			if (!CheckResult(CreateResponse())) {
+				return;
+			}
+
+			const Result result = InitializeAuthIfNeeded();
+			switch (result.state) {
+				case WebRequest::State::Unauthorized:
+					switch (_authChallenge->GetSource()) {
+						case WebAuthChallenge::Source::Proxy: {
+							if (_tryProxyCredentials) {
+								_tryProxyCredentials = false;
+
+								_authChallenge->SetCredentials(_sessionImpl.GetProxyCredentials());
+								return;
+							}
+							break;
+						}
+						case WebAuthChallenge::Source::Server: {
+							if (_tryCredentialsFromURL) {
+								_tryCredentialsFromURL = false;
+
+								// If the request is redirected, the authentication can be required again
+								if (_sessionImpl.HasProxyCredentials()) {
+									_tryProxyCredentials = true;
+								}
+
+								_authChallenge->SetCredentials(_credentialsFromURL);
+								return;
+							}
+							break;
+						}
+					}
+					DEATH_FALLTHROUGH
+
+				case WebRequest::State::Failed:
+					HandleResult(result);
+					return;
+
+				case WebRequest::State::Active:
+					break;
+
+				case WebRequest::State::Idle:
+				case WebRequest::State::Completed:
+				case WebRequest::State::Cancelled:
+					// Unreachable state
+					break;
+			}
+
+			if (!_response->ReadData()) {
+				SetFailedWithLastError("Reading data"_s);
+			}
+			return;
+		}
+
+		CheckResult(DoWriteData());
+	}
+
+	WebRequest::Result WebRequestWinHTTP::DoWriteData(DWORD* bytesWritten)
+	{
+		DEATH_DEBUG_ASSERT(_dataWritten < _dataSize);
+
+		std::int32_t dataWriteSize = WebRequestBufferSize;
+		if (_dataWritten + dataWriteSize > _dataSize) {
+			dataWriteSize = std::int32_t(_dataSize - _dataWritten);
+		}
+
+		_dataWriteBuffer.resize_for_overwrite(dataWriteSize);
+		std::int64_t bytesRead = _dataStream->Read(_dataWriteBuffer.data(), dataWriteSize);
+		if (bytesRead < 0) {
+			return FailWithLastError("Reading request data from stream"_s);
+		}
+
+		if (!WinHTTP::WinHttpWriteData(_request, _dataWriteBuffer.data(), DWORD(bytesRead), bytesWritten)) {
+			return FailWithLastError("Writing request data"_s);
+		}
+
+		return Result::Ok();
+	}
+
+	WebRequest::Result WebRequestWinHTTP::CreateResponse()
+	{
+		if (!WinHTTP::WinHttpReceiveResponse(_request, nullptr)) {
+			return FailWithLastError("Receiving response"_s);
+		}
+
+		_response.reset(new WebResponseWinHTTP(*this));
+
+		return _response->InitializeFileStorage();
+	}
+
+	WebRequest::Result WebRequestWinHTTP::InitializeAuthIfNeeded()
+	{
+		std::int32_t status = _response->GetStatus();
+		if (status == HTTP_STATUS_DENIED || status == HTTP_STATUS_PROXY_AUTH_REQ) {
+			_authChallenge.reset(new WebAuthChallengeWinHTTP(
+				status == HTTP_STATUS_PROXY_AUTH_REQ
+					? WebAuthChallenge::Source::Proxy
+					: WebAuthChallenge::Source::Server,
+				*this));
+
+			if (!_authChallenge->Initialize()) {
+				return FailWithLastError("Initializing authentication challenge"_s);
+			}
+
+			return Result::Unauthorized(_response->GetStatusText());
+		}
+
+		return Result::Ok();
+	}
+
+	const char* __GetWin32ErrorSuffix(DWORD error);
+
+	WebRequest::Result WebRequestWinHTTP::Fail(StringView operation, DWORD errorCode)
+	{
+		char message[256];
+		std::size_t length = formatInto(message, "{} failed with error {:.8x}{}", operation, errorCode, __GetWin32ErrorSuffix(errorCode));
+		return Result::Error({ message, length });
+	}
+
+	WebRequest::Result WebRequestWinHTTP::Execute()
+	{
+		Result result = DoPrepareRequest();
+		if (!result) {
+			return result;
+		}
+
+		while (true) {
+			result = SendRequest();
+			if (!result) {
+				return result;
+			}
+
+			while (_dataWritten < _dataSize) {
+				DWORD bytesWritten = 0;
+				result = DoWriteData(&bytesWritten);
+				if (!result) {
+					return result;
+				}
+				if (bytesWritten == 0) {
+					break;
+				}
+				_dataWritten += bytesWritten;
+			}
+
+			result = CreateResponse();
+			if (!result) {
+				return result;
+			}
+
+			result = InitializeAuthIfNeeded();
+			if (!result) {
+				return result;
+			}
+
+			if (result.state != WebRequest::State::Unauthorized) {
+				break;
+			}
+
+			switch (_authChallenge->GetSource()) {
+				case WebAuthChallenge::Source::Proxy: {
+					if (!_tryProxyCredentials) {
+						return result;
+					}
+
+					_tryProxyCredentials = false;
+
+					result = _authChallenge->DoSetCredentials(_sessionImpl.GetProxyCredentials());
+					if (!result) {
+						return result;
+					}
+					break;
+				}
+				case WebAuthChallenge::Source::Server: {
+					if (!_tryCredentialsFromURL) {
+						return result;
+					}
+
+					_tryCredentialsFromURL = false;
+
+					result = _authChallenge->DoSetCredentials(_credentialsFromURL);
+					if (!result) {
+						return result;
+					}
+
+					if (_sessionImpl.HasProxyCredentials()) {
+						_tryProxyCredentials = true;
+					}
+
+					if (_dataStream != nullptr) {
+						_dataStream->Seek(0, SeekOrigin::Begin);
+						_dataWritten = 0;
+					}
+					break;
+				}
+			}
+			continue;
+		}
+
+		while (true) {
+			DWORD bytesRead = 0;
+			if (!_response->ReadData(&bytesRead)) {
+				return FailWithLastError("Reading data"_s);
+			}
+			if (bytesRead == 0) {
+				break;
+			}
+			_response->ReportDataReceived(bytesRead);
+		}
+
+		// Nothing else runs before this function returns, so the file backing the response has to be closed
+		// right here - otherwise the caller is handed the path of a file whose tail is still sitting
+		// in a buffer
+		_response->Finalize();
+
+		return GetResultFromHTTPStatus(_response);
+	}
+
+	WebRequest::Result WebRequestWinHTTP::DoPrepareRequest()
+	{
+		auto urlW = Utf8::ToUtf16(_url);
+		URLComponents urlComps;
+		if (!WinHTTP::WinHttpCrackUrl(urlW.data(), DWORD(urlW.size()), 0, &urlComps)) {
+			return FailWithLastError("Parsing URL"_s);
+		}
+
+		if (urlComps.HasCredentials()) {
+			_credentialsFromURL = urlComps.GetCredentials();
+			_tryCredentialsFromURL = true;
+		}
+
+		Array<wchar_t> hostNameW(NoInit, urlComps.dwHostNameLength + 1);
+		std::memcpy(hostNameW.data(), urlComps.lpszHostName, urlComps.dwHostNameLength * sizeof(wchar_t));
+		hostNameW[urlComps.dwHostNameLength] = L'\0';
+
+		_connect = WinHTTP::WinHttpConnect(_sessionImpl.GetHandle(), hostNameW, urlComps.nPort, NULL);
+		if (_connect == NULL) {
+			return FailWithLastError("Connecting"_s);
+		}
+
+		SmallVector<wchar_t, 500> objectNameW;
+		objectNameW.reserve(urlComps.dwExtraInfoLength + urlComps.dwExtraInfoLength + 1);
+		objectNameW.append(urlComps.lpszUrlPath, urlComps.lpszUrlPath + urlComps.dwUrlPathLength);
+		if (urlComps.dwExtraInfoLength != 0) {
+			objectNameW.append(urlComps.lpszExtraInfo, urlComps.lpszExtraInfo + urlComps.dwExtraInfoLength);
+		}
+		objectNameW.push_back(L'\0');
+
+		String method = GetHTTPMethod();
+		static const wchar_t* acceptedTypesW[] = { L"*/*", nullptr };
+		_request = WinHTTP::WinHttpOpenRequest(_connect, Utf8::ToUtf16(method), objectNameW.data(), nullptr,
+			WINHTTP_NO_REFERER, acceptedTypesW, urlComps.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+		if (_request == nullptr) {
+			return FailWithLastError("Opening request"_s);
+		}
+
+		auto flags = GetSecurityFlags();
+		if (flags != WebRequest::Ignore::None) {
+			DWORD optValue = 0;
+
+			if ((flags & WebRequest::Ignore::Certificate) != WebRequest::Ignore::None) {
+				optValue |= SECURITY_FLAG_IGNORE_CERT_DATE_INVALID |
+							SECURITY_FLAG_IGNORE_UNKNOWN_CA |
+							SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+			}
+			if ((flags & WebRequest::Ignore::Host) != WebRequest::Ignore::None) {
+				optValue |= SECURITY_FLAG_IGNORE_CERT_CN_INVALID;
+			}
+
+			WinHTTPSetOption(_request, WINHTTP_OPTION_SECURITY_FLAGS, optValue);
+		}
+
+		return Result::Ok();
+	}
+
+	void WebRequestWinHTTP::Run()
+	{
+		if (!CheckResult(DoPrepareRequest())) {
+			return;
+		}
+
+		if (WinHTTP::WinHttpSetStatusCallback(_request, RequestStatusCallback, WINHTTP_CALLBACK_FLAG_READ_COMPLETE |
+				WINHTTP_CALLBACK_FLAG_WRITE_COMPLETE | WINHTTP_CALLBACK_FLAG_SENDREQUEST_COMPLETE |
+				WINHTTP_CALLBACK_FLAG_REQUEST_ERROR, NULL) == WINHTTP_INVALID_STATUS_CALLBACK) {
+			SetFailedWithLastError("Setting up callbacks"_s);
+			return;
+		}
+
+		SetState(WebRequest::State::Active);
+		CheckResult(SendRequest());
+	}
+
+	WebRequest::Result WebRequestWinHTTP::SendRequest()
+	{
+		SmallVector<char, 1000> allHeaders;
+		for (auto header = _headers.begin(); header != _headers.end(); ++header) {
+			allHeaders.append(header->first.begin(), header->first.end());
+			allHeaders.push_back(':');
+			allHeaders.push_back(' ');
+			allHeaders.append(header->second.begin(), header->second.end());
+			allHeaders.push_back('\n');
+		}
+
+		if (_dataSize != 0) {
+			_dataWritten = 0;
+		}
+
+		auto allHeadersW = Utf8::ToUtf16(allHeaders.data(), std::int32_t(allHeaders.size()));
+		if (!WinHTTP::WinHttpSendRequest(_request, allHeadersW, DWORD(allHeadersW.size()), nullptr, 0, DWORD(_dataSize), DWORD_PTR(this))) {
+			return FailWithLastError("Sending request"_s);
+		}
+
+		return Result::Ok();
+	}
+
+	void WebRequestWinHTTP::DoCancel()
+	{
+		// Closing the handle is the documented way to abort an asynchronous request - the outstanding
+		// operation fails with ERROR_WINHTTP_OPERATION_CANCELLED and that callback records the cancelled
+		// state (the reference taken by the Active state keeps the object alive until then). The atomic
+		// exchange makes sure the handle is closed exactly once, while callbacks may still read it.
+		HINTERNET request = _request.exchange(NULL);
+		if (request != NULL) {
+			WinHTTP::WinHttpCloseHandle(request);
+		}
+
+		// Waiting for credentials means no operation is outstanding, so no callback is coming to record
+		// the cancellation - it has to be recorded here. That state holds no self-reference anymore, and
+		// the state machine only releases one that was actually taken, so nothing has to be balanced.
+		if (GetState() == WebRequest::State::Unauthorized) {
+			SetState(WebRequest::State::Cancelled);
+		}
+	}
+
+	WebResponseWinHTTP::WebResponseWinHTTP(WebRequestWinHTTP& request)
+		: WebResponseImpl(request), _requestHandle(request.GetHandle()), _contentLength(0)
+	{
+		String contentLengthStr = WinHTTPQueryHeaderString(_requestHandle, WINHTTP_QUERY_CONTENT_LENGTH);
+		if (!contentLengthStr.empty()) {
+			_contentLength = strtoll(contentLengthStr.data(), nullptr, 10);
+		}
+	}
+
+	String WebResponseWinHTTP::GetURL() const
+	{
+		return WinHTTPQueryOptionString(_requestHandle, WINHTTP_OPTION_URL);
+	}
+
+	String WebResponseWinHTTP::GetHeader(StringView name) const
+	{
+		return WinHTTPQueryHeaderString(_requestHandle, WINHTTP_QUERY_CUSTOM, Utf8::ToUtf16(name));
+	}
+
+	Array<String> WebResponseWinHTTP::GetAllHeaderValues(StringView name) const
+	{
+		return WinHTTPQueryAllHeaderStrings(_requestHandle, WINHTTP_QUERY_CUSTOM, Utf8::ToUtf16(name));
+	}
+
+	std::int32_t WebResponseWinHTTP::GetStatus() const
+	{
+		DWORD status = 0;
+		DWORD statusSize = sizeof(status);
+		if (!WinHTTP::WinHttpQueryHeaders(_requestHandle, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+				WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, 0)) {
+			// Failed to get status code
+		}
+
+		return status;
+	}
+
+	String WebResponseWinHTTP::GetStatusText() const
+	{
+		return WinHTTPQueryHeaderString(_requestHandle, WINHTTP_QUERY_STATUS_TEXT);
+	}
+
+	bool WebResponseWinHTTP::ReadData(DWORD* bytesRead)
+	{
+		return WinHTTP::WinHttpReadData(_requestHandle, GetDataBuffer(WebRequestBufferSize), WebRequestBufferSize, bytesRead);
+	}
+
+	WebAuthChallengeWinHTTP::WebAuthChallengeWinHTTP(WebAuthChallenge::Source source, WebRequestWinHTTP& request)
+		: WebAuthChallengeImpl(source), _request(request), _target(0), _selectedScheme(0) {}
+
+	bool WebAuthChallengeWinHTTP::Initialize()
+	{
+		DWORD supportedSchemes, firstScheme;
+		if (!WinHTTP::WinHttpQueryAuthSchemes(_request.GetHandle(), &supportedSchemes, &firstScheme, &_target)) {
+			return false;
+		}
+
+		if (supportedSchemes & WINHTTP_AUTH_SCHEME_NEGOTIATE) {
+			_selectedScheme = WINHTTP_AUTH_SCHEME_NEGOTIATE;
+		} else if (supportedSchemes & WINHTTP_AUTH_SCHEME_NTLM) {
+			_selectedScheme = WINHTTP_AUTH_SCHEME_NTLM;
+		} else if (supportedSchemes & WINHTTP_AUTH_SCHEME_PASSPORT) {
+			_selectedScheme = WINHTTP_AUTH_SCHEME_PASSPORT;
+		} else if (supportedSchemes & WINHTTP_AUTH_SCHEME_DIGEST) {
+			_selectedScheme = WINHTTP_AUTH_SCHEME_DIGEST;
+		} else if (supportedSchemes & WINHTTP_AUTH_SCHEME_BASIC) {
+			_selectedScheme = WINHTTP_AUTH_SCHEME_BASIC;
+		} else {
+			_selectedScheme = 0;
+		}
+
+		return (_selectedScheme != 0);
+	}
+
+	WebRequest::Result WebAuthChallengeWinHTTP::DoSetCredentials(const WebCredentials& cred)
+	{
+		if (!WinHTTP::WinHttpSetCredentials(_request.GetHandle(), _target, _selectedScheme,
+				Utf8::ToUtf16(cred.GetUser()), Utf8::ToUtf16(cred.GetPassword()), NULL)) {
+			return _request.FailWithLastError("Setting credentials"_s);
+		}
+
+		return WebRequest::Result::Ok();
+	}
+
+	void WebAuthChallengeWinHTTP::SetCredentials(const WebCredentials& cred)
+	{
+		if (!_request.CheckResult(DoSetCredentials(cred))) {
+			return;
+		}
+
+		if (_request.GetState() != WebRequest::State::Active) {
+			_request.SetState(WebRequest::State::Active);
+		}
+
+		_request.CheckResult(_request.SendRequest());
+	}
+
+	WebSessionWinHTTP::WebSessionWinHTTP(Mode mode)
+		: WebSessionImpl(mode), _handle(NULL) {}
+
+	WebSessionWinHTTP::~WebSessionWinHTTP()
+	{
+		if (_handle != NULL) {
+			WinHTTP::WinHttpCloseHandle(_handle);
+		}
+	}
+
+	bool WebSessionWinHTTP::Initialize()
+	{
+		return WinHTTP::LoadLibrary();
+	}
+
+	bool WebSessionWinHTTP::Open()
+	{
+		DWORD accessType = 0;
+		Array<wchar_t> proxyName;
+
+		const WebProxy& proxy = GetProxy();
+		switch (proxy.GetType()) {
+			case WebProxy::Type::URL: {
+				accessType = WINHTTP_ACCESS_TYPE_NAMED_PROXY;
+				proxyName = Utf8::ToUtf16(_proxyURLWithoutCredentials);
+				break;
+			}
+			case WebProxy::Type::Disabled: {
+				accessType = WINHTTP_ACCESS_TYPE_NO_PROXY;
+				break;
+			}
+			case WebProxy::Type::Default: {
+				if (Environment::IsWindows8()) {
+					accessType = WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY;
+				} else {
+					accessType = WINHTTP_ACCESS_TYPE_DEFAULT_PROXY;
+				}
+				break;
+			}
+		}
+
+		DWORD flags = 0;
+		if (IsAsync()) {
+			flags |= WINHTTP_FLAG_ASYNC;
+		}
+
+		const auto& headers = GetHeaders();
+		auto userAgent = headers.find("User-Agent"_s);
+		HINTERNET handle = WinHTTP::WinHttpOpen(userAgent != headers.end() ? Utf8::ToUtf16(userAgent->second) : nullptr,
+			accessType, (!proxyName.empty() ? proxyName : WINHTTP_NO_PROXY_NAME), WINHTTP_NO_PROXY_BYPASS, flags);
+		if (handle == NULL) {
+			return false;
+		}
+
+		// Enable HTTP/2 (available since Windows 10 1607) and HTTP/3 (available since Windows 11) -
+		// the option is rejected as a whole on systems that don't know all the flags, so retry with
+		// HTTP/2 alone when the combination fails
+		DWORD protocols = WINHTTP_PROTOCOL_FLAG_HTTP2 | WINHTTP_PROTOCOL_FLAG_HTTP3;
+		if (!WinHTTP::WinHttpSetOption(handle, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, &protocols, sizeof(protocols))) {
+			WinHTTPSetOption(handle, WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL, WINHTTP_PROTOCOL_FLAG_HTTP2);
+		}
+
+		// Enable GZIP and DEFLATE (available since Windows 8.1)
+		WinHTTPSetOption(handle, WINHTTP_OPTION_DECOMPRESSION,
+						 WINHTTP_DECOMPRESSION_FLAG_ALL);
+
+		// Enable modern TLS on old Windows versions, where TLS 1.1/1.2 exist but are disabled by default
+		// (SSL 3.0 stays off - nothing supported speaks it anymore). From Windows 8 up the defaults are
+		// left alone, so the system can also negotiate TLS 1.3, which a fixed mask would exclude.
+		if (!Environment::IsWindows8()) {
+			WinHTTPSetOption(handle, WINHTTP_OPTION_SECURE_PROTOCOLS,
+							 WINHTTP_FLAG_SECURE_PROTOCOL_TLS1 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_1 |
+							 WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2);
+		}
+
+		// The receive timeout is an inactivity timeout, so long downloads that keep making progress
+		// are unaffected (see the shared constants for the rationale)
+		WinHTTP::WinHttpSetTimeouts(handle,
+			WebRequestConnectTimeoutSecs * 1000, WebRequestConnectTimeoutSecs * 1000,
+			WebRequestConnectTimeoutSecs * 1000, WebRequestStalledTimeoutSecs * 1000);
+
+		// Another thread may have opened the session in parallel, the first one wins and the loser
+		// discards its own handle - requests always read the winning handle through GetHandle()
+		HINTERNET expected = NULL;
+		if (!_handle.compare_exchange_strong(expected, handle)) {
+			WinHTTP::WinHttpCloseHandle(handle);
+		}
+
+		return true;
+	}
+
+	WebRequestImplPtr WebSessionWinHTTP::CreateRequest(WebSession& session, StringView url)
+	{
+		DEATH_ASSERT(!IsAsync(), "Cannot be called in asynchronous sessions", {});
+
+		if (_handle == NULL) {
+			if (!Open()) {
+				return {};
+			}
+		}
+
+		return WebRequestImplPtr{new WebRequestWinHTTP{*this, url}};
+	}
+
+	WebRequestImplPtr WebSessionWinHTTP::CreateRequestAsync(WebSessionAsync& session, StringView url, Function<void(WebRequestEvent&)>&& callback, std::int32_t id)
+	{
+		DEATH_ASSERT(IsAsync(), "Cannot be called in synchronous sessions", {});
+
+		if (_handle == NULL) {
+			if (!Open()) {
+				return {};
+			}
+		}
+
+		return WebRequestImplPtr(new WebRequestWinHTTP(session, *this, url, Death::move(callback), id));
+	}
+
+	bool WebSessionWinHTTP::SetProxy(const WebProxy& proxy)
+	{
+		DEATH_ASSERT(_handle == NULL, "Proxy must be set before the first request is made", false);
+
+		if (proxy.GetType() == WebProxy::Type::URL) {
+			auto url = proxy.GetURL();
+			auto urlW = Utf8::ToUtf16(url);
+			URLComponents urlComps;
+			if (!WinHTTP::WinHttpCrackUrl(urlW.data(), DWORD(urlW.size()), 0, &urlComps)) {
+				return false;
+			}
+
+			if (urlComps.HasCredentials()) {
+				_proxyCredentials = urlComps.GetCredentials();
+
+				urlComps.lpszUserName = nullptr;
+				urlComps.dwUserNameLength = 0;
+				urlComps.lpszPassword = nullptr;
+				urlComps.dwPasswordLength = 0;
+
+				SmallVector<wchar_t, 500> buffer(urlW.size());
+				DWORD length = DWORD(buffer.size());
+				if (!WinHTTP::WinHttpCreateUrl(&urlComps, 0, buffer.data(), &length)) {
+					return false;
+				}
+
+				_proxyURLWithoutCredentials = Utf8::FromUtf16(buffer.data(), length);
+			} else {
+				_proxyURLWithoutCredentials = url;
+			}
+
+			// WinHttpOpen() doesn't accept trailing slashes in the URL
+			while (_proxyURLWithoutCredentials.hasSuffix('/')) {
+				_proxyURLWithoutCredentials = _proxyURLWithoutCredentials.exceptSuffix(1);
+			}
+		}
+
+		return WebSessionImpl::SetProxy(proxy);
+	}
+
+#elif defined(DEATH_TARGET_ANDROID) || defined(DEATH_TARGET_APPLE) || defined(DEATH_TARGET_SWITCH) || \
+		defined(DEATH_TARGET_3DS) || defined(DEATH_TARGET_PSP) || defined(DEATH_TARGET_VITA) || defined(DEATH_TARGET_UNIX)
+
+	class WebAuthChallengeCURL : public WebAuthChallengeImpl
+	{
+	public:
+		WebAuthChallengeCURL(WebAuthChallenge::Source source, WebRequestCURL& request);
+
+		WebAuthChallengeCURL(const WebAuthChallengeCURL&) = delete;
+		WebAuthChallengeCURL& operator=(const WebAuthChallengeCURL&) = delete;
+
+		void SetCredentials(const WebCredentials& cred) override;
+
+	private:
+		WebRequestCURL& _request;
+	};
+
+	// Define symbols that might be missing from older libcurl headers
+	#if !defined(CURL_AT_LEAST_VERSION)
+	#	define CURL_VERSION_BITS(x,y,z) ((x)<<16|(y)<<8|z)
+	#	define CURL_AT_LEAST_VERSION(x,y,z) (LIBCURL_VERSION_NUM >= CURL_VERSION_BITS(x, y, z))
+	#endif
+
+	// The new name was introduced in curl 7.21.6
+	#if !defined(CURLOPT_ACCEPT_ENCODING)
+	#	define CURLOPT_ACCEPT_ENCODING CURLOPT_ENCODING
+	#endif
+
+	namespace
+	{
+		std::size_t CURLWriteData(void* buffer, std::size_t size, std::size_t nmemb, void* userdata)
+		{
+			DEATH_DEBUG_ASSERT(userdata != nullptr);
+
+			return static_cast<WebResponseCURL*>(userdata)->CURLOnWrite(buffer, size * nmemb);
+		}
+
+		std::size_t CURLHeader(char* buffer, std::size_t size, std::size_t nitems, void* userdata)
+		{
+			DEATH_DEBUG_ASSERT(userdata != nullptr);
+
+			return static_cast<WebResponseCURL*>(userdata)->CURLOnHeader(buffer, size * nitems);
+		}
+
+		int CURLXferInfo(void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow)
+		{
+			DEATH_DEBUG_ASSERT(clientp != nullptr);
+
+			auto* response = reinterpret_cast<WebResponseCURL*>(clientp);
+			return response->CURLOnProgress(dltotal);
+		}
+
+		int CURLProgress(void* clientp, double dltotal, double dlnow, double ultotal, double ulnow)
+		{
+			return CURLXferInfo(clientp, static_cast<curl_off_t>(dltotal), static_cast<curl_off_t>(dlnow),
+				static_cast<curl_off_t>(ultotal), static_cast<curl_off_t>(ulnow));
+		}
+
+		// Shared DNS cache and TLS session cache for all easy handles (CURLOPT_SHARE), so per-request
+		// handles skip repeated lookups and full TLS handshakes. libcurl nests these callbacks only
+		// when the connection cache is shared (curl/curl#2218), which is deliberately not done here -
+		// if CURL_LOCK_DATA_CONNECT is ever added back, this lock must become recursive, a plain mutex
+		// self-deadlocks on the first transfer. Intentionally leaked, so a request still finishing on
+		// some thread during static destruction can't touch a destroyed mutex.
+		std::mutex& _curlShareLock = *new std::mutex();
+		CURLSH* _curlShare = nullptr;
+
+		void CURLShareLockCallback(CURL*, curl_lock_data, curl_lock_access, void*)
+		{
+			_curlShareLock.lock();
+		}
+
+		void CURLShareUnlockCallback(CURL*, curl_lock_data, void*)
+		{
+			_curlShareLock.unlock();
+		}
+
+		void CURLSetOpt(CURL* handle, CURLoption option, long long value)
+		{
+			CURLcode res = curl_easy_setopt(handle, option, value);
+			if (res != CURLE_OK) {
+				LOGW("curl_easy_setopt({}, {}) failed: {}", std::int32_t(option), value, curl_easy_strerror(res));
+			}
+		}
+
+		void CURLSetOpt(CURL* handle, CURLoption option, unsigned long value)
+		{
+			CURLcode res = curl_easy_setopt(handle, option, value);
+			if (res != CURLE_OK) {
+				LOGW("curl_easy_setopt({}, {}) failed: {}", std::int32_t(option), value, curl_easy_strerror(res));
+			}
+		}
+
+		void CURLSetOpt(CURL* handle, CURLoption option, long value)
+		{
+			CURLcode res = curl_easy_setopt(handle, option, value);
+			if (res != CURLE_OK) {
+				LOGW("curl_easy_setopt({}, {}) failed: {}", std::int32_t(option), value, curl_easy_strerror(res));
+			}
+		}
+
+		void CURLSetOpt(CURL* handle, CURLoption option, int value)
+		{
+			CURLSetOpt(handle, option, static_cast<long>(value));
+		}
+
+		void CURLSetOpt(CURL* handle, CURLoption option, const void* value)
+		{
+			CURLcode res = curl_easy_setopt(handle, option, value);
+			if (res != CURLE_OK) {
+				LOGW("curl_easy_setopt({}, {}) failed: {}", std::int32_t(option), std::uintptr_t(value), curl_easy_strerror(res));
+			}
+		}
+
+		template<typename R, typename ...Args>
+		void CURLSetOpt(CURL* handle, CURLoption option, R(*func)(Args...))
+		{
+			CURLSetOpt(handle, option, reinterpret_cast<void*>(func));
+		}
+
+		void CURLSetOpt(CURL* handle, CURLoption option, const char* value)
+		{
+			CURLcode res = curl_easy_setopt(handle, option, value);
+			if (res != CURLE_OK) {
+				LOGW("curl_easy_setopt({}, \"{}\") failed: {}", std::int32_t(option), value, curl_easy_strerror(res));
+			}
+		}
+
+		void CURLSetOpt(CURL* handle, CURLoption option, StringView value)
+		{
+			CURLSetOpt(handle, option, String::nullTerminatedView(value).data());
+		}
+	}
+
+	WebResponseCURL::WebResponseCURL(WebRequestCURL& request)
+		: WebResponseImpl(request)
+	{
+		_knownDownloadSize = 0;
+
+		CURLSetOpt(GetHandle(), CURLOPT_WRITEDATA, this);
+		CURLSetOpt(GetHandle(), CURLOPT_HEADERDATA, this);
+
+#	if CURL_AT_LEAST_VERSION(7, 32, 0)
+		if (WebSessionCURL::CurlRuntimeAtLeastVersion(7, 32, 0)) {
+			CURLSetOpt(GetHandle(), CURLOPT_XFERINFOFUNCTION, CURLXferInfo);
+			CURLSetOpt(GetHandle(), CURLOPT_XFERINFODATA, this);
+		} else
+#	endif
+		{
+			DEATH_IGNORE_DEPRECATED_PUSH
+			CURLSetOpt(GetHandle(), CURLOPT_PROGRESSFUNCTION, CURLProgress);
+			CURLSetOpt(GetHandle(), CURLOPT_PROGRESSDATA, this);
+			DEATH_IGNORE_DEPRECATED_POP
+		}
+
+		CURLSetOpt(GetHandle(), CURLOPT_NOPROGRESS, 0L);
+	}
+
+	std::size_t WebResponseCURL::CURLOnWrite(void* buffer, std::size_t size)
+	{
+		void* buf = GetDataBuffer(size);
+		std::memcpy(buf, buffer, size);
+		ReportDataReceived(size);
+		return size;
+	}
+
+	std::size_t WebResponseCURL::CURLOnHeader(const char* buffer, std::size_t size)
+	{
+		StringView hdr = StringView(buffer, size).trimmed();
+
+		if (hdr.hasPrefix("HTTP/"_s)) {
+			// First line of the headers contains status text after version and status
+			hdr = hdr.suffix(hdr.findOr(' ', hdr.end()).begin());
+			_statusText = hdr.suffix(hdr.findOr(' ', hdr.end()).begin());
+			_headers.clear();
+		} else if (!hdr.empty()) {
+			if (StringView sep = hdr.find(':')) {
+				String hdrName = StringUtils::uppercase(hdr.prefix(sep.begin()).trimmedSuffix());
+				String hdrValue = hdr.suffix(sep.end()).trimmedPrefix();
+				_headers[hdrName].push_back(Death::move(hdrValue));
+			}
+		}
+
+		return size;
+	}
+
+	std::int32_t WebResponseCURL::CURLOnProgress(curl_off_t total)
+	{
+		if (_knownDownloadSize != total) {
+			if (_request.GetStorage() == WebRequest::Storage::Memory) {
+				PreAllocateBuffer(static_cast<std::size_t>(total));
+			}
+			_knownDownloadSize = total;
+		}
+
+		return 0;
+	}
+
+	std::int64_t WebResponseCURL::GetContentLength() const
+	{
+#	if CURL_AT_LEAST_VERSION(7, 55, 0)
+		curl_off_t len = 0;
+		curl_easy_getinfo(GetHandle(), CURLINFO_CONTENT_LENGTH_DOWNLOAD_T, &len);
+		return len;
+#	else
+		double len = 0;
+		curl_easy_getinfo(GetHandle(), CURLINFO_CONTENT_LENGTH_DOWNLOAD, &len);
+		return std::int64_t(len);
+#	endif
+	}
+
+	String WebResponseCURL::GetURL() const
+	{
+		char* urlp = nullptr;
+		curl_easy_getinfo(GetHandle(), CURLINFO_EFFECTIVE_URL, &urlp);
+		return urlp;
+	}
+
+	String WebResponseCURL::GetHeader(StringView name) const
+	{
+		const auto it = _headers.find(StringUtils::uppercase(name));
+		if (it != _headers.end()) {
+			return it->second.back();
+		}
+		return {};
+	}
+
+	Array<String> WebResponseCURL::GetAllHeaderValues(StringView name) const
+	{
+		const auto it = _headers.find(StringUtils::uppercase(name));
+		if (it != _headers.end()) {
+			return Array(InPlaceInit, arrayView(it->second));
+		}
+		return {};
+	}
+
+	std::int32_t WebResponseCURL::GetStatus() const
+	{
+		long status = 0;
+		curl_easy_getinfo(GetHandle(), CURLINFO_RESPONSE_CODE, &status);
+		return std::int32_t(status);
+	}
+
+	CURL* WebResponseCURL::GetHandle() const
+	{
+		return static_cast<WebRequestCURL&>(_request).GetHandle();
+	}
+
+	static std::size_t CURLRead(char* buffer, std::size_t size, std::size_t nitems, void* userdata)
+	{
+		DEATH_DEBUG_ASSERT(userdata != nullptr);
+
+		return static_cast<WebRequestCURL*>(userdata)->CURLOnRead(buffer, size * nitems);
+	}
+
+	static int CURLSeek(void* userdata, curl_off_t offset, int origin)
+	{
+		DEATH_DEBUG_ASSERT(userdata != nullptr);
+
+		return static_cast<WebRequestCURL*>(userdata)->CURLOnSeek(offset, origin);
+	}
+
+	WebRequestCURL::WebRequestCURL(WebSessionCURL& sessionImpl, StringView url)
+		: WebRequestImpl(sessionImpl), _sessionCURL(nullptr), _handle(curl_easy_init()), _bytesSent(0)
+	{
+		DoStartPrepare(url);
+	}
+
+	WebRequestCURL::WebRequestCURL(WebSessionAsync& session, WebSessionAsyncCURL& sessionImpl, StringView url, Function<void(WebRequestEvent&)>&& callback, std::int32_t id)
+		: WebRequestImpl(session, sessionImpl, Death::move(callback), id), _sessionCURL(&sessionImpl), _handle(curl_easy_init()), _bytesSent(0)
+	{
+		DoStartPrepare(url);
+	}
+
+	void WebRequestCURL::DoStartPrepare(StringView url)
+	{
+		DEATH_ASSERT(_handle != nullptr, "libcurl initialization failed", );
+
+		// Set error buffer to get more detailed CURL status
+		_errorBuffer[0] = '\0';
+		CURLSetOpt(_handle, CURLOPT_ERRORBUFFER, _errorBuffer);
+		CURLSetOpt(_handle, CURLOPT_URL, url);
+
+		// Set callback functions
+		CURLSetOpt(_handle, CURLOPT_WRITEFUNCTION, CURLWriteData);
+		CURLSetOpt(_handle, CURLOPT_HEADERFUNCTION, CURLHeader);
+		CURLSetOpt(_handle, CURLOPT_READFUNCTION, CURLRead);
+		CURLSetOpt(_handle, CURLOPT_READDATA, this);
+		// Without a way to rewind the attached data libcurl has to abandon any request it needs to submit
+		// a second time, which is what a 301/302/307/308 redirect and a 401/407 answered with credentials
+		// both come down to
+		CURLSetOpt(_handle, CURLOPT_SEEKFUNCTION, CURLSeek);
+		CURLSetOpt(_handle, CURLOPT_SEEKDATA, this);
+		CURLSetOpt(_handle, CURLOPT_ACCEPT_ENCODING, "");
+		// The shared DNS cache, TLS session cache and connection pool make this per-request handle reuse
+		// what previous requests already paid for, instead of starting from a cold state every time
+		if (_curlShare != nullptr) {
+			CURLSetOpt(_handle, CURLOPT_SHARE, (const void*)_curlShare);
+		}
+		// Requests are executed on background threads, where libcurl must not use signals to time out
+		// name resolution - it's unsafe outside the main thread and can wedge the process
+		CURLSetOpt(_handle, CURLOPT_NOSIGNAL, 1L);
+		CURLSetOpt(_handle, CURLOPT_CONNECTTIMEOUT, (long)WebRequestConnectTimeoutSecs);
+		// Stalled means making no progress at all (under 1 B/s) for the shared inactivity bound
+		CURLSetOpt(_handle, CURLOPT_LOW_SPEED_LIMIT, 1L);
+		CURLSetOpt(_handle, CURLOPT_LOW_SPEED_TIME, (long)WebRequestStalledTimeoutSecs);
+		// Enable redirection handling
+		CURLSetOpt(_handle, CURLOPT_FOLLOWLOCATION, 1L);
+		// Limit redirect to HTTP
+#	if CURL_AT_LEAST_VERSION(7, 85, 0)
+		if (WebSessionCURL::CurlRuntimeAtLeastVersion(7, 85, 0)) {
+			CURLSetOpt(_handle, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+		} else
+#	endif
+		{
+			DEATH_IGNORE_DEPRECATED_PUSH
+			CURLSetOpt(_handle, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+			DEATH_IGNORE_DEPRECATED_POP
+		}
+
+		const WebProxy& proxy = GetSessionImpl().GetProxy();
+		bool usingProxy = true;
+		switch (proxy.GetType()) {
+			case WebProxy::Type::URL:
+				CURLSetOpt(_handle, CURLOPT_PROXY, proxy.GetURL());
+				break;
+
+			case WebProxy::Type::Disabled:
+				// This is a special value disabling use of proxy
+				CURLSetOpt(_handle, CURLOPT_PROXY, "");
+				usingProxy = false;
+				break;
+
+			case WebProxy::Type::Default:
+				// Nothing to do, libcurl will use the standard http_proxy and other similar environment variables by default
+				break;
+		}
+
+		// Enable all supported authentication methods
+		CURLSetOpt(_handle, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
+		if (usingProxy) {
+			CURLSetOpt(_handle, CURLOPT_PROXYAUTH, CURLAUTH_ANY);
+		}
+	}
+
+	WebRequestCURL::~WebRequestCURL()
+	{
+		if (_headerList != nullptr) {
+			curl_slist_free_all(_headerList);
+		}
+
+		if (IsAsync()) {
+			_sessionCURL->RequestHasTerminated(this);
+		}
+
+		// Synchronous requests own their handle as well, so it's always released here
+		curl_easy_cleanup(_handle);
+	}
+
+	WebRequest::Result WebRequestCURL::DoFinishPrepare()
+	{
+		_response.reset(new WebResponseCURL(*this));
+
+		auto result = _response->InitializeFileStorage();
+		if (!result) {
+			return result;
+		}
+
+		String method = GetHTTPMethod();
+
+		if (method == "GET"_s) {
+			// Nothing to do, libcurl defaults to GET
+		} else if (method == "POST"_s) {
+			CURLSetOpt(_handle, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<long long>(_dataSize));
+			CURLSetOpt(_handle, CURLOPT_POST, 1L);
+		} else if (method == "HEAD"_s) {
+			CURLSetOpt(_handle, CURLOPT_NOBODY, 1L);
+		} else if (method != "PUT"_s || _dataSize == 0) {
+			CURLSetOpt(_handle, CURLOPT_CUSTOMREQUEST, method);
+		}
+		//else: PUT will be used by default if we have any data to send (and if we don't, which should never
+		//		happen but is nevertheless formally allowed, we've set it as custom request above).
+
+		// POST is handled specially by libcurl, but for everything else, including PUT as well as any other method,
+		// such as e.g. DELETE, we need to explicitly request uploading the data, if any.
+		if (_dataSize != 0 && method != "POST"_s) {
+			CURLSetOpt(_handle, CURLOPT_UPLOAD, 1L);
+			CURLSetOpt(_handle, CURLOPT_INFILESIZE_LARGE, static_cast<long long>(_dataSize));
+		}
+
+		for (auto& header : _headers) {
+			String hdrStr = header.first + ": "_s + header.second;
+			_headerList = curl_slist_append(_headerList, hdrStr.data());
+		}
+		CURLSetOpt(_handle, CURLOPT_HTTPHEADER, _headerList);
+
+		WebRequest::Ignore securityFlags = GetSecurityFlags();
+		if ((securityFlags & WebRequest::Ignore::Certificate) == WebRequest::Ignore::Certificate) {
+			CURLSetOpt(_handle, CURLOPT_SSL_VERIFYPEER, 0);
+		}
+		if ((securityFlags & WebRequest::Ignore::Host) == WebRequest::Ignore::Host) {
+			CURLSetOpt(_handle, CURLOPT_SSL_VERIFYHOST, 0);
+		}
+		return Result::Ok();
+	}
+
+	WebRequest::Result WebRequestCURL::Execute()
+	{
+		auto result = DoFinishPrepare();
+		if (result.state == WebRequest::State::Failed) {
+			return result;
+		}
+
+		_errorBuffer[0] = '\0';
+		_result = curl_easy_perform(_handle);
+		if (_result != CURLE_OK) {
+			// Whatever arrived before the transfer broke down is not worth handing to the caller, who has
+			// no way of telling how much of it is missing
+			_response.reset();
+		} else if (_response != nullptr) {
+			// Nothing else runs before this function returns, so the file backing the response has to be
+			// closed right here - otherwise the caller is handed the path of a file whose tail is still
+			// sitting in a buffer
+			_response->Finalize();
+		}
+
+		return DoHandleCompletion();
+	}
+
+	void WebRequestCURL::Run()
+	{
+		if (!CheckResult(DoFinishPrepare())) {
+			return;
+		}
+		StartRequest();
+	}
+
+	WebResponseImplPtr WebRequestCURL::GetResponse() const
+	{
+		return _response;
+	}
+
+	WebAuthChallengeImplPtr WebRequestCURL::GetAuthChallenge() const
+	{
+		return _authChallenge;
+	}
+
+	bool WebRequestCURL::StartRequest()
+	{
+		// The same handle is submitted again once credentials for a 401/407 arrive, and libcurl starts that
+		// over as a brand new transfer that reads the upload from wherever the stream happens to be left
+		_bytesSent = 0;
+		_errorBuffer[0] = '\0';
+
+		if (_dataStream != nullptr) {
+			_dataStream->Seek(0, SeekOrigin::Begin);
+		}
+
+		if (!_sessionCURL->StartRequest(*this)) {
+			SetState(WebRequest::State::Failed);
+			return false;
+		}
+
+		return true;
+	}
+
+	void WebRequestCURL::DoCancel()
+	{
+		_sessionCURL->CancelRequest(this);
+	}
+
+	WebRequest::Result WebRequestCURL::DoHandleCompletion()
+	{
+		// A failed transfer can still carry a response that looks perfectly complete, because the failure
+		// can happen long after the headers arrived - the body is then truncated while the status line goes
+		// on saying 200, so the libcurl outcome gets to decide before the HTTP status does. The same message
+		// covers the case of no response at all, where it's the only thing there is to report.
+		if (_result != CURLE_OK || _response == nullptr || _response->GetStatus() == 0) {
+			return Result::Error(GetError());
+		}
+
+		return GetResultFromHTTPStatus(WebResponseImplPtr(_response));
+	}
+
+	void WebRequestCURL::HandleCompletion(CURLcode result)
+	{
+		_result = result;
+
+		HandleResult(DoHandleCompletion());
+
+		if (GetState() == WebRequest::State::Unauthorized) {
+			_authChallenge.reset(new WebAuthChallengeCURL(_response->GetStatus() == 407
+				? WebAuthChallenge::Source::Proxy : WebAuthChallenge::Source::Server, *this));
+		}
+	}
+
+	String WebRequestCURL::GetError() const
+	{
+		// Nothing failed as far as libcurl is concerned, and the buffer is documented as meaningless unless
+		// the transfer did, so all that is left to describe is what the caller was denied
+		if (_result == CURLE_OK) {
+			return "Server returned no response"_s;
+		}
+
+		// The code comes first because it is the only part that always describes the actual outcome, the
+		// buffer holds the last message libcurl saw fit to write, which is not necessarily the one that
+		// ended the transfer - several of its diagnostics are non-fatal (conninfo_remote() reports a failing
+		// getpeername() and carries on) and several failure codes write nothing at all.
+		String description = curl_easy_strerror(_result);
+		if (_errorBuffer[0] == '\0') {
+			return description;
+		}
+
+		return description + " / "_s + StringView(_errorBuffer);
+	}
+
+	std::size_t WebRequestCURL::CURLOnRead(char* buffer, std::size_t size)
+	{
+		if (_dataStream == nullptr) {
+			return 0;
+		}
+
+		std::int64_t bytesRead = _dataStream->Read(buffer, std::int64_t(size));
+		if (bytesRead <= 0) {
+			return 0;
+		}
+
+		_bytesSent += bytesRead;
+		return bytesRead;
+	}
+
+	int WebRequestCURL::CURLOnSeek(curl_off_t offset, int origin)
+	{
+		if (_dataStream == nullptr) {
+			return CURL_SEEKFUNC_CANTSEEK;
+		}
+
+		SeekOrigin seekOrigin;
+		switch (origin) {
+			case SEEK_SET: seekOrigin = SeekOrigin::Begin; break;
+			case SEEK_CUR: seekOrigin = SeekOrigin::Current; break;
+			case SEEK_END: seekOrigin = SeekOrigin::End; break;
+			default:
+				LOGD("Cannot seek attached data, unknown origin {}", origin);
+				return CURL_SEEKFUNC_CANTSEEK;
+		}
+
+		std::int64_t newPos = _dataStream->Seek(std::int64_t(offset), seekOrigin);
+		if (newPos < 0) {
+			return CURL_SEEKFUNC_CANTSEEK;
+		}
+
+		// Everything from here on is sent for the second time, so the counter has to go back with the stream
+		// instead of climbing past the total size
+		_bytesSent = newPos;
+
+		return CURL_SEEKFUNC_OK;
+	}
+
+	std::int64_t WebRequestCURL::GetBytesSent() const
+	{
+		return _bytesSent;
+	}
+
+	std::int64_t WebRequestCURL::GetBytesExpectedToSend() const
+	{
+		return _dataSize;
+	}
+
+	WebAuthChallengeCURL::WebAuthChallengeCURL(WebAuthChallenge::Source source, WebRequestCURL& request)
+		: WebAuthChallengeImpl(source), _request(request) {}
+
+	void WebAuthChallengeCURL::SetCredentials(const WebCredentials& cred)
+	{
+		String authStr = cred.GetUser() + ':' + cred.GetPassword();
+		CURLSetOpt(_request.GetHandle(), (GetSource() == WebAuthChallenge::Source::Proxy
+			? CURLOPT_PROXYUSERPWD : CURLOPT_USERPWD), authStr.data());
+
+		_request.StartRequest();
+	}
+
+	std::uint32_t WebSessionBaseCURL::_runtimeVersion = 0;
+
+	void WebSessionBaseCURL::EnsureGlobalInitialized()
+	{
+		// Initialized on first use and deliberately never cleaned up - curl_global_cleanup() would have
+		// to run during static destruction while sessions and transfers may still be winding down, and
+		// the operating system reclaims everything at process exit anyway
+		static const bool initialized = []() {
+			if (curl_global_init(CURL_GLOBAL_ALL) != 0) {
+				LOGE("Failed to initialize libcurl library");
+				return false;
+			}
+
+			curl_version_info_data* data = curl_version_info(CURLVERSION_NOW);
+			_runtimeVersion = data->version_num;
+
+			CURLSH* share = curl_share_init();
+			if (share != nullptr) {
+				// Without working lock callbacks the shared caches would race, so the share is used
+				// only when both were installed. The connection cache (CURL_LOCK_DATA_CONNECT) is
+				// deliberately NOT shared between concurrent threads - the early crashes (curl/curl#2132,
+				// #2219) were patched back in 7.58, but the maintainers still consider the implementation
+				// incomplete for that: the documentation says unsupported, libcurl's own TODO 1.4 lists
+				// thread-safe shared connection caching as not implemented (see also curl/curl#12895)
+				if (curl_share_setopt(share, CURLSHOPT_LOCKFUNC, CURLShareLockCallback) == CURLSHE_OK &&
+					curl_share_setopt(share, CURLSHOPT_UNLOCKFUNC, CURLShareUnlockCallback) == CURLSHE_OK) {
+					curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+					curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+					_curlShare = share;
+				} else {
+					curl_share_cleanup(share);
+				}
+			}
+			return true;
+		}();
+		(void)initialized;
+	}
+
+	WebSessionBaseCURL::WebSessionBaseCURL(Mode mode)
+		: WebSessionImpl(mode)
+	{
+		EnsureGlobalInitialized();
+	}
+
+	WebSessionCURL::WebSessionCURL()
+		: WebSessionBaseCURL(Mode::Sync) {}
+
+	WebRequestImplPtr WebSessionCURL::CreateRequest(WebSession& session, StringView url)
+	{
+		// The session used to keep one handle around and reset it for every request to reuse connections, but
+		// the default session is shared process-wide, so two threads executing a request at the same time
+		// clobbered each other - libcurl refused the second transfer with "easy handle already used in multi
+		// handle", the error buffer and the response status of one request ended up belonging to the other one,
+		// and resetting the handle underneath a running transfer corrupted it. Every request owns its handle now.
+		return WebRequestImplPtr(new WebRequestCURL(*this, url));
+	}
+
+	WebRequestImplPtr WebSessionCURL::CreateRequestAsync(WebSessionAsync& session, StringView url, Function<void(WebRequestEvent&)>&& callback, std::int32_t id)
+	{
+		DEATH_ASSERT(false, "Cannot be called in synchronous sessions", {});
+		return {};
+	}
+
+	WebSessionAsyncCURL::WebSessionAsyncCURL()
+		: WebSessionBaseCURL(Mode::Async), _handle(nullptr), _workerRunning(false), _quit(false) {}
+
+	WebSessionAsyncCURL::~WebSessionAsyncCURL()
+	{
+		// Wait for the worker instead of detaching it - a detached worker kept using the multi handle
+		// that was destroyed right below, which could crash any time a process exited mid-transfer
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			_quit = true;
+		}
+		WakeWorker();
+		if (_workerThread.joinable()) {
+			_workerThread.join();
+		}
+
+		// Release whatever the worker didn't get to - the handles have to leave the multi handle
+		// before the requests owning them can be released (in practice both containers are already
+		// empty here, because queued and active requests keep the session alive through their
+		// session reference)
+		for (auto& transfer : _activeTransfers) {
+			curl_multi_remove_handle(_handle, transfer.first);
+			transfer.second->Release();
+		}
+		for (PendingAction& action : _pendingActions) {
+			if (action.add) {
+				action.request->Release();
+			}
+		}
+
+		if (_handle != nullptr) {
+			curl_multi_cleanup(_handle);
+		}
+	}
+
+	WebRequestImplPtr WebSessionAsyncCURL::CreateRequest(WebSession& session, StringView url)
+	{
+		DEATH_ASSERT(false, "Cannot be called in asynchronous sessions", {});
+		return {};
+	}
+
+	WebRequestImplPtr WebSessionAsyncCURL::CreateRequestAsync(WebSessionAsync& session, StringView url, Function<void(WebRequestEvent&)>&& callback, std::int32_t id)
+	{
+		{
+			// Allocate the multi handle on demand, requests can be created from any thread
+			std::lock_guard<std::mutex> lock(_mutex);
+			if (_handle == nullptr) {
+				_handle = curl_multi_init();
+				DEATH_ASSERT(_handle != nullptr, "curl_multi_init() failed", {});
+			}
+		}
+
+		return WebRequestImplPtr(new WebRequestCURL(session, *this, url, Death::move(callback), id));
+	}
+
+	bool WebSessionAsyncCURL::StartRequest(WebRequestCURL& request)
+	{
+		// The queue (and later the transfer set) owns a reference for as long as the worker knows
+		// about the request, so it can't be destroyed underneath a running transfer
+		request.AddRef();
+
+		bool startWorker = false;
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			_pendingActions.push_back(PendingAction{request.GetHandle(), &request, true});
+			if (!_workerRunning) {
+				_workerRunning = true;
+				startWorker = true;
+			}
+		}
+
+		request.SetState(WebRequest::State::Active);
+
+		if (startWorker) {
+			// A previous worker exits when it runs out of work, collect it before starting a new one
+			if (_workerThread.joinable()) {
+				_workerThread.join();
+			}
+			_workerThread = std::thread(OnWorkerThread, this);
+		} else {
+			WakeWorker();
+		}
+
+		return true;
+	}
+
+	void WebSessionAsyncCURL::CancelRequest(WebRequestCURL* request)
+	{
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			_pendingActions.push_back(PendingAction{request->GetHandle(), request, false});
+		}
+		WakeWorker();
+
+		request->SetState(WebRequest::State::Cancelled);
+	}
+
+	void WebSessionAsyncCURL::RequestHasTerminated(WebRequestCURL* request)
+	{
+		// Nothing to do - the pending queue and the transfer set hold a reference, so a request the
+		// worker still knows about can never reach its destructor in the first place
+	}
+
+	void WebSessionAsyncCURL::WakeWorker()
+	{
+#if CURL_AT_LEAST_VERSION(7, 68, 0)
+		if (CurlRuntimeAtLeastVersion(7, 68, 0)) {
+			CURLM* handle;
+			{
+				// The handle is created lazily under the same lock, so it must not be read unsynchronized
+				std::lock_guard<std::mutex> lock(_mutex);
+				handle = _handle;
+			}
+			if (handle != nullptr) {
+				// The only function that is safe to call on a multi handle from another thread
+				curl_multi_wakeup(handle);
+			}
+		}
+#endif
+	}
+
+	bool WebSessionBaseCURL::CurlRuntimeAtLeastVersion(std::uint32_t major, std::uint32_t minor, std::uint32_t patch)
+	{
+		return (_runtimeVersion >= CURL_VERSION_BITS(major, minor, patch));
+	}
+
+	void WebSessionAsyncCURL::OnWorkerThread(WebSessionAsyncCURL* _this)
+	{
+		std::vector<PendingAction> actions;
+
+		while (true) {
+			{
+				std::unique_lock<std::mutex> lock(_this->_mutex);
+				if (_this->_quit) {
+					return;
+				}
+				if (_this->_pendingActions.empty() && _this->_activeTransfers.empty()) {
+					// Out of work - the flag is cleared under the same lock the enqueue uses, so no
+					// request can slip in unnoticed, the next one just starts a fresh worker
+					_this->_workerRunning = false;
+					return;
+				}
+				actions.swap(_this->_pendingActions);
+			}
+
+			// Apply the queued actions - only this thread ever touches the multi handle
+			for (PendingAction& action : actions) {
+				if (action.add) {
+					if (curl_multi_add_handle(_this->_handle, action.handle) == CURLM_OK) {
+						std::lock_guard<std::mutex> lock(_this->_mutex);
+						_this->_activeTransfers[action.handle] = action.request;
+					} else {
+						action.request->SetState(WebRequest::State::Failed, "curl_multi_add_handle() failed"_s);
+						action.request->Release();
+					}
+				} else {
+					// Cancellation - the state was already set by CancelRequest(), and the entry is
+					// gone already if the transfer completed before the cancellation was processed
+					WebRequestCURL* request = nullptr;
+					{
+						std::lock_guard<std::mutex> lock(_this->_mutex);
+						auto it = _this->_activeTransfers.find(action.handle);
+						if (it != _this->_activeTransfers.end()) {
+							request = it->second;
+							_this->_activeTransfers.erase(it);
+						}
+					}
+					if (request != nullptr) {
+						curl_multi_remove_handle(_this->_handle, action.handle);
+						request->Release();
+					}
+				}
+			}
+			actions.clear();
+
+			int runningHandles = 0;
+			curl_multi_perform(_this->_handle, &runningHandles);
+
+			int msgQueueCount;
+			while (CURLMsg* msg = curl_multi_info_read(_this->_handle, &msgQueueCount)) {
+				if (msg->msg != CURLMSG_DONE) {
+					continue;
+				}
+				CURL* handle = msg->easy_handle;
+				curl_multi_remove_handle(_this->_handle, handle);
+
+				WebRequestCURL* request;
+				{
+					std::lock_guard<std::mutex> lock(_this->_mutex);
+					auto it = _this->_activeTransfers.find(handle);
+					request = (it != _this->_activeTransfers.end() ? it->second : nullptr);
+					if (request != nullptr) {
+						_this->_activeTransfers.erase(it);
+					}
+				}
+				if (request != nullptr) {
+					request->HandleCompletion(msg->data.result);
+					request->Release();
+				}
+			}
+
+			// Skip the wait entirely if more work arrived while the actions above were being applied
+			{
+				std::lock_guard<std::mutex> lock(_this->_mutex);
+				if (!_this->_pendingActions.empty() || _this->_quit) {
+					continue;
+				}
+			}
+
+			// With curl_multi_wakeup() available the sleep can be long, because WakeWorker() interrupts
+			// it - without it the wait has to stay short enough for queued actions to be noticed
+			int timeoutMs = 500;
+#if CURL_AT_LEAST_VERSION(7, 68, 0)
+			if (CurlRuntimeAtLeastVersion(7, 68, 0)) {
+				timeoutMs = 10000;
+			}
+#endif
+#if CURL_AT_LEAST_VERSION(7, 66, 0)
+			if (CurlRuntimeAtLeastVersion(7, 66, 0)) {
+				// Unlike curl_multi_wait(), curl_multi_poll() sleeps even with no sockets to monitor
+				curl_multi_poll(_this->_handle, nullptr, 0, timeoutMs, nullptr);
+			} else
+#endif
+			{
+				curl_multi_wait(_this->_handle, nullptr, 0, timeoutMs, nullptr);
+			}
+		}
+	}
+
+#endif
+
+}}

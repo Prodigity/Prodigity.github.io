@@ -1,0 +1,1155 @@
+﻿#include "NetworkManager.h"
+
+#if defined(DEATH_TARGET_PSP)
+#	include "../../nCine/Backends/Psp/PspNetwork.h"
+#endif
+
+#if defined(WITH_MULTIPLAYER)
+
+#include "Teams.h"
+#include "ServerDiscovery.h"
+#include "WebhookClient.h"
+#include "../ContentResolver.h"
+#include "../PreferencesCache.h"
+#include "../../nCine/I18n.h"
+
+#include <jsoncpp/json.h>
+
+#include <float.h>
+
+#include <Containers/DateTime.h>
+#include <Containers/StringUtils.h>
+#include <Containers/StringStlView.h>
+#include <IO/FileSystem.h>
+
+using namespace Death;
+using namespace Death::Containers::Literals;
+
+using namespace std::string_view_literals;
+
+namespace Jazz2::Multiplayer
+{
+	PeerDescriptor::PeerDescriptor()
+		: IsAuthenticated(false), IsAdmin(false), EnableLedgeClimb(false), PreferredPlayerType(PlayerType::None),
+			FurColor(0), Points(0), LevelState(PeerLevelState::Unknown), Player(nullptr),
+			LastUpdated(0), IdleElapsedFrames(0.0f), JoinCooldownFrames(0.0f), IsSpectating(SpectateMode::None),
+			CarryOver{}, HasCarryOver(false)
+	{
+		// The per-round game-mode statistics and team assignment are initialized by the MpPlayerState base constructor
+	}
+
+	NetworkManager::NetworkManager()
+	{
+	}
+
+	NetworkManager::~NetworkManager()
+	{
+		auto& resolver = ContentResolver::Get();
+		resolver.OverridePathHandler(nullptr);
+	}
+
+	void NetworkManager::CreateClient(INetworkHandler* handler, StringView endpoint, std::uint16_t defaultPort, std::uint32_t clientData)
+	{
+		_peerDesc.emplace(Peer{}, std::make_shared<PeerDescriptor>());
+		_serverConfig = std::make_unique<ServerConfiguration>();
+
+		auto& resolver = ContentResolver::Get();
+		resolver.OverridePathHandler([this](StringView path) {
+			return OnOverrideContentPath(path);
+		});
+
+		NetworkManagerBase::CreateClient(handler, endpoint, defaultPort, clientData);
+	}
+
+	bool NetworkManager::CreateServer(INetworkHandler* handler, ServerConfiguration&& serverConfig)
+	{
+#if defined(DEATH_TARGET_EMSCRIPTEN)
+		// Creating a server is not supported on Emscripten
+		return false;
+#else
+		_peerDesc.emplace(Peer{}, std::make_shared<PeerDescriptor>());
+		_serverConfig = std::make_unique<ServerConfiguration>(std::move(serverConfig));
+
+		std::uint16_t serverPort = _serverConfig->ServerPort; // Server port is part of Unique Server ID
+		std::memcpy(&_serverConfig->UniqueServerID[0], &PreferencesCache::UniqueServerID[0], arraySize(_serverConfig->UniqueServerID) - sizeof(std::uint16_t));
+		std::memcpy(&_serverConfig->UniqueServerID[_serverConfig->UniqueServerID.size() - sizeof(std::uint16_t)], &serverPort, sizeof(std::uint16_t));
+
+		_serverConfig->StartUnixTimestamp = DateTime::UtcNow().ToUnixMilliseconds() / 1000;
+
+#	if defined(DEATH_TARGET_PSP)
+		if (_serverConfig->AdhocMode) {
+			// The console becomes the ad hoc group other consoles find by scanning: the group carries the
+			// server's name (as far as the firmware's 8 alphanumeric characters allow), and has to exist
+			// before the transport binds its PDP socket in it
+			if (!SetAdhocMode(true)) {
+				return false;
+			}
+			char groupName[9];
+			Backends::PspNetwork::MakeAdhocGroupName(_serverConfig->ServerName, groupName);
+			if (!Backends::PspNetwork::AdhocCreateGroup(groupName)) {
+				return false;
+			}
+		} else {
+			SetAdhocMode(false);
+		}
+#	endif
+
+		bool result = NetworkManagerBase::CreateServer(handler, serverPort);
+
+		if (result) {
+#	if defined(WITH_WEBSOCKET)
+			if (_serverConfig->WsPort != 0) {
+				StartWsServer(_serverConfig->WsPort, _serverConfig->WsCertPath, _serverConfig->WsKeyPath);
+			}
+#	endif
+			// An ad hoc server is found by scanning for its group; there is no internet to publish it on and
+			// no IP network to broadcast into, so it runs no discovery of its own
+			if (!_serverConfig->IsPrivate && !_serverConfig->AdhocMode) {
+				_discovery = std::make_unique<ServerDiscovery>(this);
+			}
+			if (!_serverConfig->WebhookUrl.empty()) {
+				_webhook = std::make_unique<WebhookClient>(this);
+				_webhook->OnServerStarted();
+			}
+		}
+
+		return result;
+#endif
+	}
+
+	bool NetworkManager::CreateLocalServer(INetworkHandler* handler, ServerConfiguration&& serverConfig)
+	{
+		_peerDesc.emplace(Peer{}, std::make_shared<PeerDescriptor>());
+		_serverConfig = std::make_unique<ServerConfiguration>(std::move(serverConfig));
+		_serverConfig->StartUnixTimestamp = DateTime::UtcNow().ToUnixMilliseconds() / 1000;
+
+		// No socket, no server discovery and no content path override (all content is local)
+		NetworkManagerBase::CreateLocalSession(handler);
+		return true;
+	}
+
+	void NetworkManager::Dispose()
+	{
+		_discovery = nullptr;
+
+		if (_webhook != nullptr) {
+			_webhook->OnServerStopping();
+			// The destructor flushes still pending events and stops the delivery thread
+			_webhook = nullptr;
+		}
+
+		NetworkManagerBase::Dispose();
+	}
+
+	ServerConfiguration& NetworkManager::GetServerConfiguration() const
+	{
+		return *_serverConfig;
+	}
+
+	std::uint32_t NetworkManager::GetPeerCount()
+	{
+		// The map is read under the lock too - this is called from the discovery thread while
+		// the network thread inserts/erases peers
+		std::unique_lock<Spinlock> l(_lock);
+
+		// Count valid (remote and local splitscreen) peers plus the local host if it has a player, instead
+		// of size() - 1, which assumes the local descriptor is always present and would underflow to
+		// UINT32_MAX if it ever went missing (the count is reported to the public server list as-is)
+		std::uint32_t count = 0;
+		for (auto& [peer, peerDesc] : _peerDesc) {
+			if (peer.IsValid() || peerDesc->Player) {
+				count++;
+			}
+		}
+
+		return count;
+	}
+
+	LockedPtr<const HashMap<Peer, std::shared_ptr<PeerDescriptor>>, Spinlock> NetworkManager::GetPeers()
+	{
+		return LockedPtr<const HashMap<Peer, std::shared_ptr<PeerDescriptor>>, Spinlock>(&_peerDesc, std::unique_lock<Spinlock>(_lock));
+	}
+
+	std::shared_ptr<PeerDescriptor> NetworkManager::GetPeerDescriptor(LocalPeerT)
+	{
+		std::unique_lock<Spinlock> l(_lock);
+		auto it = _peerDesc.find(Peer{});
+		return (it != _peerDesc.end() ? it->second : nullptr);
+	}
+
+	std::shared_ptr<PeerDescriptor> NetworkManager::GetPeerDescriptor(LocalPeerT, std::int32_t index)
+	{
+		Peer key = (index <= 0 ? Peer{} : Peer::Local(index));
+		std::unique_lock<Spinlock> l(_lock);
+		auto it = _peerDesc.find(key);
+		return (it != _peerDesc.end() ? it->second : nullptr);
+	}
+
+	std::shared_ptr<PeerDescriptor> NetworkManager::AddLocalPlayer(std::int32_t index)
+	{
+		Peer key = (index <= 0 ? Peer{} : Peer::Local(index));
+		std::unique_lock<Spinlock> l(_lock);
+		auto it = _peerDesc.find(key);
+		if (it != _peerDesc.end()) {
+			return it->second;
+		}
+		// RemotePeer stays empty so the player is treated as local everywhere
+		auto desc = std::make_shared<PeerDescriptor>();
+		_peerDesc.emplace(key, desc);
+		return desc;
+	}
+
+	std::shared_ptr<PeerDescriptor> NetworkManager::GetPeerDescriptor(const Peer& peer)
+	{
+		if (!peer) {
+			return nullptr;
+		}
+
+		std::unique_lock<Spinlock> l(_lock);
+		auto it = _peerDesc.find(peer);
+		return (it != _peerDesc.end() ? it->second : nullptr);
+	}
+
+	bool NetworkManager::HasInboundConnections() const
+	{
+		if DEATH_UNLIKELY(GetState() == NetworkState::Local) {
+			// A local session binds no socket, so it can never have inbound connections. The peer map still holds
+			// one synthetic descriptor per local splitscreen player (see AddLocalPlayer()), so the size check below
+			// would report them as connected clients and make the server broadcast state nobody can receive.
+			return false;
+		}
+
+		std::unique_lock<Spinlock> l(_lock);
+		// Local peer is always present
+		return (_peerDesc.size() > 1);
+	}
+
+	void NetworkManager::RefreshServerConfiguration()
+	{
+		if (_serverConfig->FilePath.empty()) {
+			return;
+		}
+
+		HashMap<String, bool> includedFiles;
+
+		FillServerConfigurationFromFile(_serverConfig->FilePath, *_serverConfig, includedFiles, 0);
+		VerifyServerConfiguration(*_serverConfig);
+
+		// Apply webhook-related changes
+		if (_webhook != nullptr) {
+			if (_serverConfig->WebhookUrl.empty()) {
+				_webhook = nullptr;
+			} else {
+				_webhook->UpdateConfiguration();
+			}
+		} else if (!_serverConfig->WebhookUrl.empty() && GetState() == NetworkState::Listening) {
+			_webhook = std::make_unique<WebhookClient>(this);
+		}
+
+		// Check if any newly banned player should be kicked. The peers are collected under the lock, but kicked
+		// after releasing it - Kick() takes the base class lock, and holding this lock across it would invert
+		// the lock order against the send paths
+		SmallVector<Peer, 8> peersToKick;
+		{
+			std::unique_lock<Spinlock> l(_lock);
+			for (auto& pair : _peerDesc) {
+				if (pair.second->RemotePeer) {
+					auto address = NetworkManagerBase::AddressToString(pair.second->RemotePeer);
+					if (_serverConfig->BannedIPAddresses.contains(address)) {
+						LOGW("Peer kicked \"{}\" [{}] ({}): Banned by IP address", pair.second->PlayerName, pair.second->RemotePeer, address);
+						peersToKick.push_back(pair.second->RemotePeer);
+						continue;
+					}
+
+					auto uniquePlayerId = UuidToString(pair.second->UniquePlayerID);
+					if (_serverConfig->BannedUniquePlayerIDs.contains(uniquePlayerId)) {
+						LOGW("Peer kicked \"{}\" [{}] ({}): Banned by unique player ID", pair.second->PlayerName, pair.second->RemotePeer, address);
+						peersToKick.push_back(pair.second->RemotePeer);
+						continue;
+					}
+				}
+			}
+		}
+		for (const Peer& peer : peersToKick) {
+			Kick(peer, Reason::Banned);
+		}
+	}
+
+	void NetworkManager::SetStatusProvider(std::weak_ptr<IServerStatusProvider> statusProvider)
+	{
+		if (_discovery != nullptr) {
+			_discovery->SetStatusProvider(std::move(statusProvider));
+		}
+	}
+
+	WebhookClient* NetworkManager::GetWebhook() const
+	{
+		return _webhook.get();
+	}
+
+	ServerConfiguration NetworkManager::CreateDefaultServerConfiguration()
+	{
+		return LoadServerConfigurationFromFile("Jazz2.Server.config"_s);
+	}
+
+	ServerConfiguration NetworkManager::LoadServerConfigurationFromFile(StringView path)
+	{
+		HashMap<String, bool> includedFiles;
+
+		ServerConfiguration serverConfig{};
+		serverConfig.AllowAssetStreaming = true;
+		serverConfig.ColorizePlayersByTeam = true;
+		serverConfig.GameMode = MpGameMode::Cooperation;
+		serverConfig.AllowedPlayerTypes = 0x01 | 0x02 | 0x04;
+		serverConfig.IdleKickTimeSecs = -1;
+		serverConfig.ReconnectWindowSecs = 300;
+		serverConfig.AntiCheatKick = true;
+		serverConfig.MinPlayerCount = 1;
+		serverConfig.ReforgedGameplay = PreferencesCache::EnableReforgedGameplay;
+		serverConfig.AllowLedgeClimb = serverConfig.ReforgedGameplay;
+		serverConfig.PreGameSecs = 30;
+		serverConfig.SpawnInvulnerableSecs = 4;
+		serverConfig.PlaylistIndex = -1;
+
+		serverConfig.TotalPlayerPoints = 50;
+		serverConfig.InitialPlayerHealth = -1;
+		serverConfig.TotalKills = 10;
+		serverConfig.TotalLaps = 3;
+		serverConfig.TotalTreasureCollected = 0;
+		// The first player across the finish line doesn't end a race - everybody else gets this long to finish too
+		serverConfig.OvertimeSecs = 60;
+
+		serverConfig.EnableSpectate = true;
+		// Left unset on purpose: the game mode decides until a configuration says otherwise
+		serverConfig.PlayerStacking = true;
+		serverConfig.PlayerStackingSet = false;
+		serverConfig.AllowMinimap = true;
+		serverConfig.AllowMinimapSet = false;
+		serverConfig.EnableFreeCamera = true;
+		serverConfig.AllowJoinDuringRound = true;
+		serverConfig.JoinCooldownSecs = 0;
+
+		serverConfig.TeamCount = 2;
+		serverConfig.AutoBalanceTeams = true;
+		serverConfig.MaxTeamSizeDiff = 1;
+		serverConfig.AllowTeamSelection = true;
+		serverConfig.FriendlyFire = false;
+
+		serverConfig.WebhookEvents = WebhookEventType::Default;
+
+		FillServerConfigurationFromFile(path, serverConfig, includedFiles, 0);
+
+		serverConfig.FilePath = path;
+
+		VerifyServerConfiguration(serverConfig);
+
+		return serverConfig;
+	}
+
+	void NetworkManager::ApplyPlaylistEntry(ServerConfiguration& serverConfig, const PlaylistEntry& playlistEntry)
+	{
+		// Both the initial level and every playlist advance go through here, so an entry can't lose a property
+		// on one of the paths only. Keep it in sync with PlaylistEntry and with the inheritance when it's parsed.
+		serverConfig.ReforgedGameplay = playlistEntry.ReforgedGameplay;
+		serverConfig.AllowLedgeClimb = playlistEntry.AllowLedgeClimb;
+		serverConfig.TeamCount = playlistEntry.TeamCount;
+		serverConfig.AutoBalanceTeams = playlistEntry.AutoBalanceTeams;
+		serverConfig.AllowTeamSelection = playlistEntry.AllowTeamSelection;
+		serverConfig.FriendlyFire = playlistEntry.FriendlyFire;
+		serverConfig.Elimination = playlistEntry.Elimination;
+		serverConfig.InitialPlayerHealth = playlistEntry.InitialPlayerHealth;
+		serverConfig.MaxGameTimeSecs = playlistEntry.MaxGameTimeSecs;
+		serverConfig.PreGameSecs = playlistEntry.PreGameSecs;
+		serverConfig.SpawnInvulnerableSecs = playlistEntry.SpawnInvulnerableSecs;
+		serverConfig.TotalKills = playlistEntry.TotalKills;
+		serverConfig.TotalLaps = playlistEntry.TotalLaps;
+		serverConfig.TotalTreasureCollected = playlistEntry.TotalTreasureCollected;
+		serverConfig.OvertimeSecs = playlistEntry.OvertimeSecs;
+		serverConfig.PlayerStacking = playlistEntry.PlayerStacking;
+		serverConfig.PlayerStackingSet = playlistEntry.PlayerStackingSet;
+		serverConfig.AllowMinimap = playlistEntry.AllowMinimap;
+		serverConfig.AllowMinimapSet = playlistEntry.AllowMinimapSet;
+		serverConfig.ColorizePlayersByTeam = playlistEntry.ColorizePlayersByTeam;
+	}
+
+	String NetworkManager::OnOverrideContentPath(StringView path)
+	{
+		auto& resolver = ContentResolver::Get();
+
+		const auto& remoteServerId = _serverConfig->UniqueServerID;
+
+		char uuidStr[33];
+		std::size_t uuidStrLength = formatInto(uuidStr, "{:.2x}{:.2x}{:.2x}{:.2x}{:.2x}{:.2x}{:.2x}{:.2x}{:.2x}{:.2x}{:.2x}{:.2x}{:.2x}{:.2x}{:.2x}{:.2x}",
+			remoteServerId[0], remoteServerId[1], remoteServerId[2], remoteServerId[3], remoteServerId[4], remoteServerId[5], remoteServerId[6], remoteServerId[7], remoteServerId[8], remoteServerId[9], remoteServerId[10], remoteServerId[11], remoteServerId[12], remoteServerId[13], remoteServerId[14], remoteServerId[15]);
+
+		String fullPath = fs::FindPathCaseInsensitive(
+			fs::CombinePath({ resolver.GetCachePath(), "Downloads"_s,
+				{ uuidStr, uuidStrLength }, fs::ToNativeSeparators(path) }));
+		if (!fs::IsReadableFile(fullPath)) {
+			return {};
+		}
+
+		LOGI("Overriding path \"{}\" to \"{}\"", path, fullPath);
+		return fullPath;
+	}
+
+	void NetworkManager::FillServerConfigurationFromFile(StringView path, ServerConfiguration& serverConfig, HashMap<String, bool>& includedFiles, std::int32_t level)
+	{
+		static constexpr std::int32_t MaxLapCount = 80;
+
+		auto configPath = fs::CombinePath(PreferencesCache::GetDirectory(), path);
+
+		// Skip already included files to avoid infinite loops
+		if (!includedFiles.emplace(configPath, true).second) {
+			LOGW("Skipping already included configuration file \"{}\"", configPath);
+			return;
+		}
+
+		auto s = fs::Open(configPath, FileAccess::Read);
+		auto fileSize = s->GetSize();
+		if (fileSize >= 4 && fileSize < 64 * 1024 * 1024) {
+			auto buffer = std::make_unique<char[]>(fileSize);
+			s->Read(buffer.get(), fileSize);
+
+			Json::CharReaderBuilder builder;
+			auto reader = std::unique_ptr<Json::CharReader>(builder.newCharReader());
+			Json::Value doc; std::string errors;
+			if (reader->parse(buffer.get(), buffer.get() + fileSize, &doc, &errors)) {
+				if (level == 0) {
+					LOGI("Loaded configuration from \"{}\"", configPath);
+				} else {
+					LOGI("Loaded configuration from \"{}\" because of $include directive", configPath);
+				}
+
+				std::string_view includeFile;
+				if (doc["$include"].get(includeFile) == Json::SUCCESS && !includeFile.empty()) {
+					FillServerConfigurationFromFile(includeFile, serverConfig, includedFiles, level + 1);
+				}
+
+				std::string_view serverName;
+				if (doc["ServerName"].get(serverName) == Json::SUCCESS) {
+					serverConfig.ServerName = serverName;
+				}
+
+				Json::Value& serverAddressOverride = doc["ServerAddressOverride"];
+				if (serverAddressOverride.isArray()) {
+					serverConfig.ServerAddressOverrides.clear();
+					for (auto& entry : serverAddressOverride) {
+						std::string_view addressOverride;
+						if (entry.get(addressOverride) == Json::SUCCESS) {
+							AddServerAddressOverride(serverConfig, addressOverride);
+						}
+					}
+				} else {
+					// A single address is still accepted, because that's what most servers need
+					std::string_view addressOverride;
+					if (serverAddressOverride.get(addressOverride) == Json::SUCCESS) {
+						serverConfig.ServerAddressOverrides.clear();
+						AddServerAddressOverride(serverConfig, addressOverride);
+					}
+				}
+
+				std::string_view serverPassword;
+				if (doc["ServerPassword"].get(serverPassword) == Json::SUCCESS) {
+					serverConfig.ServerPassword = serverPassword;
+				}
+
+				std::string_view welcomeMessage;
+				if (doc["WelcomeMessage"].get(welcomeMessage) == Json::SUCCESS) {
+					serverConfig.WelcomeMessage = welcomeMessage;
+				}
+
+				std::int64_t maxPlayerCount;
+				if (doc["MaxPlayerCount"].get(maxPlayerCount) == Json::SUCCESS && maxPlayerCount > 0 && maxPlayerCount <= UINT32_MAX) {
+					serverConfig.MaxPlayerCount = std::uint32_t(maxPlayerCount);
+				}
+
+				std::int64_t minPlayerCount;
+				if (doc["MinPlayerCount"].get(minPlayerCount) == Json::SUCCESS && minPlayerCount >= 1 && minPlayerCount <= UINT32_MAX) {
+					serverConfig.MinPlayerCount = std::uint32_t(minPlayerCount);
+				}
+
+				std::string_view gameMode;
+				if (doc["GameMode"].get(gameMode) == Json::SUCCESS) {
+					serverConfig.GameMode = StringToGameMode(gameMode);
+				}
+
+				std::int64_t serverPort;
+				if (doc["ServerPort"].get(serverPort) == Json::SUCCESS && serverPort > 0 && serverPort <= UINT16_MAX) {
+					serverConfig.ServerPort = std::uint16_t(serverPort);
+				}
+
+#if defined(WITH_WEBSOCKET)
+				std::int64_t wsPort;
+				if (doc["WsPort"].get(wsPort) == Json::SUCCESS && wsPort > 0 && wsPort <= UINT16_MAX) {
+					serverConfig.WsPort = std::uint16_t(wsPort);
+				}
+
+				std::string_view wsCertPath;
+				if (doc["WsCertPath"].get(wsCertPath) == Json::SUCCESS && !wsCertPath.empty()) {
+					serverConfig.WsCertPath = wsCertPath;
+				}
+
+				std::string_view wsKeyPath;
+				if (doc["WsKeyPath"].get(wsKeyPath) == Json::SUCCESS && !wsKeyPath.empty()) {
+					serverConfig.WsKeyPath = wsKeyPath;
+				}
+#endif
+
+				bool isPrivate;
+				if (doc["IsPrivate"].get(isPrivate) == Json::SUCCESS) {
+					serverConfig.IsPrivate = isPrivate;
+				}
+
+				bool allowAssetStreaming;
+				if (doc["AllowAssetStreaming"].get(allowAssetStreaming) == Json::SUCCESS) {
+					serverConfig.AllowAssetStreaming = allowAssetStreaming;
+				}
+				
+				bool requiresDiscordAuth;
+				if (doc["RequiresDiscordAuth"].get(requiresDiscordAuth) == Json::SUCCESS) {
+					serverConfig.RequiresDiscordAuth = requiresDiscordAuth;
+				}
+
+				std::int64_t allowedPlayerTypes;
+				if (doc["AllowedPlayerTypes"].get(allowedPlayerTypes) == Json::SUCCESS && allowedPlayerTypes > 0 && allowedPlayerTypes <= UINT8_MAX) {
+					serverConfig.AllowedPlayerTypes = std::uint8_t(allowedPlayerTypes);
+				}
+
+				std::int64_t idleKickTimeSecs;
+				if (doc["IdleKickTimeSecs"].get(idleKickTimeSecs) == Json::SUCCESS && idleKickTimeSecs >= INT32_MIN && idleKickTimeSecs <= INT32_MAX) {
+					serverConfig.IdleKickTimeSecs = std::int16_t(idleKickTimeSecs);
+				}
+
+				std::int64_t reconnectWindowSecs;
+				if (doc["ReconnectWindowSecs"].get(reconnectWindowSecs) == Json::SUCCESS && reconnectWindowSecs >= INT32_MIN && reconnectWindowSecs <= INT32_MAX) {
+					serverConfig.ReconnectWindowSecs = std::int32_t(reconnectWindowSecs);
+				}
+
+				bool allowCheats;
+				if (doc["AllowCheats"].get(allowCheats) == Json::SUCCESS) {
+					serverConfig.AllowCheats = allowCheats;
+				}
+
+				bool antiCheatKick;
+				if (doc["AntiCheatKick"].get(antiCheatKick) == Json::SUCCESS) {
+					serverConfig.AntiCheatKick = antiCheatKick;
+				}
+
+				Json::Value& adminUniquePlayerIDs = doc["AdminUniquePlayerIDs"];
+				for (auto it = adminUniquePlayerIDs.begin(); it != adminUniquePlayerIDs.end(); ++it) {
+					std::string_view key = it.name();
+					if (!key.empty()) {
+						std::string_view value;
+						it->get(value);
+						serverConfig.AdminUniquePlayerIDs.emplace(key, value);
+					}
+				}
+
+				Json::Value& whitelistedUniquePlayerIDs = doc["WhitelistedUniquePlayerIDs"];
+				for (auto it = whitelistedUniquePlayerIDs.begin(); it != whitelistedUniquePlayerIDs.end(); ++it) {
+					std::string_view key = it.name();
+					if (!key.empty()) {
+						std::string_view value;
+						it->get(value);
+						serverConfig.WhitelistedUniquePlayerIDs.emplace(key, value);
+					}
+				}
+
+				Json::Value& bannedUniquePlayerIDs = doc["BannedUniquePlayerIDs"];
+				for (auto it = bannedUniquePlayerIDs.begin(); it != bannedUniquePlayerIDs.end(); ++it) {
+					std::string_view key = it.name();
+					if (!key.empty()) {
+						std::string_view value;
+						it->get(value);
+						serverConfig.BannedUniquePlayerIDs.emplace(key, value);
+					}
+				}
+
+				Json::Value& bannedIPAddresses = doc["BannedIPAddresses"];
+				for (auto it = bannedIPAddresses.begin(); it != bannedIPAddresses.end(); ++it) {
+					std::string_view key = it.name();
+					if (!key.empty()) {
+						std::string_view value;
+						it->get(value);
+						serverConfig.BannedIPAddresses.emplace(key, value);
+					}
+				}
+
+				std::string_view webhookUrl;
+				if (doc["WebhookUrl"].get(webhookUrl) == Json::SUCCESS) {
+					serverConfig.WebhookUrl = StringView(webhookUrl).trimmed();
+				}
+
+				Json::Value& webhookEvents = doc["WebhookEvents"];
+				if (webhookEvents.isArray()) {
+					WebhookEventType events = WebhookEventType::None;
+					for (auto& entry : webhookEvents) {
+						std::string_view eventName;
+						if (entry.get(eventName) == Json::SUCCESS) {
+							events |= StringToWebhookEvent(eventName);
+						}
+					}
+					serverConfig.WebhookEvents = events;
+				}
+
+				// Game-specific settings
+				bool reforgedGameplay;
+				if (doc["ReforgedGameplay"].get(reforgedGameplay) == Json::SUCCESS) {
+					serverConfig.ReforgedGameplay = reforgedGameplay;
+					// Ledge climbing is a part of reforged gameplay, so it follows it unless it's specified explicitly
+					serverConfig.AllowLedgeClimb = reforgedGameplay;
+				}
+
+				bool allowLedgeClimb;
+				if (doc["AllowLedgeClimb"].get(allowLedgeClimb) == Json::SUCCESS) {
+					serverConfig.AllowLedgeClimb = allowLedgeClimb;
+				}
+
+				bool randomizePlaylist;
+				if (doc["RandomizePlaylist"].get(randomizePlaylist) == Json::SUCCESS) {
+					serverConfig.RandomizePlaylist = randomizePlaylist;
+				}
+
+				bool allowMinimap;
+				if (doc["AllowMinimap"].get(allowMinimap) == Json::SUCCESS) {
+					serverConfig.AllowMinimap = allowMinimap;
+					serverConfig.AllowMinimapSet = true;
+				}
+
+				bool colorizePlayersByTeam;
+				if (doc["ColorizePlayersByTeam"].get(colorizePlayersByTeam) == Json::SUCCESS) {
+					serverConfig.ColorizePlayersByTeam = colorizePlayersByTeam;
+				}
+
+				bool elimination;
+				if (doc["Elimination"].get(elimination) == Json::SUCCESS) {
+					serverConfig.Elimination = elimination;
+				}
+
+				bool playerStacking;
+				if (doc["PlayerStacking"].get(playerStacking) == Json::SUCCESS) {
+					serverConfig.PlayerStacking = playerStacking;
+					serverConfig.PlayerStackingSet = true;
+				}
+
+				std::int64_t teamCount;
+				if (doc["TeamCount"].get(teamCount) == Json::SUCCESS && teamCount >= 2 && teamCount <= MaxTeamCount) {
+					serverConfig.TeamCount = std::uint8_t(teamCount);
+				}
+
+				bool autoBalanceTeams;
+				if (doc["AutoBalanceTeams"].get(autoBalanceTeams) == Json::SUCCESS) {
+					serverConfig.AutoBalanceTeams = autoBalanceTeams;
+				}
+
+				std::int64_t maxTeamSizeDiff;
+				if (doc["MaxTeamSizeDiff"].get(maxTeamSizeDiff) == Json::SUCCESS && maxTeamSizeDiff >= 1 && maxTeamSizeDiff <= INT8_MAX) {
+					serverConfig.MaxTeamSizeDiff = std::uint8_t(maxTeamSizeDiff);
+				}
+
+				bool allowTeamSelection;
+				if (doc["AllowTeamSelection"].get(allowTeamSelection) == Json::SUCCESS) {
+					serverConfig.AllowTeamSelection = allowTeamSelection;
+				}
+
+				bool friendlyFire;
+				if (doc["FriendlyFire"].get(friendlyFire) == Json::SUCCESS) {
+					serverConfig.FriendlyFire = friendlyFire;
+				}
+
+				std::int64_t totalPlayerPoints;
+				if (doc["TotalPlayerPoints"].get(totalPlayerPoints) == Json::SUCCESS && totalPlayerPoints >= 0 && totalPlayerPoints <= INT32_MAX) {
+					serverConfig.TotalPlayerPoints = std::uint32_t(totalPlayerPoints);
+				}
+
+				std::int64_t initialPlayerHealth;
+				if (doc["InitialPlayerHealth"].get(initialPlayerHealth) == Json::SUCCESS && initialPlayerHealth >= INT32_MIN && initialPlayerHealth <= INT32_MAX) {
+					serverConfig.InitialPlayerHealth = std::int32_t(initialPlayerHealth);
+				}
+
+				std::int64_t maxGameTimeSecs;
+				if (doc["MaxGameTimeSecs"].get(maxGameTimeSecs) == Json::SUCCESS && maxGameTimeSecs >= 0 && maxGameTimeSecs <= INT32_MAX) {
+					serverConfig.MaxGameTimeSecs = std::uint32_t(maxGameTimeSecs);
+				}
+
+				std::int64_t preGameSecs;
+				if (doc["PreGameSecs"].get(preGameSecs) == Json::SUCCESS && preGameSecs >= 0 && preGameSecs <= INT32_MAX) {
+					serverConfig.PreGameSecs = std::uint32_t(preGameSecs);
+				}
+
+				std::int64_t spawnInvulnerableSecs;
+				if (doc["SpawnInvulnerableSecs"].get(spawnInvulnerableSecs) == Json::SUCCESS && spawnInvulnerableSecs >= 0 && spawnInvulnerableSecs <= INT32_MAX) {
+					serverConfig.SpawnInvulnerableSecs = std::uint32_t(spawnInvulnerableSecs);
+				}
+
+				std::int64_t totalKills;
+				if (doc["TotalKills"].get(totalKills) == Json::SUCCESS && totalKills > 0 && totalKills <= INT32_MAX) {
+					serverConfig.TotalKills = std::uint32_t(totalKills);
+				}
+
+				std::int64_t totalLaps;
+				if (doc["TotalLaps"].get(totalLaps) == Json::SUCCESS && totalLaps > 0 && totalLaps <= INT32_MAX) {
+					serverConfig.TotalLaps = std::uint32_t(totalLaps);
+					if (serverConfig.TotalLaps > MaxLapCount) {
+						serverConfig.TotalLaps = MaxLapCount;
+					}
+				}
+
+				std::int64_t totalTreasureCollected;
+				if (doc["TotalTreasureCollected"].get(totalTreasureCollected) == Json::SUCCESS && totalTreasureCollected >= 0 && totalTreasureCollected <= INT32_MAX) {
+					serverConfig.TotalTreasureCollected = std::uint32_t(totalTreasureCollected);
+				}
+
+				std::int64_t overtimeSecs;
+				if (doc["OvertimeSecs"].get(overtimeSecs) == Json::SUCCESS && overtimeSecs >= 0 && overtimeSecs <= INT32_MAX) {
+					serverConfig.OvertimeSecs = std::uint32_t(overtimeSecs);
+				}
+
+				bool enableSpectate;
+				if (doc["EnableSpectate"].get(enableSpectate) == Json::SUCCESS) {
+					serverConfig.EnableSpectate = enableSpectate;
+				}
+
+				bool enableFreeCamera;
+				if (doc["EnableFreeCamera"].get(enableFreeCamera) == Json::SUCCESS) {
+					serverConfig.EnableFreeCamera = enableFreeCamera;
+				}
+
+				bool allowJoinDuringRound;
+				if (doc["AllowJoinDuringRound"].get(allowJoinDuringRound) == Json::SUCCESS) {
+					serverConfig.AllowJoinDuringRound = allowJoinDuringRound;
+				}
+
+				std::int64_t joinCooldownSecs;
+				if (doc["JoinCooldownSecs"].get(joinCooldownSecs) == Json::SUCCESS && joinCooldownSecs >= 0 && joinCooldownSecs <= INT32_MAX) {
+					serverConfig.JoinCooldownSecs = std::uint32_t(joinCooldownSecs);
+				}
+
+				// Playlist
+				Json::Value& playlist = doc["Playlist"];
+				if (playlist.isArray()) {
+					serverConfig.Playlist.clear();
+					for (auto& entry : playlist) {
+						// Playlist entry inherits all properties from the main server configuration
+						PlaylistEntry playlistEntry{};
+						playlistEntry.GameMode = serverConfig.GameMode;
+						playlistEntry.ReforgedGameplay = serverConfig.ReforgedGameplay;
+						playlistEntry.AllowLedgeClimb = serverConfig.AllowLedgeClimb;
+						playlistEntry.TeamCount = serverConfig.TeamCount;
+						playlistEntry.AutoBalanceTeams = serverConfig.AutoBalanceTeams;
+						playlistEntry.AllowTeamSelection = serverConfig.AllowTeamSelection;
+						playlistEntry.FriendlyFire = serverConfig.FriendlyFire;
+						playlistEntry.Elimination = serverConfig.Elimination;
+						playlistEntry.InitialPlayerHealth = serverConfig.InitialPlayerHealth;
+						playlistEntry.MaxGameTimeSecs = serverConfig.MaxGameTimeSecs;
+						playlistEntry.PreGameSecs = serverConfig.PreGameSecs;
+						playlistEntry.SpawnInvulnerableSecs = serverConfig.SpawnInvulnerableSecs;
+						playlistEntry.TotalKills = serverConfig.TotalKills;
+						playlistEntry.TotalLaps = serverConfig.TotalLaps;
+						playlistEntry.TotalTreasureCollected = serverConfig.TotalTreasureCollected;
+						playlistEntry.OvertimeSecs = serverConfig.OvertimeSecs;
+						playlistEntry.PlayerStacking = serverConfig.PlayerStacking;
+						playlistEntry.PlayerStackingSet = serverConfig.PlayerStackingSet;
+						playlistEntry.AllowMinimap = serverConfig.AllowMinimap;
+						playlistEntry.AllowMinimapSet = serverConfig.AllowMinimapSet;
+						playlistEntry.ColorizePlayersByTeam = serverConfig.ColorizePlayersByTeam;
+
+						std::string_view levelName;
+						if (entry["LevelName"].get(levelName) == Json::SUCCESS) {
+							playlistEntry.LevelName = levelName;
+						}
+
+						std::string_view gameMode;
+						if (entry["GameMode"].get(gameMode) == Json::SUCCESS) {
+							playlistEntry.GameMode = StringToGameMode(gameMode);
+						}
+
+						bool reforgedGameplay;
+						if (entry["ReforgedGameplay"].get(reforgedGameplay) == Json::SUCCESS) {
+							playlistEntry.ReforgedGameplay = reforgedGameplay;
+							// Ledge climbing is a part of reforged gameplay, so it follows it unless it's specified explicitly
+							playlistEntry.AllowLedgeClimb = reforgedGameplay;
+						}
+
+						bool entryAllowLedgeClimb;
+						if (entry["AllowLedgeClimb"].get(entryAllowLedgeClimb) == Json::SUCCESS) {
+							playlistEntry.AllowLedgeClimb = entryAllowLedgeClimb;
+						}
+
+						bool elimination;
+						if (entry["Elimination"].get(elimination) == Json::SUCCESS) {
+							playlistEntry.Elimination = elimination;
+						}
+
+						bool entryPlayerStacking;
+						if (entry["PlayerStacking"].get(entryPlayerStacking) == Json::SUCCESS) {
+							playlistEntry.PlayerStacking = entryPlayerStacking;
+							playlistEntry.PlayerStackingSet = true;
+						}
+
+						std::int64_t entryTeamCount;
+						if (entry["TeamCount"].get(entryTeamCount) == Json::SUCCESS && entryTeamCount >= 2 && entryTeamCount <= MaxTeamCount) {
+							playlistEntry.TeamCount = std::uint8_t(entryTeamCount);
+						}
+
+						bool entryAutoBalanceTeams;
+						if (entry["AutoBalanceTeams"].get(entryAutoBalanceTeams) == Json::SUCCESS) {
+							playlistEntry.AutoBalanceTeams = entryAutoBalanceTeams;
+						}
+
+						bool entryAllowTeamSelection;
+						if (entry["AllowTeamSelection"].get(entryAllowTeamSelection) == Json::SUCCESS) {
+							playlistEntry.AllowTeamSelection = entryAllowTeamSelection;
+						}
+
+						bool entryFriendlyFire;
+						if (entry["FriendlyFire"].get(entryFriendlyFire) == Json::SUCCESS) {
+							playlistEntry.FriendlyFire = entryFriendlyFire;
+						}
+
+						bool entryAllowMinimap;
+						if (entry["AllowMinimap"].get(entryAllowMinimap) == Json::SUCCESS) {
+							playlistEntry.AllowMinimap = entryAllowMinimap;
+							playlistEntry.AllowMinimapSet = true;
+						}
+
+						bool entryColorizePlayersByTeam;
+						if (entry["ColorizePlayersByTeam"].get(entryColorizePlayersByTeam) == Json::SUCCESS) {
+							playlistEntry.ColorizePlayersByTeam = entryColorizePlayersByTeam;
+						}
+
+						std::int64_t initialPlayerHealth;
+						if (entry["InitialPlayerHealth"].get(initialPlayerHealth) == Json::SUCCESS && initialPlayerHealth >= INT32_MIN && initialPlayerHealth <= INT32_MAX) {
+							playlistEntry.InitialPlayerHealth = std::int32_t(initialPlayerHealth);
+						}
+
+						std::int64_t maxGameTimeSecs;
+						if (entry["MaxGameTimeSecs"].get(maxGameTimeSecs) == Json::SUCCESS && maxGameTimeSecs >= 0 && maxGameTimeSecs <= INT32_MAX) {
+							playlistEntry.MaxGameTimeSecs = std::uint32_t(maxGameTimeSecs);
+						}
+
+						std::int64_t preGameSecs;
+						if (entry["PreGameSecs"].get(preGameSecs) == Json::SUCCESS && preGameSecs >= 0 && preGameSecs <= INT32_MAX) {
+							playlistEntry.PreGameSecs = std::uint32_t(preGameSecs);
+						}
+
+						std::int64_t spawnInvulnerableSecs;
+						if (entry["SpawnInvulnerableSecs"].get(spawnInvulnerableSecs) == Json::SUCCESS && spawnInvulnerableSecs >= 0 && spawnInvulnerableSecs <= INT32_MAX) {
+							playlistEntry.SpawnInvulnerableSecs = std::uint32_t(spawnInvulnerableSecs);
+						}
+
+						std::int64_t totalKills;
+						if (entry["TotalKills"].get(totalKills) == Json::SUCCESS && totalKills > 0 && totalKills <= INT32_MAX) {
+							playlistEntry.TotalKills = std::uint32_t(totalKills);
+						}
+
+						std::int64_t totalLaps;
+						if (entry["TotalLaps"].get(totalLaps) == Json::SUCCESS && totalLaps > 0 && totalLaps <= INT32_MAX) {
+							playlistEntry.TotalLaps = std::uint32_t(totalLaps);
+							if (playlistEntry.TotalLaps > MaxLapCount) {
+								playlistEntry.TotalLaps = MaxLapCount;
+							}
+						}
+
+						std::int64_t totalTreasureCollected;
+						if (entry["TotalTreasureCollected"].get(totalTreasureCollected) == Json::SUCCESS && totalTreasureCollected >= 0 && totalTreasureCollected <= INT32_MAX) {
+							playlistEntry.TotalTreasureCollected = std::uint32_t(totalTreasureCollected);
+						}
+
+						std::int64_t overtimeSecs;
+						if (entry["OvertimeSecs"].get(overtimeSecs) == Json::SUCCESS && overtimeSecs >= 0 && overtimeSecs <= INT32_MAX) {
+							playlistEntry.OvertimeSecs = std::uint32_t(overtimeSecs);
+						}
+
+						if (!playlistEntry.LevelName.empty() && serverConfig.GameMode != MpGameMode::Unknown) {
+							serverConfig.Playlist.push_back(std::move(playlistEntry));
+						}
+					}
+				}
+
+				std::int64_t playlistIndex;
+				if (doc["PlaylistIndex"].get(playlistIndex) == Json::SUCCESS && playlistIndex >= -1 && playlistIndex < (std::int64_t)serverConfig.Playlist.size()) {
+					serverConfig.PlaylistIndex = std::uint32_t(playlistIndex);
+				}
+			} else {
+				LOGE("Configuration from \"{}\" cannot be parsed: {}", configPath, errors.c_str());
+			}
+		} else {
+			LOGE("Configuration file \"{}\" cannot be opened", configPath);
+		}
+	}
+
+	void NetworkManager::AddServerAddressOverride(ServerConfiguration& serverConfig, StringView value)
+	{
+		StringView trimmed = value.trimmed();
+		if (trimmed.empty()) {
+			return;
+		}
+
+		StringView address; std::uint16_t port;
+		if (!TrySplitAddressAndPort(trimmed, address, port) || (!IsAddressValid(address) && !IsDomainValid(address))) {
+			LOGW("Specified server address override \"{}\" is invalid, ignoring", trimmed);
+			return;
+		}
+
+		LOGI("Using server address override \"{}\"", trimmed);
+		serverConfig.ServerAddressOverrides.emplace_back(trimmed);
+	}
+
+	void NetworkManager::VerifyServerConfiguration(ServerConfiguration& serverConfig)
+	{
+		// Set default values
+		if (serverConfig.ServerName.empty()) {
+			serverConfig.ServerName = "{PlayerName}'s Server"_s;
+		}
+		if (serverConfig.WelcomeMessage.empty()) {
+			serverConfig.WelcomeMessage = "Welcome to the {ServerName}!"_s;
+		}
+		if (serverConfig.ServerPort == 0) {
+			serverConfig.ServerPort = DefaultPort;
+		}
+		if (serverConfig.MaxPlayerCount == 0) {
+			serverConfig.MaxPlayerCount = MaxPeerCount;
+		}
+		if (serverConfig.TeamCount < 2) {
+			serverConfig.TeamCount = 2;
+		} else if (serverConfig.TeamCount > MaxTeamCount) {
+			serverConfig.TeamCount = MaxTeamCount;
+		}
+		if (serverConfig.MaxTeamSizeDiff < 1) {
+			serverConfig.MaxTeamSizeDiff = 1;
+		}
+
+		// Replace variables in parameters
+		auto playerName = PreferencesCache::GetEffectivePlayerName();
+		if (playerName.empty()) {
+			playerName = "Unknown"_s;
+		}
+
+		serverConfig.ServerName = StringUtils::replaceAll(serverConfig.ServerName, "{PlayerName}"_s, playerName);
+		//serverConfig.ServerName = StringUtils::replaceAll(serverConfig.ServerName, "\\f"_s, "\f"_s);
+
+		serverConfig.WelcomeMessage = StringUtils::replaceAll(serverConfig.WelcomeMessage, "{PlayerName}"_s, playerName);
+		serverConfig.WelcomeMessage = StringUtils::replaceAll(serverConfig.WelcomeMessage, "{ServerName}"_s, serverConfig.ServerName);
+		//serverConfig.WelcomeMessage = StringUtils::replaceAll(serverConfig.WelcomeMessage, "\\f"_s, "\f"_s);
+
+#if defined(DEATH_DEBUG)
+		String uniquePlayerId = NetworkManager::UuidToString(PreferencesCache::UniquePlayerID);
+		serverConfig.AdminUniquePlayerIDs.emplace(uniquePlayerId, "*"_s);
+#endif
+	}
+
+	StringView NetworkManager::GameModeToString(MpGameMode mode)
+	{
+		switch (mode) {
+			case MpGameMode::Battle: return "Battle"_s;
+			case MpGameMode::TeamBattle: return "Team Battle"_s;
+			case MpGameMode::Race: return "Race"_s;
+			case MpGameMode::TeamRace: return "Team Race"_s;
+			case MpGameMode::TreasureHunt: return "Treasure Hunt"_s;
+			case MpGameMode::TeamTreasureHunt: return "Team Treasure Hunt"_s;
+			case MpGameMode::CaptureTheFlag: return "Capture The Flag"_s;
+			case MpGameMode::Cooperation: return "Cooperation"_s;
+			default: return "Unknown"_s;
+		}
+	}
+
+	MpGameMode NetworkManager::StringToGameMode(StringView value)
+	{
+		auto gameModeString = StringUtils::lowercase(value);
+		if (gameModeString == "battle"sv || gameModeString == "b"sv) {
+			return MpGameMode::Battle;
+		} else if (gameModeString == "teambattle"_s || gameModeString == "tb"_s) {
+			return MpGameMode::TeamBattle;
+		} else if (gameModeString == "race"_s || gameModeString == "r"_s) {
+			return MpGameMode::Race;
+		} else if (gameModeString == "teamrace"_s || gameModeString == "tr"_s) {
+			return MpGameMode::TeamRace;
+		} else if (gameModeString == "treasurehunt"_s || gameModeString == "th"_s) {
+			return MpGameMode::TreasureHunt;
+		} else if (gameModeString == "teamtreasurehunt"_s || gameModeString == "tth"_s) {
+			return MpGameMode::TeamTreasureHunt;
+		} else if (gameModeString == "capturetheflag"_s || gameModeString == "ctf"_s) {
+			return MpGameMode::CaptureTheFlag;
+		} else if (gameModeString == "cooperation"_s || gameModeString == "coop"_s || gameModeString == "c"_s) {
+			return MpGameMode::Cooperation;
+		} else {
+			return MpGameMode::Unknown;
+		}
+	}
+
+	WebhookEventType NetworkManager::StringToWebhookEvent(StringView value)
+	{
+		auto eventString = StringUtils::lowercase(value);
+		if (eventString == "serverlifecycle"_s) {
+			return WebhookEventType::ServerLifecycle;
+		} else if (eventString == "playerconnected"_s || eventString == "playerjoined"_s) {
+			return WebhookEventType::PlayerConnected;
+		} else if (eventString == "playerdisconnected"_s || eventString == "playerleft"_s) {
+			return WebhookEventType::PlayerDisconnected;
+		} else if (eventString == "playerkicked"_s) {
+			return WebhookEventType::PlayerKicked;
+		} else if (eventString == "levelchanged"_s) {
+			return WebhookEventType::LevelChanged;
+		} else if (eventString == "roundstarted"_s) {
+			return WebhookEventType::RoundStarted;
+		} else if (eventString == "roundended"_s) {
+			return WebhookEventType::RoundEnded;
+		} else if (eventString == "championshipended"_s || eventString == "championship"_s) {
+			return WebhookEventType::ChampionshipEnded;
+		} else if (eventString == "chatmessages"_s || eventString == "chat"_s) {
+			return WebhookEventType::ChatMessages;
+		} else if (eventString == "playerroasted"_s || eventString == "roasted"_s) {
+			return WebhookEventType::PlayerRoasted;
+		} else if (eventString == "playerlapfinished"_s || eventString == "lapfinished"_s) {
+			return WebhookEventType::PlayerLapFinished;
+		} else if (eventString == "flagcaptured"_s) {
+			return WebhookEventType::FlagCaptured;
+		} else if (eventString == "default"_s) {
+			return WebhookEventType::Default;
+		} else if (eventString == "all"_s) {
+			return WebhookEventType::All;
+		} else {
+			LOGW("Unknown webhook event \"{}\" in server configuration, ignoring", value);
+			return WebhookEventType::None;
+		}
+	}
+
+	String NetworkManager::UuidToString(StaticArrayView<Uuid::Size, Uuid::Type> uuid)
+	{
+		String uuidStr{NoInit, 39};
+		DEATH_UNUSED std::size_t uuidStrLength = formatInto(MutableStringView(uuidStr), "{:.2X}{:.2X}:{:.2X}{:.2X}:{:.2X}{:.2X}:{:.2X}{:.2X}:{:.2X}{:.2X}:{:.2X}{:.2X}:{:.2X}{:.2X}:{:.2X}{:.2X}",
+			uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7], uuid[8], uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]);
+		DEATH_DEBUG_ASSERT(uuidStr.size() == uuidStrLength);
+		return uuidStr;
+	}
+
+	bool NetworkManager::IsKickedOff(Reason reason)
+	{
+		// Only the kicks of a player the server or an admin removed from the game - a join the server turned down
+		// (not ready yet, missing assets, ...) is not the player's doing, so a retained progression survives it
+		switch (reason) {
+			case Reason::Kicked:
+			case Reason::Banned:
+			case Reason::CheatingDetected:
+			case Reason::Idle:
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	ConnectionResult NetworkManager::OnPeerConnected(const Peer& peer, std::uint32_t clientData)
+	{
+		bool isListening = (GetState() == NetworkState::Listening);
+
+		if (isListening) {
+			auto address = AddressToString(peer);
+			if (_serverConfig->BannedIPAddresses.contains(address)) {
+				LOGI("Peer kicked \"<unknown>\" [{}] ({}): Banned by IP address", peer, address);
+				return Reason::Banned;
+			}
+		}
+
+		ConnectionResult result = NetworkManagerBase::OnPeerConnected(peer, clientData);
+
+		if (result && isListening) {
+			std::unique_lock<Spinlock> l(_lock);
+			auto [peerDesc, inserted] = _peerDesc.emplace(peer, std::make_shared<PeerDescriptor>());
+			peerDesc->second->RemotePeer = peer;
+			peerDesc->second->ConnectedSince = TimeStamp::now();
+		}
+
+		return result;
+	}
+
+	void NetworkManager::OnPeerDisconnected(const Peer& peer, Reason reason)
+	{
+		NetworkManagerBase::OnPeerDisconnected(peer, reason);
+
+		// The peer must be valid - looking up an empty peer would match the local descriptor and erase it
+		if (GetState() == NetworkState::Listening && peer) {
+			String playerName;
+			std::uint32_t playerCount = 0;
+
+			std::unique_lock<Spinlock> l(_lock);
+			auto it = _peerDesc.find(peer);
+			if (it != _peerDesc.end()) {
+				std::shared_ptr<PeerDescriptor> peerDesc = it->second;
+				peerDesc->RemotePeer = {};
+				_peerDesc.erase(it);
+
+				// Only authenticated peers have a name and should be reported to the webhook
+				if (_webhook != nullptr) {
+					playerName = peerDesc->PlayerName;
+					// Same counting rule as GetPeerCount(), which can't be called while the lock is held
+					for (auto& [otherPeer, otherPeerDesc] : _peerDesc) {
+						if (otherPeer.IsValid() || otherPeerDesc->Player) {
+							playerCount++;
+						}
+					}
+				}
+
+				std::int32_t reconnectWindowSecs = (_serverConfig != nullptr ? _serverConfig->ReconnectWindowSecs : 0);
+
+				// Drop any retained descriptors that have outlived the reconnect window
+				SmallVector<String, 0> expired;
+				for (auto& [uuid, desc] : _disconnectedPeers) {
+					if (desc->DisconnectedSince.secondsSince() > reconnectWindowSecs) {
+						expired.push_back(uuid);
+					}
+				}
+				for (auto& uuid : expired) {
+					_disconnectedPeers.erase(uuid);
+				}
+
+				// Retain this descriptor so the player can reconnect and resume within the window. HasCarryOver
+				// is set by the level handler only when the peer had an active player, so spectators aren't kept.
+				// A window of zero (or less) disables reconnect resume entirely.
+				if (peerDesc->HasCarryOver && reconnectWindowSecs > 0) {
+					if (IsKickedOff(reason)) {
+						// Removed from the game for what the player did, so a reconnect starts over instead of
+						// resuming where the kick left off
+						LOGI("Progression of \"{}\" [{}] discarded: {}", peerDesc->PlayerName, peer, ReasonToString(reason));
+					} else {
+						peerDesc->DisconnectedSince = TimeStamp::now();
+						_disconnectedPeers[UuidToString(peerDesc->UniquePlayerID)] = Death::move(peerDesc);
+					}
+				}
+			}
+			l.unlock();
+
+			if (_webhook != nullptr && !playerName.empty()) {
+				_webhook->OnPlayerDisconnected(playerName, reason, playerCount, _serverConfig->MaxPlayerCount);
+			}
+		}
+	}
+
+	std::shared_ptr<PeerDescriptor> NetworkManager::ReclaimDisconnectedPeer(StaticArrayView<Uuid::Size, Uuid::Type> uuid)
+	{
+		std::unique_lock<Spinlock> l(_lock);
+		auto it = _disconnectedPeers.find(UuidToString(uuid));
+		if (it == _disconnectedPeers.end()) {
+			return nullptr;
+		}
+
+		std::shared_ptr<PeerDescriptor> peerDesc = it->second;
+		_disconnectedPeers.erase(it);
+		std::int32_t reconnectWindowSecs = (_serverConfig != nullptr ? _serverConfig->ReconnectWindowSecs : 0);
+		if (reconnectWindowSecs <= 0 || peerDesc->DisconnectedSince.secondsSince() > reconnectWindowSecs) {
+			return nullptr;
+		}
+		return peerDesc;
+	}
+
+	void NetworkManager::ClearDisconnectedPeerStates()
+	{
+		std::unique_lock<Spinlock> l(_lock);
+		for (auto& [uuid, peerDesc] : _disconnectedPeers) {
+			peerDesc->HasCarryOver = false;
+		}
+	}
+}
+
+#endif

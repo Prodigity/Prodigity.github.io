@@ -1,0 +1,346 @@
+﻿#pragma once
+
+#if defined(WITH_MULTIPLAYER) || defined(DOXYGEN_GENERATING_OUTPUT)
+
+#include "ConnectionResult.h"
+#include "Peer.h"
+#include "Reason.h"
+#include "ServerDiscovery.h"
+#include "../../nCine/Threading/Thread.h"
+#include "../../nCine/Threading/ThreadSync.h"
+
+#include <Base/IDisposable.h>
+#include <Containers/Function.h>
+#include <Containers/SmallVector.h>
+#include <Containers/StringView.h>
+#include <IO/MemoryStream.h>
+#include <Threading/Spinlock.h>
+
+#if defined(WITH_WEBSOCKET)
+#	if defined(DEATH_TARGET_EMSCRIPTEN)
+#		include <emscripten/websocket.h>
+#	else
+#		include <ixwebsocket/IXWebSocket.h>
+#		include <ixwebsocket/IXWebSocketServer.h>
+#	endif
+#endif
+
+#if !defined(DEATH_TARGET_EMSCRIPTEN)
+struct _ENetHost;
+#endif
+
+using namespace Death::Containers;
+using namespace Death::IO;
+using namespace Death::Threading;
+using namespace nCine;
+
+namespace Jazz2::Multiplayer
+{
+	class INetworkHandler;
+
+	/**
+		@brief Network packet channel
+		
+		Selects which transport channel a packet is sent on, separating reliable, ordered traffic on the
+		main channel from frequent unreliable state updates.
+	*/
+	enum class NetworkChannel : std::uint8_t
+	{
+		Main,				/**< Main */
+		UnreliableUpdates,	/**< Unreliable updates */
+		Count				/**< Count of supported channels */
+	};
+
+	/**
+		@brief State of network connection
+		
+		Describes the current role and connection status of a @ref NetworkManagerBase: idle, listening as a
+		server, or connecting to and connected with a remote server as a client.
+	*/
+	enum class NetworkState
+	{
+		None,				/**< Disconnected */
+		Listening,			/**< Listening as server */
+		Connecting,			/**< Connecting to server as client */
+		Connected,			/**< Connected to server as client */
+		Local				/**< Local session with no socket (local splitscreen multiplayer) */
+	};
+
+	/**
+		@brief All connected peers tag type
+	*/
+	struct AllPeersT {
+#ifndef DOXYGEN_GENERATING_OUTPUT
+		struct Init {};
+		// Explicit constructor to avoid ambiguous calls when using {}
+		constexpr explicit AllPeersT(Init) {}
+#endif
+	};
+
+	/**
+		@brief Local peer tag type
+	*/
+	struct LocalPeerT {
+#ifndef DOXYGEN_GENERATING_OUTPUT
+		struct Init {};
+		// Explicit constructor to avoid ambiguous calls when using {}
+		constexpr explicit LocalPeerT(Init) {}
+#endif
+	};
+
+	/**
+		@brief All connected peers tag
+		
+		Use in @ref NetworkManagerBase::SendTo() to send to all connected peers or the remote server peer.
+	*/
+	constexpr AllPeersT AllPeers{AllPeersT::Init{}};
+
+	/**
+		@brief Local peer tag
+	*/
+	constexpr LocalPeerT LocalPeer{LocalPeerT::Init{}};
+
+	/**
+		@brief Allows to create generic network clients and servers
+		
+		Wraps the ENet (and optional WebSocket) transport to run either a client or a server on a background
+		thread, tracks connected peers and the connection state, and dispatches connect, disconnect and
+		received-packet events to an @ref INetworkHandler. Provides the low-level send and kick primitives
+		that @ref NetworkManager builds the game-specific session on top of.
+	*/
+	class NetworkManagerBase : public Death::IDisposable
+	{
+		friend class ServerDiscovery;
+
+	public:
+		/** @brief Quality of the connection to the server */
+		struct ConnectionStatistics
+		{
+			/** @brief Mean round trip time in milliseconds */
+			std::uint32_t RoundTripTimeMs;
+			/** @brief Mean deviation of the round trip time in milliseconds, or negative if the transport does not measure it */
+			std::int32_t RoundTripTimeVarianceMs;
+			/** @brief Mean loss of reliable packets in percent, or negative if the transport does not measure it */
+			float PacketLoss;
+		};
+
+		/** @{ @name Constants */
+
+		/** @brief Maximum connected peer count */
+		static constexpr std::uint32_t MaxPeerCount = 128;
+
+		/** @brief Default port used when an endpoint doesn't specify one */
+		static constexpr std::uint16_t DefaultPort = 7438;
+
+		/** @} */
+
+		/** @brief Creates a new instance */
+		NetworkManagerBase();
+		~NetworkManagerBase();
+
+		NetworkManagerBase(const NetworkManagerBase&) = delete;
+		NetworkManagerBase& operator=(const NetworkManagerBase&) = delete;
+
+		/** @brief Creates a client connection to a remote server */
+		virtual void CreateClient(INetworkHandler* handler, StringView endpoints, std::uint16_t defaultPort, std::uint32_t clientData);
+		/** @brief Creates a server that accepts incoming connections */
+		virtual bool CreateServer(INetworkHandler* handler, std::uint16_t port);
+		/** @brief Disposes all active connections */
+		virtual void Dispose();
+
+		/** @brief Returns state of network connection */
+		NetworkState GetState() const;
+		/** @brief Returns mean round trip time to the server, in milliseconds */
+		std::uint32_t GetRoundTripTimeMs() const;
+		/** @brief Returns mean round trip time to the server for specified peer, in milliseconds */
+		std::uint32_t GetRoundTripTimeMs(const Peer& peer) const;
+		/**
+		 * @brief Returns the quality of the connection to the server
+		 *
+		 * Returns `false` unless connected to a server as a client. ENet measures all of it; the WebSocket transport
+		 * runs over TCP, which neither loses packets nor has the jitter measured, so only the round trip time is there.
+		 */
+		bool GetConnectionStatistics(ConnectionStatistics& stats) const;
+		/** @brief Returns all IPv4 and IPv6 addresses along with ports of the server */
+		Array<String> GetServerEndpoints() const;
+		/** @brief Returns port of the server */
+		std::uint16_t GetServerPort() const;
+
+		/** @brief Sends a packet to a given peer */
+		void SendTo(const Peer& peer, NetworkChannel channel, std::uint8_t packetType, ArrayView<const std::uint8_t> data);
+		/** @brief Sends a packet to all connected peers that match a given predicate */
+		void SendTo(Function<bool(const Peer&)>&& predicate, NetworkChannel channel, std::uint8_t packetType, ArrayView<const std::uint8_t> data);
+		/** @brief Sends a packet to all connected peers or the remote server peer */
+		void SendTo(AllPeersT, NetworkChannel channel, std::uint8_t packetType, ArrayView<const std::uint8_t> data);
+		/**
+		 * @brief Kicks a given peer from the server
+		 *
+		 * The disconnect of the peer is then reported with this reason, even though the transport doesn't carry it
+		 * back (an ENet peer the server disconnects comes back with no reason at all). The first kick counts, a
+		 * repeated one before the peer is gone doesn't change it.
+		 */
+		void Kick(const Peer& peer, Reason reason);
+
+		/** @brief Converts the specified IPv4 endpoint to the string representation */
+		static String AddressToString(const struct in_addr& address, std::uint16_t port = 0);
+#if ENET_IPV6
+		/** @brief Converts the specified IPv6 endpoint to the string representation */
+		static String AddressToString(const struct in6_addr& address, std::uint16_t scopeId, std::uint16_t port = 0);
+#endif
+#if (!defined(DEATH_TARGET_EMSCRIPTEN) && defined(WITH_ONLINE_MULTIPLAYER)) || defined(DOXYGEN_GENERATING_OUTPUT)
+		/** @brief Converts the specified ENet address to the string representation */
+		static String AddressToString(const ENetAddress& address, bool includePort = false);
+#endif
+		/** @brief Converts the endpoint of the specified peer to the string representation */
+		String AddressToString(const Peer& peer) const;
+		
+		/** @brief Returns `true` if the specified string representation of the address is valid */
+		static bool IsAddressValid(StringView address);
+		/** @brief Returns `true` if the specified string representation of the domain name is valid */
+		static bool IsDomainValid(StringView domain);
+		/** @brief Attempts to split the specified endpoint into address and port */
+		static bool TrySplitAddressAndPort(StringView input, StringView& address, std::uint16_t& port);
+
+		/**
+		 * @brief Switches the transport between Wi-Fi (infrastructure) and ad hoc (local wireless) mode
+		 *
+		 * @partialsupport Available only on @ref DEATH_TARGET_PSP "PlayStation Portable" platform.
+		 */
+		static bool SetAdhocMode(bool enabled);
+		/** @brief Whether the transport is in ad hoc mode (see @ref SetAdhocMode()) */
+		static bool IsAdhocMode();
+		/** @brief Converts the specified reason to the string representation */
+		static const char* ReasonToString(Reason reason);
+
+	protected:
+		/**
+		 * @brief Puts the manager into a socket-less local session state
+		 *
+		 * Used for local splitscreen multiplayer: no socket is bound and no background thread is started, but the
+		 * manager reports @ref NetworkState::Local so the game session layer treats it as an authoritative server.
+		 * Sending packets is a no-op in this state.
+		 */
+		void CreateLocalSession(INetworkHandler* handler);
+
+		/** @brief Called when a peer connects to the local server or the local client connects to a server */
+		virtual ConnectionResult OnPeerConnected(const Peer& peer, std::uint32_t clientData);
+		/** @brief Called when a peer disconnects from the local server or the local client disconnects from a server */
+		virtual void OnPeerDisconnected(const Peer& peer, Reason reason);
+
+#if defined(WITH_WEBSOCKET) && !defined(DEATH_TARGET_EMSCRIPTEN)
+		/** @brief Starts a WebSocket server alongside the ENet server */
+		bool StartWsServer(std::uint16_t wsPort, StringView certPath, StringView keyPath);
+#endif
+
+	private:
+		static constexpr std::uint32_t ProcessingIntervalMs = 4;
+		/**
+		 * @brief Maximum number of addresses taken from a single host name, see @ref AddResolvedEndpoints()
+		 *
+		 * The client thread walks the endpoints one by one and gives each of them up to 10 seconds, so a
+		 * name behind a large round-robin record set would otherwise keep the player waiting for minutes.
+		 * Two addresses is what a dual-stacked server answers with.
+		 */
+		static constexpr std::int32_t MaxAddressesPerHost = 4;
+
+#if !defined(DEATH_TARGET_EMSCRIPTEN)
+		/** @brief Peer kicked by the server, waiting for its disconnect to be reported */
+		struct KickedPeer {
+			Peer Target;
+			Reason KickReason;
+		};
+
+		_ENetHost* _host;
+		Thread _thread;
+		SmallVector<Peer, 1> _connectedPeers;
+		SmallVector<KickedPeer, 0> _kickedPeers;	/**< Guarded by `_lock` */
+#	if defined(WITH_ONLINE_MULTIPLAYER)
+		SmallVector<ENetAddress, 0> _desiredEndpoints;
+#	endif
+#endif
+		NetworkState _state;
+		std::uint32_t _clientData;
+		INetworkHandler* _handler;
+		mutable Spinlock _lock;
+
+#if defined(WITH_WEBSOCKET) && !defined(DEATH_TARGET_EMSCRIPTEN)
+		/** @brief Queued event from WebSocket callbacks to the main processing thread */
+		struct WsQueuedEvent {
+			enum class Type : std::uint8_t { Open, Close, Message };
+			Type type = Type::Open;
+			ix::WebSocket* peer = nullptr;
+			std::string data;
+			std::uint32_t clientData = 0;	/**< For Open: client data value to pass to OnPeerConnected */
+			std::uint16_t closeCode = 0;	/**< For Close: WebSocket close code */
+		};
+
+		/** @brief Per-peer info stored by the WebSocket transport */
+		struct WsPeerInfo {
+			String address;			/**< Remote address string */
+			std::uint32_t rtt = 0;	/**< Last reported round trip time in milliseconds */
+		};
+
+		std::unique_ptr<ix::WebSocketServer> _wsServer;
+		std::unique_ptr<ix::WebSocket> _wsClient;
+		HashMap<ix::WebSocket*, WsPeerInfo> _wsPeers;	/**< Maps ix::WebSocket* → peer info; also acts as lifetime guard */
+		SmallVector<WsQueuedEvent, 0> _wsPendingEvents;
+		std::uint64_t _wsPingLastTime = 0;		/**< Timestamp (ms) of the last outgoing Ping on the client thread */
+		std::atomic<std::uint32_t> _wsRtt{0};	/**< Client-side measured RTT for the WebSocket server connection */
+		mutable Spinlock _wsLock;
+
+		void ProcessWsQueue(INetworkHandler* handler);
+		bool SendToWsPeer(ix::WebSocket* ws, std::uint8_t packetType, ArrayView<const std::uint8_t> data);
+#elif defined(WITH_WEBSOCKET) && defined(DEATH_TARGET_EMSCRIPTEN)
+		/** @brief Emscripten WebSocket handle (0 = not connected) */
+		EMSCRIPTEN_WEBSOCKET_T _emWsSocket{0};
+		/** @brief URL of the WebSocket server being connected to */
+		String _emWsUrl;
+		/** @brief Client-side measured RTT for the Emscripten WebSocket connection */
+		std::uint32_t _emWsRtt = 0;
+		/** @brief Handle of the scheduled ping timer (0 = not scheduled) */
+		long _emWsPingTimerId = 0;
+
+		static EM_BOOL OnEmWsOpen(int eventType, const EmscriptenWebSocketOpenEvent* e, void* userData);
+		static EM_BOOL OnEmWsMessage(int eventType, const EmscriptenWebSocketMessageEvent* e, void* userData);
+		static EM_BOOL OnEmWsError(int eventType, const EmscriptenWebSocketErrorEvent* e, void* userData);
+		static EM_BOOL OnEmWsClose(int eventType, const EmscriptenWebSocketCloseEvent* e, void* userData);
+		static void OnEmWsPingTimer(void* userData);
+#endif
+
+		static void InitializeBackend();
+		static void ReleaseBackend();
+
+#if !defined(DEATH_TARGET_EMSCRIPTEN) && defined(WITH_ONLINE_MULTIPLAYER)
+		/**
+		 * @brief Appends every address the given host resolves to as a separate endpoint
+		 *
+		 * The IPv6 addresses of the host are appended before its IPv4 ones, so a dual-stacked server is
+		 * tried over IPv6 first and @ref MaxAddressesPerHost is spent on IPv6 addresses first as well.
+		 * Returns the number of endpoints added, which is @cpp 0 @ce also when the host resolved to
+		 * addresses that are all already among the endpoints. A host that cannot be resolved at all is
+		 * reported by the method itself. See @ref CreateClient().
+		 */
+		std::int32_t AddResolvedEndpoints(StringView host, std::uint16_t port, std::int32_t ifidx);
+#endif
+
+		/** @brief Whether the transport is in ad hoc mode (only ever `true` on the PSP), see @ref SetAdhocMode() */
+		static bool _adhocMode;
+		/** @brief Ad hoc group a client joins before connecting (see @ref CreateClient()) */
+		String _adhocGroup;
+
+#if !defined(DEATH_TARGET_EMSCRIPTEN)
+		/** @brief Returns the reason a disconnected peer was kicked for and forgets it, or `reason` if it wasn't kicked */
+		Reason TakeKickReason(const Peer& peer, Reason reason);
+		/** @brief Forgets a kick of a peer whose handle is being reused by a new connection */
+		void ForgetKickReason(const Peer& peer);
+
+		static void OnClientThread(void* param);
+		static void OnServerThread(void* param);
+#	if defined(WITH_WEBSOCKET)
+		static void OnClientWsThread(void* param);
+#	endif
+#endif
+	};
+}
+
+#endif

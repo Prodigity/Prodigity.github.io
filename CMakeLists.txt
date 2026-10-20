@@ -1,0 +1,191 @@
+cmake_minimum_required(VERSION 3.15)
+
+# Policies
+if(POLICY CMP0127)
+	cmake_policy(SET CMP0127 NEW)
+endif()
+if(POLICY CMP0141)
+	cmake_policy(SET CMP0141 NEW)
+endif()
+if(POLICY CMP0144)
+	cmake_policy(SET CMP0144 NEW)
+endif()
+
+if(NOT CMAKE_CONFIGURATION_TYPES)
+	get_property(_haveMultiConfigGenerator GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+	if(_haveMultiConfigGenerator)
+		set(CMAKE_CONFIGURATION_TYPES "Debug;Release")
+	endif()
+endif()
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+	set(_defaultBuildtype "Debug")
+	message(STATUS "Setting build configuration to \"${_defaultBuildtype}\" as none was specified")
+	set(CMAKE_BUILD_TYPE "${_defaultBuildtype}" CACHE STRING "Build configuration" FORCE)
+	set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release")
+endif()
+
+# Project metadata
+set(NCINE_ROOT ${CMAKE_SOURCE_DIR})
+set(NCINE_SOURCE_DIR "${NCINE_ROOT}/Sources")
+set(NCINE_APP "jazz2")
+set(NCINE_APP_NAME "Jazz² Resurrection")
+set(NCINE_APP_DESCRIPTION "Open-source reimplementation of Jazz Jackrabbit 2")
+set(NCINE_APP_DESCRIPTION_FULL "Jazz² Resurrection is reimplementation of the game Jazz Jackrabbit 2 released in 1998. Supports various versions of the game (Shareware Demo, Holiday Hare '98, The Secret Files and Christmas Chronicles). Also, it partially supports some features of JJ2+ extension and MLLE.\n\nFurther information can be found here: https://de4th.dev/jazz2/")
+set(NCINE_APP_VENDOR "Dan R.")
+set(NCINE_REVERSE_DNS "jazz2.resurrection")
+set(NCINE_VERSION "3.9.0")
+
+project(Jazz2
+	VERSION "${NCINE_VERSION}"
+	DESCRIPTION "${NCINE_APP_NAME}"
+	HOMEPAGE_URL "https://de4th.dev/jazz2/"
+	LANGUAGES CXX C)
+
+set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_SOURCE_DIR}/cmake)
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+
+if(NOT CMAKE_GENERATOR_PLATFORM OR "${CMAKE_GENERATOR_PLATFORM}" STREQUAL "${CMAKE_SYSTEM_PROCESSOR}")
+	if(EMSCRIPTEN)
+		message(STATUS "Compiling for architecture: WASM (on ${CMAKE_SYSTEM_PROCESSOR} machine)")
+	elseif(NINTENDO_SWITCH)
+		message(STATUS "Compiling for architecture: ${CMAKE_SYSTEM_PROCESSOR} (Nintendo Switch)")
+	elseif(IOS)
+		message(STATUS "Compiling for architecture: ${CMAKE_OSX_ARCHITECTURES} (iOS, ${CMAKE_OSX_SYSROOT})")
+	elseif(APPLE AND CMAKE_OSX_ARCHITECTURES)
+		message(STATUS "Compiling for architecture: ${CMAKE_OSX_ARCHITECTURES} (on ${CMAKE_SYSTEM_PROCESSOR} machine)")
+	else()
+		message(STATUS "Compiling for architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+	endif()
+else()
+	message(STATUS "Compiling for architecture: ${CMAKE_GENERATOR_PLATFORM} (on ${CMAKE_SYSTEM_PROCESSOR} machine)")
+endif()
+
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+	if(CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+		set(NCINE_ARM_PROCESSOR TRUE)
+	elseif(CMAKE_OSX_ARCHITECTURES MATCHES "x86_64")
+		# Default architecture
+	else()
+		message(FATAL_ERROR "Architecture \"${CMAKE_OSX_ARCHITECTURES}\" is not supported. Only one architecture (arm64 or x86_64) could be specified at build time.")
+	endif()
+else()
+	string(FIND ${CMAKE_SYSTEM_PROCESSOR} "arm" ARM_SUBSTRING_FOUND)
+	string(FIND ${CMAKE_SYSTEM_PROCESSOR} "aarch64" AARCH64_SUBSTRING_FOUND)
+	if (ARM_SUBSTRING_FOUND GREATER -1 OR AARCH64_SUBSTRING_FOUND GREATER -1)
+		set(NCINE_ARM_PROCESSOR TRUE)
+	endif()
+endif()
+	
+include(ncine_options)
+include(ncine_get_version)
+
+if(NCINE_PREFERRED_RHI STREQUAL "Metal")
+	# For the Metal backend's one Objective-C++ file (the CAMetalLayer bridge). Enabled before any dependency
+	# subdirectory is added, and together with OBJC: enabling only OBJCXX later would claim SDL2's `.m` files as
+	# Objective-C++ in a directory that never loaded the language ("CMAKE_OBJCXX_COMPILE_OBJECT not set").
+	enable_language(OBJC OBJCXX)
+endif()
+
+include(ncine_imported_targets)
+
+if(NOT NCINE_BUILD_GAME)
+	# Only the offline tools, see `NCINE_BUILD_GAME` in "ncine_options.cmake" - they need the source lists and none of
+	# what follows, which is all about the game
+	include(ncine_sources)
+	include(ncine_offline_tools)
+	return()
+endif()
+
+include(ncine_imgui)
+include(ncine_tracy)
+
+if(NOT IS_DIRECTORY ${NCINE_CONTENT_DIR})
+	message(WARNING "Content directory not found at: ${NCINE_CONTENT_DIR}")
+else()
+	message(STATUS "Content directory: ${NCINE_CONTENT_DIR}")
+endif()
+	
+if(NCINE_BUILD_ANDROID)
+	include(ncine_generated_sources)
+	include(ncine_build_android)
+	return()
+endif()
+
+if(NCINE_BUILD_LIBRETRO)
+	add_library(${NCINE_APP} SHARED)
+	set_target_properties(${NCINE_APP} PROPERTIES PREFIX "" OUTPUT_NAME "${NCINE_APP}_libretro")
+else()
+	add_executable(${NCINE_APP})
+endif()
+
+if(NCINE_NATIVE_WINDOW_BACKEND)
+	# A platform with a window/input backend of its own, so none of the windowing libraries below is
+	# involved (or was even looked for). Which platforms those are, and what each one is called, is decided
+	# in one place - see NCINE_NATIVE_WINDOW_BACKEND in cmake/ncine_options.cmake - and the backend itself
+	# lives in Sources/nCine/Backends/${NCINE_NATIVE_WINDOW_BACKEND}
+	message(STATUS "Compiling for ${NCINE_PLATFORM_SUMMARY}")
+elseif(PLATFORM_AMIGAOS4 OR PLATFORM_MORPHOS)
+	# Unlike the classic 68k Amiga, which has a backend of its own and is matched by the arm above, the
+	# PowerPC Amigas have a maintained SDL2 and use it for window and input, so they need no backend of
+	# their own - see Docs/Amiga.dox. It is also the only backend they
+	# have, and this arm never reaches the fallback chain in the `else()` branch below, so a missing SDL2
+	# is reported here rather than as a missing header or an unresolved symbol later in the build
+	if(NOT SDL2_FOUND)
+		message(FATAL_ERROR "SDL2 has not been found, which is the only window and input backend of the PowerPC Amigas (both SDKs carry it - see Docs/Amiga.dox)")
+	endif()
+	if(PLATFORM_AMIGAOS4)
+		message(STATUS "Compiling for AmigaOS 4.1 (SDL2 backend)")
+	else()
+		message(STATUS "Compiling for MorphOS (SDL2 backend)")
+	endif()
+elseif(NCINE_BUILD_LIBRETRO)
+	message(STATUS "Compiling as a libretro core (no window backend)")
+elseif(DEDICATED_SERVER)
+	# The dedicated server never opens a window, so no window backend is compiled for it
+	message(STATUS "Compiling as a dedicated server (no window backend)")
+else()
+	# Falling back to either GLFW or SDL2 if the other one is not available
+	if(NOT GLFW_FOUND AND NOT SDL2_FOUND AND NOT SDL3_FOUND AND NOT Qt5_FOUND)
+		message(FATAL_ERROR "No backend between SDL2, SDL3, GLFW, and QT5 has been found")
+	elseif(GLFW_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "GLFW")
+		message(STATUS "Using GLFW as the preferred backend")
+	elseif(SDL2_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "SDL2")
+		message(STATUS "Using SDL2 as the preferred backend")
+	elseif(SDL3_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "SDL3")
+		message(STATUS "Using SDL3 as the preferred backend")
+	elseif(Qt5_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "QT5")
+		message(STATUS "Using QT5 as the preferred backend")
+	elseif(SDL2_FOUND AND NOT GLFW_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "GLFW")
+		set(NCINE_PREFERRED_BACKEND "SDL2")
+		message(WARNING "Using SDL2 as backend because GLFW cannot be found")
+	elseif(GLFW_FOUND AND NOT SDL2_FOUND AND NCINE_PREFERRED_BACKEND STREQUAL "SDL2")
+		set(NCINE_PREFERRED_BACKEND "GLFW")
+		message(WARNING "Using GLFW as backend because SDL2 cannot be found")
+	endif()
+endif()
+
+include(ncine_compiler_options)
+include(ncine_headers)
+include(ncine_sources)
+include(ncine_extra_sources)
+include(ncine_generated_sources)
+
+# Organize main project files into folders
+ncine_assign_source_group(PATH_PREFIX ${NCINE_SOURCE_DIR} FILES ${HEADERS} ${SOURCES})
+foreach(SOURCE_FILE ${GENERATED_SOURCES})
+	source_group("Generated Files" FILES ${SOURCE_FILE})
+endforeach()
+
+target_sources(${NCINE_APP} PRIVATE ${SOURCES} ${HEADERS} ${GENERATED_SOURCES})
+
+include(ncine_offline_tools)
+
+# Windows RT uses custom packaging, enable it only for other platforms. iOS assembles its application bundle at
+# build time instead (see cmake/ncine_ios_bundle.cmake), there is nothing to install or package.
+if(IOS)
+	include(ncine_ios_bundle)
+elseif(NOT WINDOWS_PHONE AND NOT WINDOWS_STORE AND NOT ANDROID AND NOT NCINE_BUILD_ANDROID AND NOT NINTENDO_SWITCH AND NOT NINTENDO_3DS AND NOT VITA AND NOT PLATFORM_PSP AND NOT PLATFORM_PS3 AND NOT NCINE_BUILD_LIBRETRO)
+	include(ncine_installation)
+endif()
+include(ncine_strip_binaries)
+

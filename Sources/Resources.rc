@@ -1,0 +1,41 @@
+﻿#include <windows.h>
+#include "Resources.h"
+
+LANGUAGE LANG_NEUTRAL, SUBLANG_DEFAULT
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 3, 9, 0, 0
+ PRODUCTVERSION 3, 9, 0, 0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+{
+	BLOCK "StringFileInfo"
+	{
+		BLOCK "000004b0"
+		{
+			VALUE "CompanyName", "Dan R."
+			VALUE "FileVersion", "3.9.0.0"
+			VALUE "InternalName", "Jazz2"
+			VALUE "LegalCopyright", "© 2016-2026 Dan R."
+			VALUE "OriginalFilename", "Jazz2.exe"
+			VALUE "ProductName", "Jazz² Resurrection"
+			VALUE "ProductVersion", "3.9.0.0"
+			VALUE "FileDescription", "Jazz² Resurrection: Open-source reimplementation of Jazz Jackrabbit 2"
+		}
+	}
+	BLOCK "VarFileInfo"
+	{
+		VALUE "Translation", 0x0, 1200
+	}
+}
+
+GLFW_ICON				ICON		".\\Icons\\Main.ico"
+WINDOW_ICON				ICON		".\\Icons\\Window.ico"
+IMGUI_ICON				ICON		".\\Icons\\WindowImGui.ico"
